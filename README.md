@@ -96,18 +96,16 @@ Set a `token` in portal.toml or via `PORTAL_TOKEN` env var. When set, connecting
 
 No token configured = open access (suitable for trusted networks).
 
-## Security
+## Security & Permissions
 
-- **Workspace sandbox**: File tools are confined to the configured workspace directory. Path traversal is blocked.
-- **Exec allowlist**: Optionally restrict which commands can be executed.
-- **Max file size**: Configurable limit on file read/write operations (default 10MB).
+Portal runs on **your** computer. You control everything:
 
-```toml
-[security]
-workspace_root = "/home/me/workspace"
-exec_allowlist = ["ls", "cat", "grep", "python3"]
-max_file_size = 5242880  # 5MB
-```
+- **Token auth** — who can connect
+- **Tool switches** — what categories of actions are allowed (exec/file/web)
+- **Workspace sandbox** — file operations confined to one directory, path traversal blocked
+- **Exec allowlist** — optionally restrict which shell commands are allowed
+
+See **[SECURITY.md](SECURITY.md)** for the full permissions guide, including recommended configs for trusted beings, visiting beings, and maximum restriction.
 
 ## Architecture
 
