@@ -1,0 +1,27 @@
+[package]
+name = "heart-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP (Model Context Protocol) client library for Heart Portal"
+
+[lib]
+name = "heart_mcp"
+path = "src/lib.rs"
+
+# Standalone binary excluded — only used inside Heart-RS monorepo
+# [[bin]]
+# name = "heart-mcp"
+# path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+notify = "6"
+
+[dev-dependencies]
+tempfile = "3"

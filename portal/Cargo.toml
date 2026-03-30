@@ -1,0 +1,19 @@
+[package]
+name = "heart-portal"
+version.workspace = true
+edition.workspace = true
+description = "Portal — Being's gateway to the world. Lightweight MCP server with built-in tools."
+
+[[bin]]
+name = "heart-portal"
+path = "src/main.rs"
+
+[dependencies]
+heart-mcp = { path = "../mcp-supervisor" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
