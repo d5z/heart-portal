@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cowork</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+:root {
+  --bg: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-tertiary: #0f3460;
+  --border: #533483;
+  --text: #eee2dc;
+  --text-muted: #a89b9d;
+  --accent: #e94560;
+  --accent-dim: #e9456022;
+  --accent-glow: #e9456066;
+  --success: #7ec8e3;
+  --warning: #ffd460;
+  --danger: #e94560;
+  --pixel-border: #533483;
+  --radius: 4px;
+  --sidebar-w: 260px;
+  --topbar-h: 56px;
+  --bottombar-h: 32px;
+  --font-pixel: 'Press Start 2P', monospace;
+}
+/* Pixel border mixin via box-shadow */
+.pixel-border {
+  box-shadow:
+    inset -2px -2px 0 0 var(--pixel-border),
+    inset 2px 2px 0 0 #7b6b8a,
+    0 0 0 2px var(--pixel-border);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 14px; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+a { color: var(--accent); text-decoration: none; }
+
+/* Top bar */
+#topbar { height: var(--topbar-h); background: var(--bg-secondary); border-bottom: 2px solid var(--border); display: flex; align-items: center; padding: 0 16px; gap: 12px; flex-shrink: 0; }
+#topbar .being-emoji { font-size: 28px; animation: breathe 3s ease-in-out infinite; filter: drop-shadow(0 0 8px var(--accent-glow)); }
+@keyframes breathe { 0%,100% { transform: scale(0.95); filter: drop-shadow(0 0 6px var(--accent-glow)); } 50% { transform: scale(1.05); filter: drop-shadow(0 0 12px var(--accent-glow)); } }
+#topbar .being-name { font-family: var(--font-pixel); font-size: 12px; color: var(--accent); letter-spacing: 1px; text-shadow: 0 0 10px var(--accent-glow); }
+.tab-btn { background: none; border: 2px solid transparent; color: var(--text-muted); cursor: pointer; padding: 6px 14px; font-size: 13px; font-family: var(--font-pixel); transition: all .15s; image-rendering: pixelated; }
+.tab-btn:hover { background: var(--bg-tertiary); color: var(--text); border-color: var(--border); }
+.tab-btn.active { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+#topbar .spacer { flex: 1; }
+#hamburger { display: none; background: none; border: none; color: var(--text); font-size: 20px; cursor: pointer; }
+
+/* Layout */
+#main-layout { display: flex; flex: 1; overflow: hidden; }
+#sidebar { width: var(--sidebar-w); background: var(--bg-secondary); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; flex-shrink: 0; }
+#content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* Bottom bar */
+#bottombar { height: var(--bottombar-h); background: var(--bg-secondary); border-top: 2px solid var(--border); display: flex; align-items: center; padding: 0 12px; font-size: 10px; font-family: var(--font-pixel); color: var(--text-muted); flex-shrink: 0; overflow: hidden; }
+
+/* Chat view */
+#chat-view { display: flex; flex-direction: column; height: 100%; }
+#chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.msg { max-width: 85%; padding: 10px 14px; border-radius: var(--radius); line-height: 1.5; word-wrap: break-word; }
+.msg.user { background: var(--accent-dim); align-self: flex-end; border: 2px solid var(--accent); box-shadow: 3px 3px 0 var(--accent-glow); }
+.msg.assistant { background: var(--bg-tertiary); align-self: flex-start; border: 2px solid var(--border); box-shadow: 3px 3px 0 rgba(83,52,131,0.3); }
+.msg.system { background: transparent; color: var(--text-muted); font-size: 12px; align-self: center; }
+.msg pre { background: var(--bg); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 8px 0; }
+.msg code { font-size: 13px; }
+.msg p { margin: 4px 0; }
+.stream-cursor::after { content: '▊'; animation: blink 1s step-end infinite; color: var(--accent); }
+@keyframes blink { 50% { opacity: 0; } }
+#chat-input-area { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+#chat-input { flex: 1; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); padding: 10px 12px; font-size: 14px; font-family: inherit; resize: none; min-height: 42px; max-height: 200px; outline: none; }
+#chat-input:focus { border-color: var(--accent); }
+#chat-send { background: var(--accent); color: #fff; border: 2px solid #ff6b81; padding: 8px 16px; cursor: pointer; font-family: var(--font-pixel); font-size: 11px; box-shadow: 3px 3px 0 #8b0000; transition: all .1s; }
+#chat-send:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 #8b0000; }
+#chat-send:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 #8b0000; }
+
+/* Chat sidebar */
+.sidebar-section { padding: 12px; }
+.sidebar-title { font-family: var(--font-pixel); font-size: 9px; text-transform: uppercase; color: var(--warning); letter-spacing: 1px; margin-bottom: 8px; text-shadow: 0 0 6px rgba(255,212,96,0.3); }
+
+/* Files view */
+#files-view { display: none; height: 100%; flex-direction: column; }
+#file-tabs { display: flex; background: var(--bg-secondary); border-bottom: 1px solid var(--border); overflow-x: auto; flex-shrink: 0; min-height: 36px; }
+.file-tab { padding: 6px 14px; font-size: 13px; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.file-tab:hover { color: var(--text); background: var(--bg-tertiary); }
+.file-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.file-tab .close { font-size: 16px; opacity: 0.5; cursor: pointer; }
+.file-tab .close:hover { opacity: 1; }
+#file-content { flex: 1; overflow: auto; padding: 0; position: relative; }
+#file-editor { width: 100%; height: 100%; background: var(--bg); color: var(--text); border: none; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; padding: 16px; resize: none; outline: none; tab-size: 2; }
+#file-preview { padding: 20px 24px; line-height: 1.6; overflow-y: auto; height: 100%; }
+#file-preview h1,#file-preview h2,#file-preview h3 { margin: 16px 0 8px; }
+#file-preview p { margin: 8px 0; }
+#file-preview code { background: var(--bg-tertiary); padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+#file-preview pre { background: var(--bg-tertiary); padding: 12px; border-radius: var(--radius); overflow-x: auto; }
+#file-preview img { max-width: 100%; border-radius: var(--radius); }
+#file-iframe { width: 100%; height: 100%; border: none; background: #fff; }
+.file-mode-bar { display: flex; gap: 4px; padding: 4px 12px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.file-mode-btn { font-size: 12px; padding: 3px 10px; border-radius: 4px; cursor: pointer; background: none; border: 1px solid transparent; color: var(--text-muted); }
+.file-mode-btn.active { background: var(--bg-tertiary); color: var(--text); border-color: var(--border); }
+
+/* File tree */
+.tree-item { padding: 4px 8px 4px 0; cursor: pointer; display: flex; align-items: center; gap: 4px; font-size: 13px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tree-item:hover { background: var(--bg-tertiary); }
+.tree-item .icon { width: 16px; text-align: center; flex-shrink: 0; }
+.tree-children { padding-left: 16px; }
+.tree-dir-toggle { cursor: pointer; user-select: none; }
+
+/* Apps view */
+#apps-view { display: none; height: 100%; flex-direction: column; }
+#apps-list { padding: 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; overflow-y: auto; }
+.app-card { background: var(--bg-secondary); border: 2px solid var(--border); padding: 16px; cursor: pointer; transition: all .15s; box-shadow: 4px 4px 0 rgba(83,52,131,0.4); }
+.app-card:hover { border-color: var(--accent); transform: translate(-2px, -2px); box-shadow: 6px 6px 0 var(--accent-glow); }
+.app-card .name { font-family: var(--font-pixel); font-size: 11px; margin-bottom: 4px; }
+.app-card .path { font-size: 12px; color: var(--text-muted); }
+#app-frame { flex: 1; border: none; display: none; }
+#app-back { display: none; padding: 8px 12px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); }
+#app-back button { background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); padding: 4px 12px; border-radius: 4px; cursor: pointer; }
+
+/* Upload overlay */
+.drop-overlay { display: none; position: absolute; inset: 0; background: var(--accent-dim); border: 2px dashed var(--accent); border-radius: var(--radius); z-index: 100; align-items: center; justify-content: center; font-size: 18px; color: var(--accent); }
+.drop-active .drop-overlay { display: flex; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  #sidebar { position: absolute; left: -100%; top: var(--topbar-h); bottom: var(--bottombar-h); z-index: 50; transition: left .2s; }
+  #sidebar.open { left: 0; }
+  #hamburger { display: block; }
+  :root { --sidebar-w: 240px; }
+  #topbar { flex-wrap: wrap; row-gap: 8px; }
+  .tab-btn { font-size: 10px; padding: 5px 10px; }
+  #chat-messages { padding: 12px; }
+  .msg { max-width: 95%; }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border); }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+  <span class="being-emoji" id="being-emoji">🧵</span>
+  <span class="being-name" id="being-name">Being</span>
+  <div class="spacer"></div>
+  <button class="tab-btn active" data-view="chat" onclick="switchView('chat')">💬 Chat</button>
+  <button class="tab-btn" data-view="files" onclick="switchView('files')">📁 Files</button>
+  <button class="tab-btn" data-view="apps" onclick="switchView('apps')">🚀 Apps</button>
+</div>
+
+<div id="main-layout">
+  <div id="sidebar">
+    <div id="sidebar-chat" class="sidebar-section">
+      <div class="sidebar-title">Activity</div>
+      <div id="activity-list" style="font-size:12px;color:var(--text-muted)"></div>
+    </div>
+    <div id="sidebar-files" class="sidebar-section" style="display:none">
+      <div class="sidebar-title">Files <button onclick="uploadFiles()" style="float:right;background:none;border:none;color:var(--accent);cursor:pointer;font-size:12px">⬆ Upload</button></div>
+      <div id="file-tree" style="position:relative">
+        <div class="drop-overlay">Drop files here</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="content">
+    <!-- Chat View -->
+    <div id="chat-view" style="display:flex;flex-direction:column;height:100%">
+      <div id="chat-messages"></div>
+      <div id="chat-input-area">
+        <textarea id="chat-input" rows="1" placeholder="Message…"></textarea>
+        <button id="chat-send" onclick="sendChat()">Send</button>
+      </div>
+    </div>
+
+    <!-- Files View -->
+    <div id="files-view">
+      <div id="file-tabs"></div>
+      <div class="file-mode-bar" id="file-mode-bar" style="display:none">
+        <button class="file-mode-btn active" onclick="setFileMode('preview')">Preview</button>
+        <button class="file-mode-btn" onclick="setFileMode('edit')">Edit</button>
+        <button class="file-mode-btn" onclick="setFileMode('app')" id="btn-app-mode" style="display:none">App</button>
+      </div>
+      <div id="file-content">
+        <div id="file-preview" style="display:none"></div>
+        <textarea id="file-editor" style="display:none" spellcheck="false"></textarea>
+        <iframe id="file-iframe" style="display:none" sandbox="allow-scripts allow-forms"></iframe>
+        <div id="file-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--text-muted);gap:12px"><span style="font-size:48px">📂</span><span style="font-family:var(--font-pixel);font-size:10px">click a file to explore</span></div>
+      </div>
+    </div>
+
+    <!-- Apps View -->
+    <div id="apps-view">
+      <div id="app-back"><button onclick="closeApp()">← Back to apps</button></div>
+      <div id="apps-list"></div>
+      <iframe id="app-frame" sandbox="allow-scripts allow-forms"></iframe>
+    </div>
+  </div>
+</div>
+
+<div id="bottombar">
+  <span id="status-indicator">●</span>&nbsp;
+  <span id="status-text">connecting…</span>
+  <span style="flex:1"></span>
+  <span id="activity-latest"></span>
+</div>
+
+<input type="file" id="file-upload-input" multiple style="display:none" onchange="handleUpload(this.files)">
+
+<script>
+// --- State ---
+let currentView = 'chat';
+let openFiles = []; // [{path, content, mode, modified}]
+let activeFileIdx = -1;
+let ws = null;
+let wsRetry = 1000;
+let soulInfo = {};
+let sessionId = null;
+let isStreaming = false;
+let saveTimers = {};
+let authToken = null;
+let wsPingInterval = null;
+
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+function initAuth() {
+  const params = new URLSearchParams(location.search);
+  const tok = params.get('token');
+  if (tok) {
+    authToken = tok;
+    try { sessionStorage.setItem('cowork_token', tok); } catch (e) {}
+    params.delete('token');
+    const newSearch = params.toString();
+    history.replaceState(null, '', location.pathname + (newSearch ? '?' + newSearch : '') + location.hash);
+  } else {
+    try { authToken = sessionStorage.getItem('cowork_token'); } catch (e) {}
+  }
+}
+
+function authHeaders() {
+  const h = {};
+  if (authToken) h['Authorization'] = 'Bearer ' + authToken;
+  return h;
+}
+
+function jsonAuthHeaders() {
+  return { ...authHeaders(), 'Content-Type': 'application/json' };
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/'/g, '&#39;');
+}
+
+// --- Init ---
+async function init() {
+  initAuth();
+  await loadSoul();
+  await loadHistory();
+  connectWs();
+  setupInput();
+}
+
+async function loadSoul() {
+  try {
+    const r = await fetch('/api/soul', { headers: authHeaders() });
+    soulInfo = await r.json();
+    if (soulInfo.name) {
+      $('#being-name').textContent = soulInfo.name;
+      document.title = `Cowork — ${soulInfo.name}`;
+    }
+  } catch(e) { console.warn('soul load failed', e); }
+}
+
+// --- View switching ---
+function switchView(view) {
+  currentView = view;
+  $$('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  $('#chat-view').style.display = view === 'chat' ? 'flex' : 'none';
+  $('#files-view').style.display = view === 'files' ? 'flex' : 'none';
+  $('#apps-view').style.display = view === 'apps' ? 'flex' : 'none';
+  $('#sidebar-chat').style.display = view === 'chat' ? 'block' : 'none';
+  $('#sidebar-files').style.display = view === 'files' ? 'block' : 'none';
+  if (view === 'files') loadFileTree();
+  if (view === 'apps') loadApps();
+  // Close mobile sidebar
+  $('#sidebar').classList.remove('open');
+}
+
+// --- Chat ---
+function setupInput() {
+  const input = $('#chat-input');
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+  input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+  });
+}
+
+function trimChatMessages() {
+  const el = $('#chat-messages');
+  while (el.children.length > 400) el.firstChild.remove();
+}
+
+function addMsg(role, html, streaming) {
+  const el = document.createElement('div');
+  el.className = `msg ${role}`;
+  if (streaming) el.classList.add('stream-cursor');
+  el.innerHTML = html;
+  $('#chat-messages').appendChild(el);
+  trimChatMessages();
+  $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight;
+  return el;
+}
+
+function addSystemMsg(text) {
+  const el = document.createElement('div');
+  el.className = 'msg system';
+  el.textContent = text;
+  $('#chat-messages').appendChild(el);
+  trimChatMessages();
+  $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight;
+}
+
+function renderMd(text) {
+  const s = String(text);
+  if (typeof marked !== 'undefined') {
+    try {
+      const raw = marked.parse(s, { breaks: true });
+      if (typeof DOMPurify !== 'undefined') {
+        return DOMPurify.sanitize(raw, { USE_PROFILES: { html: true } });
+      }
+      return raw;
+    } catch (e) {}
+  }
+  return s.replace(/</g,'&lt;').replace(/\n/g,'<br>');
+}
+
+async function sendChat() {
+  const input = $('#chat-input');
+  const msg = input.value.trim();
+  if (!msg || isStreaming) return;
+  input.value = '';
+  input.style.height = 'auto';
+
+  addMsg('user', renderMd(msg));
+
+  const body = { message: msg };
+  if (sessionId) body.session_id = sessionId;
+
+  try {
+    isStreaming = true;
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = await res.text(); } catch (e) { detail = res.statusText || 'request failed'; }
+      addSystemMsg('⚠ ' + detail);
+      isStreaming = false;
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let streamEl = null;
+    let streamText = '';
+    let eventType = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) { eventType = line.slice(7).trim(); continue; }
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const data = JSON.parse(line.slice(6));
+
+          if (eventType === 'content_block_delta') {
+            streamText += data.delta?.text || '';
+            if (!streamEl) streamEl = addMsg('assistant', renderMd(streamText), true);
+            else { streamEl.innerHTML = renderMd(streamText); $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight; }
+          }
+          if (eventType === 'tool_use') {
+            addActivity('🔧 ' + (data.name || 'tool'));
+          }
+          if (eventType === 'thinking') {
+            setStatus('thinking…', 'var(--warning)');
+          }
+          if (eventType === 'message_stop') {
+            if (streamEl) { streamEl.classList.remove('stream-cursor'); streamEl.innerHTML = renderMd(streamText); }
+            if (data.session_id) sessionId = data.session_id;
+            isStreaming = false;
+            setStatus('connected', 'var(--success)');
+          }
+          if (eventType === 'error') {
+            addSystemMsg('⚠ ' + (data.message || 'error'));
+            isStreaming = false;
+          }
+        } catch(e) { console.warn('SSE parse error', line); }
+      }
+    }
+
+    if (streamEl && streamText) {
+      streamEl.classList.remove('stream-cursor');
+      streamEl.innerHTML = renderMd(streamText);
+    }
+    isStreaming = false;
+    setStatus('connected', 'var(--success)');
+  } catch(e) {
+    addSystemMsg('⚠ ' + (e && e.message ? e.message : String(e)));
+    isStreaming = false;
+  }
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/history?limit=100', { headers: authHeaders() });
+    if (!r.ok) return;
+    const data = await r.json();
+    const list = data.messages || data.history;
+    if (list && list.length) {
+      for (const msg of list) {
+        addMsg(msg.role === 'user' ? 'user' : 'assistant', renderMd(msg.content || ''));
+      }
+    }
+  } catch(e) {}
+}
+
+// --- Files ---
+async function loadFileTree() {
+  try {
+    const r = await fetch('/api/files', { headers: authHeaders() });
+    const entries = await r.json();
+    $('#file-tree').innerHTML = '<div class="drop-overlay">Drop files here</div>' + renderTree(entries, '');
+    setupDragDrop();
+  } catch(e) {
+    $('#file-tree').innerHTML = '<div style="color:var(--danger);padding:8px">Failed to load files</div>';
+  }
+}
+
+function renderTree(entries, prefix) {
+  let html = '';
+  for (const e of entries) {
+    const indent = prefix ? `padding-left:${prefix.split('/').length * 16}px` : '';
+    if (e.is_dir) {
+      html += `<div class="tree-item tree-dir-toggle" style="${indent}" onclick="toggleDir(this)" data-path="${escapeAttr(e.path)}">
+        <span class="icon">▶</span> 📁 ${escapeHtml(e.name)}</div>`;
+      if (e.children && e.children.length) {
+        html += `<div class="tree-children" style="display:none">${renderTree(e.children, e.path)}</div>`;
+      } else {
+        html += `<div class="tree-children" style="display:none" data-lazy="${e.path}"></div>`;
+      }
+    } else {
+      const icon = fileIcon(e.name);
+      html += `<div class="tree-item" style="${indent}" onclick="openFile(${JSON.stringify(e.path)})">
+        <span class="icon">${icon}</span> ${escapeHtml(e.name)}</div>`;
+    }
+  }
+  return html;
+}
+
+function fileIcon(name) {
+  if (/\.md$/i.test(name)) return '📝';
+  if (/\.html?$/i.test(name)) return '🌐';
+  if (/\.(png|jpe?g|gif|svg|webp)$/i.test(name)) return '🖼';
+  if (/\.(rs|js|ts|py|toml|json|yml|yaml|sh)$/i.test(name)) return '📄';
+  return '📃';
+}
+
+function toggleDir(el) {
+  const children = el.nextElementSibling;
+  if (!children) return;
+  const open = children.style.display !== 'none';
+  children.style.display = open ? 'none' : 'block';
+  el.querySelector('.icon').textContent = open ? '▶' : '▼';
+
+  // Lazy load
+  const lazy = children.dataset.lazy;
+  if (lazy && !children.innerHTML) {
+    fetch(`/api/files?path=${encodeURIComponent(lazy)}`, { headers: authHeaders() })
+      .then(r => r.json())
+      .then(entries => { children.innerHTML = renderTree(entries, lazy); })
+      .catch(() => { children.innerHTML = '<div style="color:var(--danger);padding:4px 8px">Error</div>'; });
+  }
+}
+
+async function openFile(path) {
+  // Check if already open
+  let idx = openFiles.findIndex(f => f.path === path);
+  if (idx >= 0) { activateTab(idx); return; }
+
+  const ext = path.split('.').pop().toLowerCase();
+  const isImage = ['png','jpg','jpeg','gif','svg','webp'].includes(ext);
+  const isMd = ext === 'md';
+  const isHtml = ['html','htm'].includes(ext);
+
+  let content = '';
+  if (!isImage) {
+    try {
+      const r = await fetch(`/api/file?path=${encodeURIComponent(path)}`, { headers: authHeaders() });
+      content = await r.text();
+    } catch(e) { content = '(failed to load)'; }
+  }
+
+  const mode = isImage ? 'image' : isMd ? 'preview' : isHtml ? 'app' : 'edit';
+  openFiles.push({ path, content, mode, modified: false, isImage, isMd, isHtml });
+  idx = openFiles.length - 1;
+  renderTabs();
+  activateTab(idx);
+}
+
+function renderTabs() {
+  $('#file-tabs').innerHTML = openFiles.map((f, i) => {
+    const name = escapeHtml(f.path.split('/').pop() || '');
+    const mod = f.modified ? '●' : '';
+    return `<div class="file-tab ${i === activeFileIdx ? 'active' : ''}" onclick="activateTab(${i})">
+      ${name} ${mod} <span class="close" onclick="event.stopPropagation();closeTab(${i})">×</span></div>`;
+  }).join('');
+}
+
+function activateTab(idx) {
+  if (idx < 0 || idx >= openFiles.length) return;
+  activeFileIdx = idx;
+  const f = openFiles[idx];
+  renderTabs();
+
+  // Hide all
+  $('#file-preview').style.display = 'none';
+  $('#file-editor').style.display = 'none';
+  $('#file-iframe').style.display = 'none';
+  $('#file-empty').style.display = 'none';
+  $('#file-mode-bar').style.display = 'flex';
+  $('#btn-app-mode').style.display = f.isHtml ? 'inline-block' : 'none';
+
+  // Set mode buttons
+  $$('.file-mode-btn').forEach(b => b.classList.toggle('active', b.textContent.trim().toLowerCase() === f.mode));
+
+  showFileContent(f);
+}
+
+function showFileContent(f) {
+  $('#file-preview').style.display = 'none';
+  $('#file-editor').style.display = 'none';
+  $('#file-iframe').style.display = 'none';
+
+  if (f.mode === 'image') {
+    const prev = $('#file-preview');
+    prev.style.display = 'block';
+    $('#file-mode-bar').style.display = 'none';
+    prev.innerHTML = '<span style="color:var(--text-muted)">Loading…</span>';
+    fetch(`/api/file?path=${encodeURIComponent(f.path)}`, { headers: authHeaders() })
+      .then(r => { if (!r.ok) throw new Error('load failed'); return r.blob(); })
+      .then(blob => {
+        if (f._blobUrl) URL.revokeObjectURL(f._blobUrl);
+        f._blobUrl = URL.createObjectURL(blob);
+        prev.innerHTML = `<img src="${f._blobUrl}" alt="">`;
+      })
+      .catch(() => { prev.innerHTML = '<span style="color:var(--danger)">Failed to load image</span>'; });
+  } else if (f.mode === 'preview') {
+    $('#file-preview').style.display = 'block';
+    $('#file-preview').innerHTML = renderMd(f.content);
+  } else if (f.mode === 'edit') {
+    const ed = $('#file-editor');
+    ed.style.display = 'block';
+    ed.value = f.content;
+    ed.oninput = () => {
+      f.content = ed.value;
+      f.modified = true;
+      renderTabs();
+      debounceSave(f);
+    };
+  } else if (f.mode === 'app') {
+    const iframe = $('#file-iframe');
+    iframe.style.display = 'block';
+    iframe.srcdoc = f.content;
+  }
+}
+
+function setFileMode(mode) {
+  if (activeFileIdx < 0) return;
+  const f = openFiles[activeFileIdx];
+  if (f.isImage) return;
+  f.mode = mode;
+  $$('.file-mode-btn').forEach(b => b.classList.toggle('active', b.textContent.trim().toLowerCase() === mode));
+  showFileContent(f);
+}
+
+function closeTab(idx) {
+  const removed = openFiles[idx];
+  if (removed && removed._blobUrl) URL.revokeObjectURL(removed._blobUrl);
+  openFiles.splice(idx, 1);
+  if (activeFileIdx >= openFiles.length) activeFileIdx = openFiles.length - 1;
+  renderTabs();
+  if (activeFileIdx >= 0) activateTab(activeFileIdx);
+  else {
+    $('#file-preview').style.display = 'none';
+    $('#file-editor').style.display = 'none';
+    $('#file-iframe').style.display = 'none';
+    $('#file-empty').style.display = 'flex';
+    $('#file-mode-bar').style.display = 'none';
+  }
+}
+
+function debounceSave(f) {
+  if (saveTimers[f.path]) clearTimeout(saveTimers[f.path]);
+  saveTimers[f.path] = setTimeout(() => saveFile(f), 500);
+}
+
+async function saveFile(f) {
+  try {
+    await fetch(`/api/file?path=${encodeURIComponent(f.path)}`, {
+      method: 'PUT',
+      headers: { ...authHeaders(), 'Content-Type': 'text/plain' },
+      body: f.content
+    });
+    f.modified = false;
+    renderTabs();
+  } catch(e) { console.warn('save failed', e); }
+}
+
+// --- Upload ---
+function uploadFiles() {
+  $('#file-upload-input').click();
+}
+
+async function handleUpload(files) {
+  for (const file of files) {
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      await fetch(`/api/upload?path=`, { method: 'POST', headers: authHeaders(), body: formData });
+    } catch(e) { console.warn('upload failed', e); }
+  }
+  loadFileTree();
+}
+
+function setupDragDrop() {
+  const tree = $('#file-tree');
+  tree.addEventListener('dragover', e => { e.preventDefault(); tree.classList.add('drop-active'); });
+  tree.addEventListener('dragleave', () => tree.classList.remove('drop-active'));
+  tree.addEventListener('drop', async e => {
+    e.preventDefault();
+    tree.classList.remove('drop-active');
+    if (e.dataTransfer.files.length) await handleUpload(e.dataTransfer.files);
+  });
+}
+
+// --- Apps ---
+async function loadApps() {
+  try {
+    const r = await fetch('/api/files', { headers: authHeaders() });
+    const entries = await r.json();
+    const htmlFiles = flattenHtml(entries);
+    $('#apps-list').innerHTML = htmlFiles.length ? htmlFiles.map(f =>
+      `<div class="app-card" onclick="openApp(${JSON.stringify(f.path)})">
+        <div class="name">🚀 ${escapeHtml(f.name)}</div>
+        <div class="path">${escapeHtml(f.path)}</div>
+      </div>`
+    ).join('') : '<div style="color:var(--text-muted);padding:32px;text-align:center"><div style="font-size:48px;margin-bottom:12px">🏠</div><div style="font-family:var(--font-pixel);font-size:10px">no apps yet!<br><br>being can create .html apps here</div></div>';
+    $('#apps-list').style.display = 'grid';
+    $('#app-frame').style.display = 'none';
+    $('#app-back').style.display = 'none';
+  } catch(e) {}
+}
+
+function flattenHtml(entries) {
+  let result = [];
+  for (const e of entries) {
+    if (!e.is_dir && /\.html?$/i.test(e.name)) result.push(e);
+    if (e.children) result = result.concat(flattenHtml(e.children));
+  }
+  return result;
+}
+
+async function openApp(path) {
+  $('#apps-list').style.display = 'none';
+  $('#app-back').style.display = 'block';
+  const frame = $('#app-frame');
+  frame.style.display = 'block';
+  frame.removeAttribute('src');
+  try {
+    const r = await fetch(`/api/file?path=${encodeURIComponent(path)}`, { headers: authHeaders() });
+    if (!r.ok) throw new Error('load failed');
+    frame.srcdoc = await r.text();
+  } catch (e) {
+    frame.srcdoc = '<p style="padding:16px;color:#c00">Failed to load app.</p>';
+  }
+}
+
+function closeApp() {
+  const frame = $('#app-frame');
+  frame.style.display = 'none';
+  frame.removeAttribute('src');
+  frame.srcdoc = '';
+  $('#app-back').style.display = 'none';
+  $('#apps-list').style.display = 'grid';
+}
+
+// --- WebSocket ---
+function connectWs() {
+  if (wsPingInterval) {
+    clearInterval(wsPingInterval);
+    wsPingInterval = null;
+  }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    setStatus('connected', 'var(--success)');
+    wsRetry = 1000;
+    if (authToken) {
+      try { ws.send(JSON.stringify({ token: authToken })); } catch (e) {}
+    }
+    wsPingInterval = setInterval(() => {
+      if (ws && ws.readyState === 1) {
+        try { ws.send('ping'); } catch (e) {}
+      }
+    }, 30000);
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      addActivity(`${data.type === 'file-created' ? '➕' : data.type === 'file-deleted' ? '🗑' : '✏️'} ${data.path}`);
+      // Refresh file tree if on files view
+      if (currentView === 'files') loadFileTree();
+      // Refresh open file if changed
+      const idx = openFiles.findIndex(f => f.path === data.path);
+      if (idx >= 0 && !openFiles[idx].modified) {
+        fetch(`/api/file?path=${encodeURIComponent(data.path)}`, { headers: authHeaders() })
+          .then(r => r.text())
+          .then(content => {
+            openFiles[idx].content = content;
+            if (idx === activeFileIdx) showFileContent(openFiles[idx]);
+          });
+      }
+    } catch(e) {}
+  };
+
+  ws.onclose = () => {
+    if (wsPingInterval) {
+      clearInterval(wsPingInterval);
+      wsPingInterval = null;
+    }
+    setStatus('disconnected', 'var(--danger)');
+    setTimeout(connectWs, wsRetry);
+    wsRetry = Math.min(wsRetry * 2, 8000);
+  };
+
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+// --- UI helpers ---
+function setStatus(text, color) {
+  $('#status-text').textContent = text;
+  $('#status-indicator').style.color = color || 'var(--text-muted)';
+}
+
+function addActivity(text) {
+  const el = $('#activity-list');
+  const item = document.createElement('div');
+  item.style.padding = '2px 0';
+  const time = new Date().toLocaleTimeString('en', {hour:'2-digit',minute:'2-digit'});
+  item.textContent = `${time} ${text}`;
+  el.prepend(item);
+  // Keep max 50
+  while (el.children.length > 50) el.lastChild.remove();
+  $('#activity-latest').textContent = `${text} · just now`;
+}
+
+// --- Start ---
+init();
+</script>
+</body>
+</html>

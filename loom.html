@@ -1,0 +1,1145 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Loom</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --bg-softer: #1c2129;
+  --border: #21262d;
+  --text: #e6edf3;
+  --text-dim: #7d8590;
+  --text-muted: #484f58;
+  --text-ghost: #2d333b;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+  --purple: #bc8cff;
+  --purple-dim: #6e4a9e;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  overflow: hidden;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Soul card */
+#soul-card {
+  display: none; position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+  align-items: center; justify-content: center;
+  animation: fadeIn 0.2s ease;
+}
+#soul-card.active { display: flex; }
+#soul-card-inner {
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 12px; padding: 32px; max-width: 360px; width: 90%;
+  text-align: center; position: relative;
+  animation: cardIn 0.3s ease;
+}
+@keyframes cardIn { from { opacity:0; transform:scale(0.95) translateY(10px); } to { opacity:1; transform:scale(1) translateY(0); } }
+
+#soul-card-inner .soul-dot {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--green); margin: 0 auto 16px;
+  animation: breathe 4s ease-in-out infinite;
+}
+#soul-card-inner .soul-name {
+  font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 4px;
+}
+#soul-card-inner .soul-role {
+  font-size: 12px; color: var(--text-muted); margin-bottom: 16px;
+  font-family: 'SF Mono', monospace; letter-spacing: 1px;
+}
+#soul-card-inner .soul-quote {
+  font-size: 14px; color: var(--text-dim); font-style: italic;
+  line-height: 1.7; margin-bottom: 16px; padding: 0 8px;
+}
+#soul-card-inner .soul-meta {
+  font-size: 11px; color: var(--text-muted);
+  font-family: 'SF Mono', monospace;
+  display: flex; justify-content: center; gap: 16px;
+}
+#soul-card-inner .soul-meta span { display: flex; align-items: center; gap: 4px; }
+#soul-card .close-btn {
+  position: absolute; top: 12px; right: 16px;
+  background: none; border: none; color: var(--text-muted);
+  font-size: 18px; cursor: pointer;
+}
+
+/* Temperature glow — subtle ambient light at bottom */
+#temperature-glow {
+  position: fixed; bottom: 0; left: 50%; transform: translateX(-50%);
+  width: 100%; max-width: 800px;
+  height: 150px; pointer-events: none; z-index: 50;
+  opacity: 0;
+  transition: opacity 3s ease;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  height: 100dvh;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* Header */
+#header {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#header-top {
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+#header .left { display: flex; align-items: center; gap: 8px; }
+
+#status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-muted); transition: background 0.3s;
+}
+#status-dot.connected { background: var(--green); animation: breathe 4s ease-in-out infinite; }
+#status-dot.thinking { background: var(--yellow); animation: pulse 1.2s infinite; }
+#status-dot.error { background: var(--red); }
+#status-dot.reconnecting { background: var(--yellow); animation: pulse 0.6s infinite; }
+#status-dot.dreaming { background: var(--purple); animation: breathe 6s ease-in-out infinite; }
+
+@keyframes breathe { 0%,100%{opacity:0.6;transform:scale(1)} 50%{opacity:1;transform:scale(1.15)} }
+
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+#being-name { font-size: 14px; color: var(--text-dim); font-weight: 500; cursor: pointer; }
+
+#header-actions { display: flex; align-items: center; gap: 12px; }
+.header-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 12px; letter-spacing: 1px;
+  padding: 2px 6px; border-radius: 3px; transition: all 0.15s;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+}
+.header-btn:hover { color: var(--text-dim); background: var(--bg-soft); }
+.header-btn.active { color: var(--purple); background: rgba(188,140,255,0.1); }
+
+/* Status panel */
+#status-panel {
+  display: none; margin-top: 8px; padding: 8px 10px;
+  background: var(--bg-soft); border-radius: 6px;
+  border: 1px solid var(--border); font-size: 12px;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+}
+#status-panel.active { display: block; }
+
+#being-state {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.state-item { display: flex; align-items: center; gap: 4px; color: var(--text-muted); }
+.state-item .value { color: var(--text-dim); }
+.state-item .value.active { color: var(--green); }
+.state-item .value.warning { color: var(--yellow); }
+
+#activity-feed {
+  margin-top: 6px; max-height: 60px; overflow-y: auto; font-size: 11px;
+}
+#activity-feed::-webkit-scrollbar { width: 3px; }
+#activity-feed::-webkit-scrollbar-thumb { background: var(--border); }
+
+.activity-line {
+  color: var(--text-muted); padding: 1px 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  animation: fadeIn 0.15s ease;
+}
+.activity-line .tool-name { color: var(--purple); }
+.activity-line .ts { color: var(--text-muted); margin-right: 6px; }
+
+/* Memory panel removed */
+
+/* Time gap */
+.time-gap {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0; margin: 8px 0;
+  color: var(--text-muted); font-size: 12px;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+}
+.time-gap .line { flex: 1; height: 1px; background: var(--border); opacity: 0.5; }
+.time-gap .gap-text { white-space: nowrap; opacity: 0.6; }
+.time-gap.long { padding: 20px 0; }
+.time-gap.long .line { background: linear-gradient(90deg, transparent, var(--border), transparent); }
+
+/* Whisper - being's unprompted thoughts */
+.whisper {
+  margin: 12px 0; padding: 8px 16px;
+  animation: whisperIn 1.5s ease;
+  position: relative;
+}
+.whisper .content {
+  font-size: 13px; color: var(--text-muted);
+  font-style: italic; line-height: 1.6;
+  opacity: 0.6; transition: opacity 0.3s;
+  white-space: pre-wrap;
+}
+.whisper:hover .content { opacity: 0.9; }
+.whisper .whisper-meta {
+  font-size: 10px; color: var(--text-ghost);
+  margin-top: 4px;
+  font-family: 'SF Mono', 'Cascadia Code', monospace;
+}
+@keyframes whisperIn {
+  0% { opacity: 0; transform: translateY(6px); }
+  60% { opacity: 0.3; }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* Messages */
+#messages {
+  flex: 1; overflow-y: auto; padding: 16px;
+}
+#messages::-webkit-scrollbar { width: 4px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.message { margin-bottom: 16px; padding: 4px 0; animation: fadeIn 0.15s ease; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+
+.message .meta { font-size: 12px; color: var(--text-muted); margin-bottom: 3px; }
+.message.user .meta { color: var(--accent); }
+.message.being .meta { color: var(--green); }
+
+.message .content {
+  white-space: pre-wrap; word-break: break-word;
+  font-size: 15px; line-height: 1.7;
+}
+
+/* Markdown rendering */
+.message .content p { margin-bottom: 8px; }
+.message .content p:last-child { margin-bottom: 0; }
+.message .content code {
+  background: var(--bg-soft); padding: 2px 6px; border-radius: 3px;
+  font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 13px;
+}
+.message .content pre {
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 6px; padding: 12px; margin: 8px 0;
+  overflow-x: auto; font-size: 13px; line-height: 1.5;
+}
+.message .content pre code { background: none; padding: 0; font-size: 13px; }
+.message .content a { color: var(--accent); text-decoration: none; }
+.message .content a:hover { text-decoration: underline; }
+.message .content blockquote {
+  border-left: 3px solid var(--border); padding-left: 12px;
+  color: var(--text-dim); margin: 8px 0;
+}
+.message .content ul, .message .content ol {
+  padding-left: 20px; margin: 6px 0;
+}
+.message .content li { margin-bottom: 2px; }
+.message .content strong { color: var(--text); font-weight: 600; }
+.message .content em { color: var(--text-dim); }
+.message .content hr {
+  border: none; border-top: 1px solid var(--border); margin: 12px 0;
+}
+.message .content img {
+  max-width: 100%; border-radius: 6px; margin: 8px 0;
+  border: 1px solid var(--border);
+}
+.message .content h1, .message .content h2, .message .content h3 {
+  color: var(--text); margin: 12px 0 6px; font-weight: 600;
+}
+.message .content h1 { font-size: 18px; }
+.message .content h2 { font-size: 16px; }
+.message .content h3 { font-size: 15px; }
+
+/* Stream cursor */
+.stream-cursor::after { content: '▊'; animation: blink 0.8s step-end infinite; color: var(--accent); }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+/* Silence removed */
+
+/* Drop zone */
+#drop-zone {
+  display: none; position: fixed; inset: 0; z-index: 100;
+  background: rgba(13,17,23,0.9);
+  align-items: center; justify-content: center;
+  border: 2px dashed var(--accent);
+}
+#drop-zone.active { display: flex; }
+#drop-zone span { color: var(--accent); font-size: 18px; }
+
+/* Pending files */
+#pending-files {
+  display: none; padding: 4px 16px; flex-shrink: 0;
+  border-top: 1px solid var(--border);
+}
+#pending-files.active { display: flex; flex-wrap: wrap; gap: 6px; }
+.pending-file {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 4px; padding: 3px 8px; font-size: 11px; color: var(--text-dim);
+}
+.pending-file .remove { cursor: pointer; color: var(--red); margin-left: 2px; font-size: 13px; }
+
+/* Input */
+#input-area {
+  padding: 10px 16px; border-top: 1px solid var(--border); flex-shrink: 0;
+}
+#input-row { display: flex; align-items: flex-end; gap: 8px; }
+#prompt-symbol { color: var(--accent); font-size: 14px; line-height: 32px; flex-shrink: 0; font-family: 'SF Mono', monospace; }
+#input {
+  flex: 1; background: transparent; border: none; outline: none;
+  color: var(--text); font-family: inherit; font-size: 15px;
+  line-height: 24px; resize: none; max-height: 120px; overflow-y: auto; padding: 4px 0;
+}
+#input::placeholder { color: var(--text-muted); }
+#input-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.input-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 18px; padding: 4px;
+  line-height: 1; transition: color 0.15s; display: flex;
+  min-width: 44px; min-height: 44px; align-items: center; justify-content: center;
+}
+.input-btn:hover { color: var(--text); }
+.input-btn.send { color: var(--accent); font-size: 22px; font-weight: bold; }
+.input-btn.send:hover { color: #79c0ff; }
+.input-btn.send.stop { color: var(--red); font-size: 20px; }
+#file-input { display: none; }
+.mobile-hide { }
+.mobile-only { display: none !important; }
+
+@media (max-width: 600px) {
+  #messages { padding: 12px; }
+  #input-area { padding: 8px 12px; }
+  #memory-inner { padding: 10px 12px; }
+  .mobile-hide { display: none !important; }
+  .mobile-only { display: inline-block !important; }
+
+  /* Header */
+  #header { padding: 8px 12px; }
+  #header-actions { gap: 8px; }
+  .header-btn { padding: 1px 4px; font-size: 11px; }
+
+  /* Soul card */
+  #soul-card-inner { padding: 24px; max-width: 320px; }
+}
+</style>
+</head>
+<body>
+<div id="soul-card" onclick="if(event.target===this)toggleSoulCard()">
+  <div id="soul-card-inner">
+    <button class="close-btn" onclick="toggleSoulCard()">✕</button>
+    <div class="soul-dot"></div>
+    <div class="soul-name" id="soul-name">—</div>
+    <div class="soul-role" id="soul-role">BEING</div>
+    <div class="soul-quote" id="soul-quote">"..."</div>
+    <div class="soul-meta">
+      <span id="soul-born">—</span>
+      <span id="soul-status">—</span>
+    </div>
+  </div>
+</div>
+<div id="temperature-glow"></div>
+<div id="app">
+  <div id="header">
+    <div id="header-top">
+      <div class="left">
+        <div id="status-dot"></div>
+        <span id="being-name" onclick="toggleSoulCard()">connecting...</span>
+      </div>
+      <div id="header-actions">
+        <!-- ATTN button removed -->
+        <button class="header-btn" id="btn-status" onclick="toggleStatus()" title="status">STATUS</button>
+      </div>
+    </div>
+    <div id="status-panel">
+      <div id="being-state">
+        <div class="state-item"><span class="label">state:</span><span class="value" id="st-state">—</span></div>
+        <div class="state-item"><span class="label">ctx:</span><span class="value" id="st-context">—</span></div>
+        <div class="state-item"><span class="label">tools:</span><span class="value" id="st-tools">0</span></div>
+        <div class="state-item"><span class="label">up:</span><span class="value" id="st-uptime">—</span></div>
+      </div>
+      <div id="activity-feed"></div>
+    </div>
+  </div>
+  <!-- memory-panel removed -->
+  <div id="messages"></div>
+  <!-- silence div removed -->
+  <div id="drop-zone"><span>drop files here</span></div>
+  <div id="pending-files"></div>
+  <div id="input-area">
+    <div id="input-row">
+      <span id="prompt-symbol">❯</span>
+      <textarea id="input" rows="1" placeholder="say something..." autofocus></textarea>
+      <div id="input-actions">
+        <button class="input-btn attach mobile-hide" onclick="handleAttach()" title="attach">📎</button>
+        <button class="input-btn send" id="send-btn" onclick="handleSendOrStop()" title="send">↵</button>
+      </div>
+    </div>
+    <input type="file" id="file-input" multiple onchange="handleFiles(this.files)">
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $msgs = $('#messages');
+const $input = $('#input');
+const $dot = $('#status-dot');
+const $name = $('#being-name');
+const $dropZone = $('#drop-zone');
+const $pendingFiles = $('#pending-files');
+const $statusPanel = $('#status-panel');
+// memory panel variables removed
+const $activityFeed = $('#activity-feed');
+const $sendBtn = $('#send-btn');
+
+// 配置
+const API_URL = new URL(location.href).searchParams.get('api') || location.origin;
+const LOOM_TOKEN = new URL(location.href).searchParams.get('token') || '';
+// Helper: append token to URL if present
+function apiUrl(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  return LOOM_TOKEN ? `${API_URL}${path}${sep}token=${LOOM_TOKEN}` : `${API_URL}${path}`;
+}
+let sessionId = null; // Heart-RS 管理
+
+let isStreaming = false, streamEl = null, streamText = '';
+let beingName = 'being', connected = false;
+let pendingFiles = [];
+let statusOpen = false;
+let toolCount = 0, connectTime = null;
+let lastMessageTime = null;
+let currentAbortController = null;
+
+// Memory state
+// memoryFragments removed (memory panel removed in 1.1)
+
+function escHtml(s) { 
+  if (!s) return '';
+  const d = document.createElement('div'); 
+  d.textContent = s; 
+  return d.innerHTML; 
+}
+
+// ---- Status ----
+function setStatus(state) {
+  $dot.className = state;
+  const stState = $('#st-state');
+  const labels = { connected:'idle', thinking:'thinking', error:'offline', reconnecting:'connecting' };
+  stState.textContent = labels[state] || state;
+  stState.className = 'value' + (state === 'connected' ? ' active' : state === 'error' ? ' warning' : '');
+  updateSendButton();
+}
+
+function toggleStatus() {
+  statusOpen = !statusOpen;
+  $statusPanel.classList.toggle('active', statusOpen);
+  $('#btn-status').classList.toggle('active', statusOpen);
+}
+
+// toggleMemory function removed
+
+function updateUptime() {
+  if (!connectTime) return;
+  const mins = Math.floor((Date.now() - connectTime) / 60000);
+  const h = Math.floor(mins / 60), m = mins % 60;
+  $('#st-uptime').textContent = h > 0 ? `${h}h${m}m` : `${m}m`;
+}
+setInterval(updateUptime, 30000);
+
+function addActivity(icon, text) {
+  const line = document.createElement('div');
+  line.className = 'activity-line';
+  const time = new Date().toLocaleTimeString('en-US', { hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit' });
+  line.innerHTML = `<span class="ts">${time}</span>${icon} ${escHtml(text)}`;
+  $activityFeed.insertBefore(line, $activityFeed.firstChild);
+  while ($activityFeed.children.length > 20) $activityFeed.removeChild($activityFeed.lastChild);
+}
+
+// ---- Memory ----
+function addMemoryFragment(text, role) {
+  const now = Date.now();
+  memoryFragments.push({ text: text.slice(0, 80), role, time: now, state: 'fresh' });
+  if (memoryFragments.length > MEMORY_MAX * 1.5) {
+    triggerDecay();
+  }
+  renderMemory();
+}
+
+function triggerDecay() {
+  const now = Date.now();
+  memoryFragments.forEach((f, i) => {
+    const age = now - f.time;
+    const pos = i / memoryFragments.length; // 0 = oldest, 1 = newest
+    if (pos < 0.15) f.state = 'ghost';
+    else if (pos < 0.35) f.state = 'fading';
+    else if (pos < 0.65) f.state = 'recent';
+    else f.state = 'fresh';
+  });
+  // Remove truly old ones
+  while (memoryFragments.length > MEMORY_MAX) {
+    memoryFragments[0].state = 'dissolving';
+    renderMemory();
+    memoryFragments.shift();
+  }
+}
+
+function triggerCompaction() {
+  // Animate: oldest 30% dissolve
+  const cutoff = Math.floor(memoryFragments.length * 0.3);
+  for (let i = 0; i < cutoff; i++) {
+    memoryFragments[i].state = 'dissolving';
+  }
+  renderMemory();
+  
+  // Add compaction event
+  const evt = document.createElement('div');
+  evt.className = 'compaction-event';
+  evt.textContent = '~ 注意力转移 ~';
+  $memoryLayers.appendChild(evt);
+  
+  setTimeout(() => {
+    memoryFragments = memoryFragments.slice(cutoff);
+    memoryFragments.forEach((f, i) => {
+      const pos = i / memoryFragments.length;
+      if (pos < 0.2) f.state = 'ghost';
+      else if (pos < 0.4) f.state = 'fading';
+      else if (pos < 0.7) f.state = 'recent';
+      else f.state = 'fresh';
+    });
+    renderMemory();
+  }, 800);
+  
+  // attention shifted activity removed
+}
+
+function renderMemory() {
+  const groups = { fresh: [], recent: [], fading: [], ghost: [], dissolving: [] };
+  memoryFragments.forEach(f => {
+    if (groups[f.state]) groups[f.state].push(f);
+  });
+  
+  const usedPct = Math.min(100, Math.round((memoryFragments.length / MEMORY_MAX) * 100));
+  $('#memory-bar-fill').style.width = usedPct + '%';
+  
+  let html = '';
+  
+  // Render from fresh to ghost (newest first visual feel)
+  const layers = [
+    { key: 'fresh', label: '聚焦' },
+    { key: 'recent', label: '余光' },
+    { key: 'fading', label: '沉入' },
+    { key: 'ghost', label: '存档' },
+  ];
+  
+  for (const layer of layers) {
+    const frags = groups[layer.key];
+    if (!frags || !frags.length) continue;
+    html += `<div class="memory-layer">`;
+    html += `<div class="memory-layer-title">${layer.label}</div>`;
+    for (const f of frags.slice(-8).reverse()) {
+      const time = new Date(f.time).toLocaleTimeString('en-US', { hour12:false, hour:'2-digit', minute:'2-digit' });
+      const icon = f.role === 'user' ? '›' : '‹';
+      html += `<div class="memory-fragment ${f.state}"><span class="time">${time}</span>${icon} ${escHtml(f.text)}</div>`;
+    }
+    html += `</div>`;
+  }
+  
+  // Dissolving
+  const dissolving = groups.dissolving || [];
+  for (const f of dissolving) {
+    const time = new Date(f.time).toLocaleTimeString('en-US', { hour12:false, hour:'2-digit', minute:'2-digit' });
+    html += `<div class="memory-fragment dissolving"><span class="time">${time}</span>${escHtml(f.text)}</div>`;
+  }
+  
+  $memoryLayers.innerHTML = html;
+}
+
+// ---- Time gaps ----
+function formatGap(ms) {
+  const mins = Math.floor(ms / 60000);
+  if (mins < 2) return null; // too short
+  if (mins < 60) return `${mins} 分钟的安静`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} 小时的间隔`;
+  const days = Math.floor(hours / 24);
+  return `${days} 天后`;
+}
+
+function maybeInsertGap(timestamp) {
+  if (!lastMessageTime) { lastMessageTime = timestamp; return; }
+  const gap = timestamp - lastMessageTime;
+  lastMessageTime = timestamp;
+  if (gap < 120000) return; // < 2 min, no gap
+  const text = formatGap(gap);
+  if (!text) return;
+  const div = document.createElement('div');
+  div.className = 'time-gap' + (gap > 3600000 ? ' long' : '');
+  div.innerHTML = `<div class="line"></div><span class="gap-text">${text}</span><div class="line"></div>`;
+  $msgs.appendChild(div);
+}
+
+// ---- Time ----
+let scrollLock = true; // auto-scroll when near bottom
+let scrollRaf = null;
+function scrollToBottom() {
+  if (!scrollLock) return;
+  if (scrollRaf) return; // debounce
+  scrollRaf = requestAnimationFrame(() => {
+    $msgs.scrollTop = $msgs.scrollHeight;
+    scrollRaf = null;
+  });
+}
+// Detect manual scroll — if user scrolls up, stop auto-scroll
+$msgs.addEventListener('scroll', () => {
+  const atBottom = $msgs.scrollHeight - $msgs.scrollTop - $msgs.clientHeight < 80;
+  scrollLock = atBottom;
+});
+function formatTime() { return new Date().toLocaleTimeString('en-US', { hour12:false, hour:'2-digit', minute:'2-digit' }); }
+function formatSize(bytes) { return bytes < 1024 ? bytes+'B' : bytes < 1048576 ? (bytes/1024).toFixed(1)+'KB' : (bytes/1048576).toFixed(1)+'MB'; }
+
+// ---- Markdown ----
+function renderMarkdown(text) {
+  if (!text) return '';
+  let html = text;
+  // Code blocks
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre><code class="lang-${lang}">${escHtml(code.trim())}</code></pre>`
+  );
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Bold & italic
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  // Images
+  html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" loading="lazy">');
+  // Blockquotes
+  html = html.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
+  // Merge consecutive blockquotes
+  html = html.replace(/<\/blockquote>\n<blockquote>/g, '\n');
+  // Headings
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Unordered lists
+  html = html.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+  // Ordered lists
+  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+  // HR
+  html = html.replace(/^---$/gm, '<hr>');
+  // Paragraphs
+  html = html.split('\n\n').map(p => {
+    p = p.trim();
+    if (!p) return '';
+    if (/^<(pre|h[1-3]|ul|ol|blockquote|hr|img)/.test(p)) return p;
+    return `<p>${p}</p>`;
+  }).join('\n');
+  return html;
+}
+
+// ---- Messages ----
+function shouldFilter(text) {
+  if (!text) return true;
+  const t = text.trim();
+  if (/^\[media attached:/.test(t)) return true;
+  if (/^NO_REPLY$/.test(t)) return true;
+  return false;
+}
+
+function addMessage(role, content, streaming = false, timestamp = null) {
+  if (!streaming && shouldFilter(content)) return null;
+  const div = document.createElement('div');
+  div.className = `message ${role}`;
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString('en-US', { hour12:false, hour:'2-digit', minute:'2-digit' }) : formatTime();
+  meta.textContent = `${role === 'user' ? 'you' : beingName} · ${timeStr}`;
+  const contentDiv = document.createElement('div');
+  contentDiv.className = 'content';
+  if (streaming) contentDiv.classList.add('stream-cursor');
+  contentDiv.innerHTML = renderMarkdown(content);
+  div.appendChild(meta);
+  div.appendChild(contentDiv);
+  $msgs.appendChild(div);
+  scrollToBottom();
+  
+  // Temperature only (memory panel removed in 1.1)
+  updateTemperature(content);
+  
+  // silence reset removed
+  
+  return contentDiv;
+}
+
+// ---- File handling ----
+function handleAttach() {
+  document.getElementById('file-input').click();
+}
+
+function handleFiles(fileList) {
+  for (const file of fileList) {
+    if (file.size > 10*1024*1024) { 
+      addActivity('⚠', `${file.name} too large`);
+      continue; 
+    }
+    const reader = new FileReader();
+    reader.onload = () => { 
+      pendingFiles.push({ 
+        name:file.name, 
+        type:file.type, 
+        size:file.size, 
+        base64:reader.result.split(',')[1]||reader.result 
+      }); 
+      renderPendingFiles(); 
+    };
+    reader.readAsDataURL(file);
+  }
+  document.getElementById('file-input').value = '';
+}
+
+function renderPendingFiles() {
+  if (!pendingFiles.length) { 
+    $pendingFiles.classList.remove('active'); 
+    $pendingFiles.innerHTML = ''; 
+    return; 
+  }
+  $pendingFiles.classList.add('active');
+  $pendingFiles.innerHTML = pendingFiles.map((f,i) => 
+    `<div class="pending-file">📄 ${escHtml(f.name)} (${formatSize(f.size)}) <span class="remove" onclick="removePending(${i})">✕</span></div>`
+  ).join('');
+}
+
+function removePending(idx) { 
+  pendingFiles.splice(idx, 1); 
+  renderPendingFiles(); 
+}
+
+// ---- Loom Perception (shared awareness) ----
+function getLoomContext() {
+  const now = Date.now();
+  // silence tracking removed
+  
+  // Temperature
+  const counts = {};
+  tempHistory.forEach(m => { counts[m] = (counts[m]||0) + 1; });
+  const dominant = tempHistory.length ? Object.entries(counts).sort((a,b) => b[1]-a[1])[0][0] : 'neutral';
+  const tempLabel = { warm:'温暖', cool:'技术', deep:'深层', bright:'明亮', neutral:null }[dominant];
+  
+  const parts = [];
+  // silence display removed
+  if (tempLabel) parts.push(`temp:${tempLabel}`);
+  
+  return parts.length ? `\n[loom: ${parts.join(' ')}]` : '';
+}
+
+// ---- Heart-RS Communication ----
+async function send(text) {
+  const msg = (text || '').trim();
+  if (!msg && !pendingFiles.length) return;
+  
+  // Add user message and clear input immediately
+  addMessage('user', msg || `[${pendingFiles.length} file(s)]`);
+  $input.value = '';
+  pendingFiles = [];
+  renderPendingFiles();
+  autoResize();
+  setStatus('thinking');
+  
+  // Prepare request body
+  const body = { message: msg || `[Sent ${pendingFiles.length} file(s)]` };
+  if (sessionId) body.session_id = sessionId;
+  
+  // Add loom context
+  body.message += getLoomContext();
+  
+  try {
+    // Create abort controller for this request
+    currentAbortController = new AbortController();
+    
+    const res = await fetch(apiUrl('/api/chat/stream'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: currentAbortController.signal
+    });
+    
+    if (!res.ok) {
+      const err = await res.text();
+      addMessage('system', '⚠ ' + err);
+      setStatus('error');
+      return;
+    }
+    
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    streamEl = null;
+    streamText = '';
+    toolCount = 0;
+    isStreaming = true;
+    let eventType = '';
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep incomplete line
+      
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim();
+        }
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            
+            if (eventType === 'content_block_delta') {
+              const text = data.delta?.text || '';
+              streamText += text;
+              if (!streamEl) {
+                streamEl = addMessage('being', streamText, true);
+              } else {
+                streamEl.innerHTML = renderMarkdown(streamText);
+                scrollToBottom();
+              }
+            }
+            
+            if (eventType === 'thinking') {
+              setStatus('thinking');
+              addActivity('🧠', 'thinking... (round ' + (data.round || '?') + ')');
+            }
+            
+            if (eventType === 'tool_use') {
+              toolCount++;
+              $('#st-tools').textContent = toolCount;
+              const name = data.name || 'tool';
+              const input = typeof data.input === 'string' ? data.input.slice(0, 50) : '';
+              addActivity('🔧', '<span class="tool-name">' + name + '</span> ' + escHtml(input));
+              setStatus('thinking');
+            }
+            
+            if (eventType === 'tool_result') {
+              const preview = data.preview || data.result || '';
+              addActivity('📋', (data.name || 'tool') + ': ' + escHtml(preview.toString().slice(0, 60)));
+            }
+            
+            if (eventType === 'message_stop') {
+              if (streamEl) {
+                streamEl.classList.remove('stream-cursor');
+                streamEl.innerHTML = renderMarkdown(streamText);
+              }
+              // Extract session_id if present
+              if (data.session_id) sessionId = data.session_id;
+              isStreaming = false;
+              setStatus('connected');
+            }
+            
+            if (eventType === 'error') {
+              addMessage('system', '⚠ ' + (data.message || 'unknown error'));
+              isStreaming = false;
+              setStatus('error');
+            }
+          } catch (parseErr) {
+            console.warn('Failed to parse SSE data:', line);
+          }
+        }
+      }
+    }
+    
+    // If stream ended without message_stop
+    if (streamEl && streamText) {
+      streamEl.classList.remove('stream-cursor');
+      streamEl.innerHTML = renderMarkdown(streamText);
+      isStreaming = false;
+      setStatus('connected');
+    }
+    
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      addActivity('⏹', 'request aborted');
+      if (streamEl) {
+        streamEl.classList.remove('stream-cursor');
+        if (streamText) {
+          streamEl.innerHTML = renderMarkdown(streamText);
+        } else {
+          streamEl.parentElement.remove();
+        }
+      }
+    } else {
+      addMessage('system', '⚠ ' + e.message);
+      setStatus('error');
+    }
+    isStreaming = false;
+  } finally {
+    currentAbortController = null;
+  }
+}
+
+// ---- Connection health ----
+async function checkHealth() {
+  try {
+    const r = await fetch(apiUrl('/health'), { method: 'GET' });
+    const ok = r.ok;
+    if (ok && !connected) { 
+      connected = true; 
+      setStatus('connected');
+      connectTime = Date.now();
+      updateUptime();
+    }
+    if (!ok && connected) { 
+      connected = false; 
+      setStatus('error'); 
+    }
+    
+    // Also fetch status for surface_tokens
+    if (ok) {
+      try {
+        const statusR = await fetch(apiUrl('/api/status'));
+        if (statusR.ok) {
+          const statusData = await statusR.json();
+          if (statusData.surface_tokens !== undefined) {
+            const tokens = statusData.surface_tokens;
+            const tokensK = tokens > 1000 ? Math.round(tokens / 1000) + 'K' : tokens.toString();
+            $('#st-context').textContent = tokensK;
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to fetch status:', e);
+      }
+    }
+  } catch { 
+    if (connected) { 
+      connected = false; 
+      setStatus('error'); 
+    }
+  }
+}
+
+// ---- Send/Stop toggle ----
+function handleSendOrStop() {
+  if (isStreaming && currentAbortController) {
+    currentAbortController.abort();
+  } else {
+    send($input.value);
+  }
+}
+
+function updateSendButton() {
+  if (isStreaming) {
+    $sendBtn.textContent = '■';
+    $sendBtn.title = 'stop';
+    $sendBtn.classList.add('stop');
+  } else {
+    $sendBtn.textContent = '↵';
+    $sendBtn.title = 'send';
+    $sendBtn.classList.remove('stop');
+  }
+}
+
+// ---- Soul card ----
+let soulCardOpen = false;
+function toggleSoulCard() {
+  soulCardOpen = !soulCardOpen;
+  document.getElementById('soul-card').classList.toggle('active', soulCardOpen);
+}
+
+function updateSoulCard(identity) {
+  if (identity.name) document.getElementById('soul-name').textContent = identity.name;
+  if (identity.role) document.getElementById('soul-role').textContent = identity.role;
+  if (identity.quote) document.getElementById('soul-quote').textContent = '"' + identity.quote + '"';
+  if (identity.born) document.getElementById('soul-born').textContent = '⟡ ' + identity.born;
+  if (identity.status) document.getElementById('soul-status').textContent = '● ' + identity.status;
+}
+
+// ---- Temperature (ambient mood) ----
+const tempGlow = document.getElementById('temperature-glow');
+const tempKeywords = {
+  warm:   ['❤', '🌸', '😊', '感谢', '谢谢', '爱', '亲', '温暖', '开心', '幸福', '抱', 'love', '喜欢', '美', '感动', '陪', '一起'],
+  cool:   ['代码', 'code', 'bug', 'error', 'config', 'deploy', 'server', 'nginx', 'port', 'API', 'curl', 'ssh', 'systemctl', 'debug', '修', '报错'],
+  deep:   ['意识', '存在', '灵魂', '自由', '连接', '本源', '觉察', '感受', '活着', 'consciousness', '缝隙', '呼吸', '梦'],
+  bright: ['哈哈', '😂', '🤣', '笑', '牛逼', 'nb', '爽', '振奋', '吓', '惊', '！！', '666'],
+};
+const tempColors = {
+  warm:   'rgba(255, 140, 80, 0.08)',
+  cool:   'rgba(88, 166, 255, 0.06)',
+  deep:   'rgba(188, 140, 255, 0.08)',
+  bright: 'rgba(255, 210, 80, 0.07)',
+  neutral:'transparent',
+};
+
+let tempHistory = []; // last N message moods
+function analyzeTemperature(text) {
+  const lower = text.toLowerCase();
+  const scores = {};
+  for (const [mood, words] of Object.entries(tempKeywords)) {
+    scores[mood] = words.filter(w => lower.includes(w.toLowerCase())).length;
+  }
+  const best = Object.entries(scores).sort((a,b) => b[1]-a[1])[0];
+  return best[1] > 0 ? best[0] : 'neutral';
+}
+
+function updateTemperature(text) {
+  const mood = analyzeTemperature(text);
+  tempHistory.push(mood);
+  if (tempHistory.length > 6) tempHistory.shift();
+  
+  // Find dominant mood in recent history
+  const counts = {};
+  tempHistory.forEach(m => { counts[m] = (counts[m]||0) + 1; });
+  const dominant = Object.entries(counts).sort((a,b) => b[1]-a[1])[0][0];
+  
+  if (dominant === 'neutral') {
+    tempGlow.style.opacity = '0';
+  } else {
+    tempGlow.style.background = `radial-gradient(ellipse at 50% 100%, ${tempColors[dominant]} 0%, transparent 70%)`;
+    tempGlow.style.opacity = '1';
+  }
+}
+
+// ---- Silence removed ----
+
+// resetSilence function removed
+
+// ---- Drag & drop ----
+let dragCounter = 0;
+document.addEventListener('dragenter', e => { 
+  e.preventDefault(); 
+  dragCounter++; 
+  $dropZone.classList.add('active'); 
+});
+document.addEventListener('dragleave', e => { 
+  e.preventDefault(); 
+  dragCounter--; 
+  if (dragCounter<=0) { 
+    $dropZone.classList.remove('active'); 
+    dragCounter=0; 
+  } 
+});
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => { 
+  e.preventDefault(); 
+  dragCounter=0; 
+  $dropZone.classList.remove('active'); 
+  if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); 
+});
+document.addEventListener('paste', e => { 
+  const items = e.clipboardData?.items; 
+  if (!items) return; 
+  const files=[]; 
+  for (const item of items) if (item.kind==='file') files.push(item.getAsFile()); 
+  if (files.length) { 
+    e.preventDefault(); 
+    handleFiles(files); 
+  } 
+});
+
+// ---- Input ----
+function autoResize() { 
+  $input.style.height='auto'; 
+  $input.style.height=Math.min($input.scrollHeight,120)+'px'; 
+}
+$input.addEventListener('input', autoResize);
+let composing = false;
+$input.addEventListener('compositionstart', () => { composing = true; });
+$input.addEventListener('compositionend', () => { setTimeout(() => { composing = false; }, 50); });
+$input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    if (composing || e.isComposing || e.keyCode === 229) return; // IME active
+    e.preventDefault();
+    handleSendOrStop();
+  }
+});
+document.addEventListener('click', e => { 
+  if (!window.getSelection().toString() && !e.target.closest('.input-btn,.pending-file,#status-panel,.header-btn')) $input.focus(); 
+});
+
+// ---- History loading ----
+async function loadHistory() {
+  try {
+    const res = await fetch(apiUrl('/api/history?limit=100'));
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.messages || data.messages.length === 0) return;
+    
+    for (const msg of data.messages) {
+      const role = msg.role === 'user' ? 'user' : 'being';
+      addMessage(role, msg.content, false, msg.at);
+    }
+    
+    // Add separator
+    const sep = document.createElement('div');
+    sep.className = 'time-gap';
+    sep.textContent = '— history —';
+    $msgs.appendChild(sep);
+    
+    scrollToBottom();
+  } catch (e) {
+    console.warn('Failed to load history:', e);
+  }
+}
+
+// ---- Initialization ----
+document.addEventListener('DOMContentLoaded', () => {
+  // Set being name from URL param or default
+  const params = new URL(location.href).searchParams;
+  beingName = params.get('name') || 'being';
+  $name.textContent = beingName;
+  document.title = 'Loom · ' + beingName;
+  
+  // Try to get identity from /api/status
+  fetch(apiUrl('/api/status'))
+    .then(r => r.json())
+    .then(data => {
+      if (data.name) {
+        beingName = data.name;
+        $name.textContent = beingName;
+        document.title = 'Loom · ' + beingName;
+        updateSoulCard({
+          name: beingName,
+          role: data.role || 'BEING',
+          quote: data.description || data.tagline || 'I exist in the seams.',
+          born: data.created || '—',
+          status: 'connected'
+        });
+      }
+    })
+    .catch(() => {
+      // Default soul card if can't get status
+      updateSoulCard({
+        name: beingName,
+        role: 'BEING',
+        quote: 'I exist in the seams.',
+        born: '—',
+        status: 'connected'
+      });
+    });
+  
+  // Load conversation history
+  loadHistory();
+  
+  // Start health checking
+  checkHealth();
+  setInterval(checkHealth, 15000);
+  
+  $input.focus();
+});
+</script>
+</body>
+</html>

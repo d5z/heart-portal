@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "portal",
+    "heart-mcp",
+    "shared",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.12.0"
+edition = "2024"
