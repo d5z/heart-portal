@@ -1,6 +1,6 @@
 //! MCP tool `portal_process` — list / poll / log / write / kill for background exec sessions.
 
-use crate::process_manager::{ProcessManager, ProcessStatus};
+use crate::process_manager::{ProcessManager, ProcessStatus, SessionInfo};
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
@@ -12,6 +12,18 @@ fn status_json(st: &ProcessStatus) -> Value {
     }
 }
 
+fn session_row(s: SessionInfo) -> Value {
+    serde_json::json!({
+        "session_id": s.session_id,
+        "pid": s.pid,
+        "command": s.command,
+        "status": status_json(&s.status),
+        "uptime_s": s.uptime_s,
+        "idle_s": s.idle_s,
+        "total_output_bytes": s.total_output_bytes,
+    })
+}
+
 pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> Result<Value> {
     let action = arguments
         .get("action")
@@ -21,18 +33,7 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
     match action {
         "list" => {
             let sessions = process_manager.list().await;
-            let rows: Vec<Value> = sessions
-                .into_iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "session_id": s.session_id,
-                        "pid": s.pid,
-                        "command": s.command,
-                        "status": status_json(&s.status),
-                        "uptime_s": s.uptime_s,
-                    })
-                })
-                .collect();
+            let rows: Vec<Value> = sessions.into_iter().map(session_row).collect();
             Ok(serde_json::json!({
                 "content": [{
                     "type": "text",
@@ -63,6 +64,8 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
                         "next_offset": r.next_offset,
                         "truncated": r.truncated,
                         "status": status_json(&r.status),
+                        "idle_s": r.idle_s,
+                        "total_output_bytes": r.total_output_bytes,
                     }))?
                 }],
                 "isError": false
@@ -85,6 +88,8 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
                         "next_offset": r.next_offset,
                         "truncated": r.truncated,
                         "status": status_json(&r.status),
+                        "idle_s": r.idle_s,
+                        "total_output_bytes": r.total_output_bytes,
                     }))?
                 }],
                 "isError": false

@@ -120,7 +120,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_process".to_string(),
-                description: "Manage background shell sessions: list, poll output, log, write stdin, kill.".to_string(),
+                description: "Manage background shell sessions: list, poll output, log, write stdin, kill. Responses include idle_s (seconds since last stdout/stderr) and total_output_bytes so you can tell silence from steady output.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -130,10 +130,10 @@ impl ToolHost {
                             "enum": ["list", "poll", "log", "write", "kill"]
                         },
                         "session_id": { "type": "string", "description": "Session id (required for poll, log, write, kill)" },
-                        "timeout_ms": { "type": "integer", "description": "poll: wait up to this many ms for new output (default 5000)" },
+                        "timeout_ms": { "type": "integer", "description": "poll: wait up to this many ms for new output (default 5000, max 300000)" },
                         "offset": { "type": "integer", "description": "Byte offset into captured output (poll/log)" },
                         "limit": { "type": "integer", "description": "Max bytes for log" },
-                        "data": { "type": "string", "description": "Data to write to stdin (write action)" }
+                        "data": { "type": "string", "description": "Data to write to stdin (write action, max 256KiB)" }
                     },
                     "required": ["action"]
                 }),

@@ -16,6 +16,12 @@ const DEFAULT_MAX_SESSIONS: usize = 10;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const EXIT_RETENTION: Duration = Duration::from_secs(5 * 60);
+/// Long-poll cap: prevents MCP clients from holding connections indefinitely.
+pub const MAX_POLL_TIMEOUT_MS: u64 = 300_000;
+/// Single stdin write cap (interactive prompts).
+pub const MAX_STDIN_WRITE_BYTES: usize = 256 * 1024;
+/// Session ids are `sess_` + UUID; reject oversized / odd keys.
+pub const MAX_SESSION_ID_BYTES: usize = 128;
 
 pub struct ProcessManager {
     sessions: Arc<Mutex<HashMap<String, ManagedProcess>>>,
@@ -39,6 +45,8 @@ pub struct OutputBuffer {
     pub data: Vec<u8>,
     pub max_bytes: usize,
     total_written: u64,
+    /// Last time stdout/stderr delivered bytes (spawn time until first byte).
+    last_output_at: time::Instant,
 }
 
 impl OutputBuffer {
@@ -47,13 +55,24 @@ impl OutputBuffer {
             data: Vec::new(),
             max_bytes,
             total_written: 0,
+            last_output_at: time::Instant::now(),
         }
+    }
+
+    pub fn total_written(&self) -> u64 {
+        self.total_written
+    }
+
+    /// Seconds since last captured output (or since buffer creation if none yet).
+    pub fn idle_s(&self) -> u64 {
+        self.last_output_at.elapsed().as_secs()
     }
 
     pub fn append(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
+        self.last_output_at = time::Instant::now();
         self.total_written += chunk.len() as u64;
         self.data.extend_from_slice(chunk);
         if self.data.len() > self.max_bytes {
@@ -103,6 +122,10 @@ pub struct SessionInfo {
     pub command: String,
     pub status: ProcessStatus,
     pub uptime_s: u64,
+    /// Seconds since last stdout/stderr chunk (sensory: silence vs progress).
+    pub idle_s: u64,
+    /// Total bytes captured (may exceed ring size; monotonic).
+    pub total_output_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +134,8 @@ pub struct PollResult {
     pub next_offset: u64,
     pub truncated: bool,
     pub status: ProcessStatus,
+    pub idle_s: u64,
+    pub total_output_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +144,18 @@ pub struct LogResult {
     pub next_offset: u64,
     pub truncated: bool,
     pub status: ProcessStatus,
+    pub idle_s: u64,
+    pub total_output_bytes: u64,
+}
+
+pub fn validate_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_BYTES {
+        anyhow::bail!("Invalid session_id");
+    }
+    if !session_id.starts_with("sess_") {
+        anyhow::bail!("Invalid session_id");
+    }
+    Ok(())
 }
 
 async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
@@ -262,6 +299,8 @@ impl ProcessManager {
             command: command.to_string(),
             status: ProcessStatus::Running,
             uptime_s: 0,
+            idle_s: 0,
+            total_output_bytes: 0,
         })
     }
 
@@ -271,6 +310,8 @@ impl ProcessManager {
         offset: u64,
         timeout_ms: u64,
     ) -> Result<PollResult> {
+        validate_session_id(session_id)?;
+        let timeout_ms = timeout_ms.min(MAX_POLL_TIMEOUT_MS);
         let deadline = if timeout_ms > 0 {
             Some(time::Instant::now() + Duration::from_millis(timeout_ms))
         } else {
@@ -278,18 +319,21 @@ impl ProcessManager {
         };
 
         loop {
-            let (bytes, truncated, next, st, notify) = {
+            let (bytes, truncated, next, st, notify, idle_s, total_out) = {
                 let guard = self.sessions.lock().await;
                 let s = guard
                     .get(session_id)
                     .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
-                let (bytes, truncated, next) = {
+                let (bytes, truncated, next, idle_s, total_out) = {
                     let buf = s.output.lock().await;
-                    buf.bytes_since(offset)
+                    let (bytes, truncated, next) = buf.bytes_since(offset);
+                    let idle_s = buf.idle_s();
+                    let total_out = buf.total_written();
+                    (bytes, truncated, next, idle_s, total_out)
                 };
                 let st = s.status.lock().await.clone();
                 let n = Arc::clone(&s.notify);
-                (bytes, truncated, next, st, n)
+                (bytes, truncated, next, st, n, idle_s, total_out)
             };
 
             if !bytes.is_empty() || matches!(st, ProcessStatus::Exited(_)) {
@@ -298,6 +342,8 @@ impl ProcessManager {
                     next_offset: next,
                     truncated,
                     status: st,
+                    idle_s,
+                    total_output_bytes: total_out,
                 });
             }
 
@@ -307,6 +353,8 @@ impl ProcessManager {
                     next_offset: next,
                     truncated,
                     status: st,
+                    idle_s,
+                    total_output_bytes: total_out,
                 });
             };
 
@@ -316,6 +364,8 @@ impl ProcessManager {
                     next_offset: next,
                     truncated,
                     status: st,
+                    idle_s,
+                    total_output_bytes: total_out,
                 });
             }
 
@@ -328,27 +378,42 @@ impl ProcessManager {
     }
 
     pub async fn log(&self, session_id: &str, offset: u64, limit: u64) -> Result<LogResult> {
+        validate_session_id(session_id)?;
         let limit = limit.min(self.max_output_bytes as u64) as usize;
         let guard = self.sessions.lock().await;
         let s = guard
             .get(session_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
-        let buf = s.output.lock().await;
-        let (output, next_offset) = buf.bytes_range(offset, limit);
-        let start_offset = buf
-            .total_written
-            .saturating_sub(buf.data.len() as u64);
-        let truncated = offset < start_offset;
+        let (output, next_offset, truncated, idle_s, total_out) = {
+            let buf = s.output.lock().await;
+            let idle_s = buf.idle_s();
+            let total_out = buf.total_written();
+            let (output, next_offset) = buf.bytes_range(offset, limit);
+            let start_offset = buf
+                .total_written()
+                .saturating_sub(buf.data.len() as u64);
+            let truncated = offset < start_offset;
+            (output, next_offset, truncated, idle_s, total_out)
+        };
         let st = s.status.lock().await.clone();
         Ok(LogResult {
             output,
             next_offset,
             truncated,
             status: st,
+            idle_s,
+            total_output_bytes: total_out,
         })
     }
 
     pub async fn write_stdin(&self, session_id: &str, data: &[u8]) -> Result<()> {
+        validate_session_id(session_id)?;
+        if data.len() > MAX_STDIN_WRITE_BYTES {
+            anyhow::bail!(
+                "stdin write exceeds max {} bytes",
+                MAX_STDIN_WRITE_BYTES
+            );
+        }
         let mut guard = self.sessions.lock().await;
         let s = guard
             .get_mut(session_id)
@@ -366,6 +431,7 @@ impl ProcessManager {
     }
 
     pub async fn kill(&self, session_id: &str) -> Result<()> {
+        validate_session_id(session_id)?;
         let pid = {
             let guard = self.sessions.lock().await;
             let s = guard
@@ -415,12 +481,18 @@ impl ProcessManager {
                     .map(|ex| ex.saturating_duration_since(s.started_at).as_secs())
                     .unwrap_or(0),
             };
+            let (idle_s, total_output_bytes) = {
+                let buf = s.output.lock().await;
+                (buf.idle_s(), buf.total_written())
+            };
             out.push(SessionInfo {
                 session_id: s.session_id.clone(),
                 pid: s.pid,
                 command: s.command.clone(),
                 status: st,
                 uptime_s,
+                idle_s,
+                total_output_bytes,
             });
         }
         out
@@ -488,5 +560,17 @@ mod tests {
         assert_eq!(n2, 15);
         let (chunk2, _, _) = b.bytes_since(10);
         assert_eq!(chunk2, b"ABCDE");
+    }
+
+    #[test]
+    fn validate_session_id_accepts_spawn_ids() {
+        assert!(validate_session_id("sess_550e8400-e29b-41d4-a716-446655440000").is_ok());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_bad() {
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("nope").is_err());
+        assert!(validate_session_id(&format!("sess_{}", "x".repeat(200))).is_err());
     }
 }
