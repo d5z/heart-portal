@@ -206,11 +206,14 @@ async fn api_files(
 ) -> Result<Json<Vec<FileEntry>>, StatusCode> {
     check_auth(&headers)?;
     let base = safe_path(&st.workspace, q.path.as_deref().unwrap_or(""))?;
-    let entries = list_dir_recursive(&base, &st.workspace, 3).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let entries = list_dir_recursive(base, st.workspace.clone(), 3)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(entries))
 }
 
-fn list_dir_recursive(dir: &Path, workspace: &Path, depth: u32) -> std::io::Result<Vec<FileEntry>> {
+// Synchronous tree walk; run via `list_dir_recursive` + `spawn_blocking` to avoid blocking Tokio.
+fn list_dir_recursive_sync(dir: &Path, workspace: &Path, depth: u32) -> std::io::Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
     if !dir.is_dir() {
         return Ok(entries);
@@ -232,7 +235,7 @@ fn list_dir_recursive(dir: &Path, workspace: &Path, depth: u32) -> std::io::Resu
             .unwrap_or_default()
             .as_secs();
         let children = if meta.is_dir() && depth > 0 {
-            Some(list_dir_recursive(&e.path(), workspace, depth - 1)?)
+            Some(list_dir_recursive_sync(&e.path(), workspace, depth - 1)?)
         } else {
             None
         };
@@ -249,6 +252,17 @@ fn list_dir_recursive(dir: &Path, workspace: &Path, depth: u32) -> std::io::Resu
         b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+async fn list_dir_recursive(
+    dir: PathBuf,
+    workspace: PathBuf,
+    depth: u32,
+) -> std::io::Result<Vec<FileEntry>> {
+    tokio::task::spawn_blocking(move || list_dir_recursive_sync(&dir, &workspace, depth))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .flatten()
 }
 
 async fn api_file_read(

@@ -4,11 +4,12 @@ use crate::config::PortalConfig;
 use crate::exec_policy::{configure_shell_command, validate_exec_allowlist};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time;
 use tracing::debug;
 
@@ -24,7 +25,9 @@ pub const MAX_STDIN_WRITE_BYTES: usize = 256 * 1024;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 
 pub struct ProcessManager {
-    sessions: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+    sessions: Arc<RwLock<HashMap<String, ManagedProcess>>>,
+    /// Number of sessions currently in `Running` state (O(1) vs scanning the map).
+    running_count: Arc<AtomicUsize>,
     max_sessions: usize,
     max_output_bytes: usize,
 }
@@ -180,7 +183,8 @@ async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            running_count: Arc::new(AtomicUsize::new(0)),
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
@@ -195,17 +199,11 @@ impl ProcessManager {
     ) -> Result<SessionInfo> {
         validate_exec_allowlist(command, &config.security.exec_allowlist)?;
 
-        let running = {
-            let g = self.sessions.lock().await;
-            let mut n = 0;
-            for s in g.values() {
-                if matches!(*s.status.lock().await, ProcessStatus::Running) {
-                    n += 1;
-                }
-            }
-            n
-        };
-        if running >= self.max_sessions {
+        let prev = self
+            .running_count
+            .fetch_add(1, Ordering::AcqRel);
+        if prev >= self.max_sessions {
+            self.running_count.fetch_sub(1, Ordering::AcqRel);
             anyhow::bail!(
                 "Maximum concurrent background sessions ({}) reached",
                 self.max_sessions
@@ -227,19 +225,20 @@ impl ProcessManager {
             cmd.env(k, v);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            self.running_count.fetch_sub(1, Ordering::AcqRel);
+            anyhow::anyhow!("Failed to spawn: {}", e)
+        })?;
         let pid = child.id().unwrap_or(0);
         let stdin = child.stdin.take();
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stdout not piped"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("stderr not piped"))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            self.running_count.fetch_sub(1, Ordering::AcqRel);
+            anyhow::anyhow!("stdout not piped")
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            self.running_count.fetch_sub(1, Ordering::AcqRel);
+            anyhow::anyhow!("stderr not piped")
+        })?;
 
         let out_a = Arc::clone(&output);
         let n_a = Arc::clone(&notify);
@@ -255,6 +254,7 @@ impl ProcessManager {
         let st_b = Arc::clone(&status);
         let n_exit = Arc::clone(&notify);
         let sessions_wait = Arc::clone(&self.sessions);
+        let running_exit = Arc::clone(&self.running_count);
         let sid_wait = session_id.clone();
         tokio::spawn(async move {
             let code = match child.wait().await {
@@ -263,13 +263,14 @@ impl ProcessManager {
             };
             let now = tokio::time::Instant::now();
             {
-                let mut g = sessions_wait.lock().await;
+                let mut g = sessions_wait.write().await;
                 if let Some(p) = g.get_mut(&sid_wait) {
                     p.exited_at = Some(now);
                 }
             }
             let mut st = st_b.lock().await;
             *st = ProcessStatus::Exited(code);
+            running_exit.fetch_sub(1, Ordering::AcqRel);
             n_exit.notify_waiters();
         });
 
@@ -286,7 +287,7 @@ impl ProcessManager {
             exited_at: None,
         };
 
-        self.sessions.lock().await.insert(session_id.clone(), proc);
+        self.sessions.write().await.insert(session_id.clone(), proc);
 
         debug!(
             "spawned background session {} pid {} ({})",
@@ -320,7 +321,7 @@ impl ProcessManager {
 
         loop {
             let (bytes, truncated, next, st, notify, idle_s, total_out) = {
-                let guard = self.sessions.lock().await;
+                let guard = self.sessions.read().await;
                 let s = guard
                     .get(session_id)
                     .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
@@ -380,7 +381,7 @@ impl ProcessManager {
     pub async fn log(&self, session_id: &str, offset: u64, limit: u64) -> Result<LogResult> {
         validate_session_id(session_id)?;
         let limit = limit.min(self.max_output_bytes as u64) as usize;
-        let guard = self.sessions.lock().await;
+        let guard = self.sessions.read().await;
         let s = guard
             .get(session_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
@@ -414,7 +415,7 @@ impl ProcessManager {
                 MAX_STDIN_WRITE_BYTES
             );
         }
-        let mut guard = self.sessions.lock().await;
+        let mut guard = self.sessions.write().await;
         let s = guard
             .get_mut(session_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
@@ -433,7 +434,7 @@ impl ProcessManager {
     pub async fn kill(&self, session_id: &str) -> Result<()> {
         validate_session_id(session_id)?;
         let pid = {
-            let guard = self.sessions.lock().await;
+            let guard = self.sessions.read().await;
             let s = guard
                 .get(session_id)
                 .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
@@ -447,7 +448,7 @@ impl ProcessManager {
             }
             time::sleep(KILL_GRACE).await;
             let still_running = {
-                let guard = self.sessions.lock().await;
+                let guard = self.sessions.read().await;
                 if let Some(s) = guard.get(session_id) {
                     matches!(*s.status.lock().await, ProcessStatus::Running)
                 } else {
@@ -470,7 +471,7 @@ impl ProcessManager {
     }
 
     pub async fn list(&self) -> Vec<SessionInfo> {
-        let guard = self.sessions.lock().await;
+        let guard = self.sessions.read().await;
         let mut out = Vec::new();
         for s in guard.values() {
             let st = s.status.lock().await.clone();
@@ -501,12 +502,12 @@ impl ProcessManager {
     pub async fn cleanup(&self) {
         let now = tokio::time::Instant::now();
         let keys: Vec<String> = {
-            let guard = self.sessions.lock().await;
+            let guard = self.sessions.read().await;
             guard.keys().cloned().collect()
         };
         for k in keys {
             let remove = {
-                let guard = self.sessions.lock().await;
+                let guard = self.sessions.read().await;
                 let Some(p) = guard.get(&k) else {
                     continue;
                 };
@@ -523,7 +524,7 @@ impl ProcessManager {
                 }
             };
             if remove {
-                let mut guard = self.sessions.lock().await;
+                let mut guard = self.sessions.write().await;
                 guard.remove(&k);
             }
         }
@@ -531,7 +532,7 @@ impl ProcessManager {
 
     pub async fn kill_all(&self) {
         let ids: Vec<String> = {
-            let g = self.sessions.lock().await;
+            let g = self.sessions.read().await;
             g.keys().cloned().collect()
         };
         for id in ids {
