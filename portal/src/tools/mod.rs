@@ -4,6 +4,7 @@
 mod exec;
 mod file;
 mod web;
+mod search;
 pub mod custom;
 
 use crate::config::PortalConfig;
@@ -115,6 +116,25 @@ impl ToolHost {
                     "required": ["url"]
                 }),
             });
+
+            tools.push(ToolInfo {
+                name: "portal_web_search".to_string(),
+                description: "Search the web using Google Custom Search API".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "Number of results to return (default: 5, max: 10)"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            });
         }
 
         if self.config.tools.file {
@@ -196,6 +216,7 @@ impl ToolHost {
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
+            "portal_web_search" => search::search(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
             _ => anyhow::bail!("Unknown tool: {}", tool_name),
         }
