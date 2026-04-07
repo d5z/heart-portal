@@ -1,73 +1,18 @@
-name: Release
+[2529 chars] name: Build Portal Binaries
 
 on:
   push:
     tags:
       - 'v*'
-
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
   build:
     strategy:
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: heart-portal-macos-arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: heart-portal-macos-x86_64
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            name: heart-portal-linux-x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: heart-portal-windows-x86_64.exe
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install musl tools (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin heart-portal
-
-      - name: Rename binary (unix)
-        if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/heart-portal ${{ matrix.name }}
-
-      - name: Rename binary (windows)
-        if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/heart-portal.exe ${{ matrix.name }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: portal-macos-arm64
+          - os: macos-latest
+            targ...
