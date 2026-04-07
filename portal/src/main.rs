@@ -7,6 +7,8 @@
 mod config;
 mod tools;
 mod protocol;
+mod extensions;
+mod extensions;
 
 use std::path::PathBuf;
 use anyhow::Result;
@@ -44,7 +46,7 @@ async fn main() -> Result<()> {
         info!("Portal '{}' starting on {}:{} (open access — set token in portal.toml for auth)", config.name, config.bind_host, config.bind_port);
     }
 
-    // Initialize tool host (built-in + custom)
+    // Initialize tool host (built-in + custom + extensions)
     let tool_host = ToolHost::new(&config);
 
     // Load custom tools from workspace/tools/mcp.toml
@@ -52,6 +54,12 @@ async fn main() -> Result<()> {
         Ok(0) => info!("No custom tools loaded"),
         Ok(n) => info!("Loaded {} custom tools", n),
         Err(e) => warn!("Failed to load custom tools: {}", e),
+    }
+
+    // Initialize extensions
+    match tool_host.initialize_extensions().await {
+        Ok(()) => info!("Extensions initialized"),
+        Err(e) => warn!("Failed to initialize extensions: {}", e),
     }
 
     let tool_list = tool_host.list_tools().await;
@@ -299,6 +307,148 @@ async fn handle_request(
                 id,
                 result: Some(serde_json::json!({})),
                 error: None,
+            }
+        }
+
+        "extensions/status" => {
+            let status = tool_host.get_extension_status().await;
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(serde_json::json!({ "extensions": status })),
+                error: None,
+            }
+        }
+
+        "extensions/reload" => {
+            match tool_host.reload_extensions().await {
+                Ok(changes) => {
+                    info!("Extensions reloaded with {} changes", changes.len());
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(serde_json::json!({ 
+                            "changes": changes,
+                            "reloaded": true 
+                        })),
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to reload extensions: {}", e);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -1,
+                            message: format!("Failed to reload extensions: {}", e),
+                            data: None,
+                        }),
+                    }
+                }
+            }
+        }
+
+        "extensions/start" => {
+            let extension_name = request.params.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            
+            match tool_host.start_extension(extension_name).await {
+                Ok(()) => {
+                    info!("Extension '{}' started", extension_name);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(serde_json::json!({ 
+                            "extension": extension_name,
+                            "started": true 
+                        })),
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to start extension '{}': {}", extension_name, e);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -1,
+                            message: format!("Failed to start extension '{}': {}", extension_name, e),
+                            data: None,
+                        }),
+                    }
+                }
+            }
+        }
+
+        "extensions/stop" => {
+            let extension_name = request.params.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            
+            match tool_host.stop_extension(extension_name).await {
+                Ok(()) => {
+                    info!("Extension '{}' stopped", extension_name);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(serde_json::json!({ 
+                            "extension": extension_name,
+                            "stopped": true 
+                        })),
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to stop extension '{}': {}", extension_name, e);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -1,
+                            message: format!("Failed to stop extension '{}': {}", extension_name, e),
+                            data: None,
+                        }),
+                    }
+                }
+            }
+        }
+
+        "extensions/restart" => {
+            let extension_name = request.params.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            
+            match tool_host.restart_extension(extension_name).await {
+                Ok(()) => {
+                    info!("Extension '{}' restarted", extension_name);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: Some(serde_json::json!({ 
+                            "extension": extension_name,
+                            "restarted": true 
+                        })),
+                        error: None,
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to restart extension '{}': {}", extension_name, e);
+                    JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -1,
+                            message: format!("Failed to restart extension '{}': {}", extension_name, e),
+                            data: None,
+                        }),
+                    }
+                }
             }
         }
 

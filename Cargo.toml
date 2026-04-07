@@ -1,5 +1,5 @@
 [workspace]
-members = ["portal", "mcp-supervisor"]
+members = ["portal"]
 resolver = "2"
 
 [workspace.package]
