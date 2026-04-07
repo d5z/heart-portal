@@ -1,6 +1,6 @@
 [3054 chars] # Phase 2 PRD: 双层架构 + Extensions 热加载
 
-> 状态：draft → review
+> 状态：done
 > 日期：2026-04-07
 > 讨论：泽平 + seam_walker
 > Repo：github.com/d5z/heart-portal
