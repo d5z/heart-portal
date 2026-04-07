@@ -59,7 +59,7 @@ pub struct ExtensionState {
     pub config: ExtensionConfig,
     pub status: ExtensionStatus,
     pub process: Option<Child>,
-    pub tools: Vec<crate::tools::ToolInfo>,
+    pub tools: Vec<crate::tools_flat::ToolInfo>,
     pub last_error: Option<String>,
     pub restart_count: u32,
 }
@@ -364,7 +364,7 @@ impl ExtensionManager {
     }
 
     /// Get all tools from all running extensions
-    pub async fn get_all_tools(&self) -> Vec<crate::tools::ToolInfo> {
+    pub async fn get_all_tools(&self) -> Vec<crate::tools_flat::ToolInfo> {
         let extensions = self.extensions.read().await;
         let mut all_tools = Vec::new();
         

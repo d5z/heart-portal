@@ -5,9 +5,8 @@
 //! Portal can run on Town Home, a human's laptop, or anywhere.
 
 mod config;
-mod tools;
+mod tools_flat;
 mod protocol;
-mod extensions;
 mod extensions;
 
 use std::path::PathBuf;
@@ -18,7 +17,7 @@ use tracing::{info, warn, error, debug};
 
 use crate::config::PortalConfig;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError};
-use crate::tools::ToolHost;
+use crate::tools_flat::ToolHost;
 
 #[tokio::main]
 async fn main() -> Result<()> {
