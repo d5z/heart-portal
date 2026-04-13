@@ -61,7 +61,7 @@ pub struct FileEntry {
 
 // --- Auth middleware ---
 
-/// Cowork bearer token from `PORTAL_TOKEN` / `LOOM_TOKEN`.
+/// Cowork bearer token from `PORTAL_TOKEN` / `LOOM_TOKEN` (startup warning + shared helper).
 pub fn cowork_token() -> Option<String> {
     let t = std::env::var("PORTAL_TOKEN").unwrap_or_default();
     if !t.is_empty() { return Some(t); }
