@@ -3,11 +3,14 @@
 
 mod exec;
 mod file;
-mod web;
+mod process;
 mod search;
+mod web;
+mod web_search;
 pub mod custom;
 
 use crate::config::PortalConfig;
+use crate::process_manager::ProcessManager;
 use custom::CustomToolHost;
 use anyhow::Result;
 use serde_json::Value;
@@ -28,6 +31,7 @@ pub struct ToolInfo {
 pub struct ToolHost {
     config: PortalConfig,
     custom: CustomToolHost,
+    process_manager: Arc<ProcessManager>,
     /// Set to true after reload — signals connection handler to close TCP
     pub needs_reconnect: Arc<AtomicBool>,
 }
@@ -37,12 +41,24 @@ impl ToolHost {
         Self {
             config: config.clone(),
             custom: CustomToolHost::new(),
+            process_manager: Arc::new(ProcessManager::new()),
             needs_reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    pub async fn kill_all_managed_processes(&self) {
+        self.process_manager.kill_all().await;
+    }
+
+    pub async fn cleanup_background_sessions(&self) {
+        self.process_manager.cleanup().await;
+    }
+
     /// Load custom tools from workspace/tools/mcp.toml
     pub async fn load_custom_tools(&self) -> Result<usize> {
+        if !self.config.tools.custom_tools_enabled {
+            return Ok(0);
+        }
         self.custom.load(&self.config.security.workspace_root).await
     }
 
@@ -50,6 +66,9 @@ impl ToolHost {
     pub async fn reload_custom_tools(&self) -> Result<(usize, Vec<String>)> {
         // Shutdown existing custom MCP servers
         self.custom.shutdown().await;
+        if !self.config.tools.custom_tools_enabled {
+            return Ok((0, vec![]));
+        }
         // Reload from config
         let count = self.custom.load(&self.config.security.workspace_root).await?;
         let names: Vec<String> = self.custom.list_tools().await
@@ -89,10 +108,35 @@ impl ToolHost {
                         },
                         "timeout_secs": {
                             "type": "integer",
-                            "description": "Timeout in seconds (default: 30)"
+                            "description": "Timeout in seconds (default: 30, sync mode only)"
+                        },
+                        "background": {
+                            "type": "boolean",
+                            "description": "If true, spawn in background and return session_id + pid (default: false)"
                         }
                     },
                     "required": ["command"]
+                }),
+            });
+
+            tools.push(ToolInfo {
+                name: "portal_process".to_string(),
+                description: "Manage background shell sessions: list, poll output, log, write stdin, kill. Responses include idle_s (seconds since last stdout/stderr) and total_output_bytes so you can tell silence from steady output.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "list | poll | log | write | kill",
+                            "enum": ["list", "poll", "log", "write", "kill"]
+                        },
+                        "session_id": { "type": "string", "description": "Session id (required for poll, log, write, kill)" },
+                        "timeout_ms": { "type": "integer", "description": "poll: wait up to this many ms for new output (default 5000, max 300000)" },
+                        "offset": { "type": "integer", "description": "Byte offset into captured output (poll/log)" },
+                        "limit": { "type": "integer", "description": "Max bytes for log" },
+                        "data": { "type": "string", "description": "Data to write to stdin (write action, max 256KiB)" }
+                    },
+                    "required": ["action"]
                 }),
             });
         }
@@ -119,7 +163,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_web_search".to_string(),
-                description: "Search the web using Google Custom Search API".to_string(),
+                description: "Search the web. Returns titles, URLs, and snippets.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -129,7 +173,7 @@ impl ToolHost {
                         },
                         "count": {
                             "type": "integer",
-                            "description": "Number of results to return (default: 5, max: 10)"
+                            "description": "Number of results (default 5, max 10)"
                         }
                     },
                     "required": ["query"]
@@ -188,6 +232,31 @@ impl ToolHost {
             });
         }
 
+        if self.config.tools.search {
+            tools.push(ToolInfo {
+                name: "portal_search".to_string(),
+                description: "Recursively search text files under the workspace for a regex pattern (ripgrep-style Rust regex).".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Rust regex pattern to match against each line"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Subdirectory or file to search under workspace root (default: entire workspace)"
+                        },
+                        "max_matches": {
+                            "type": "integer",
+                            "description": "Maximum matches to return (default 200, max 2000)"
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            });
+        }
+
         // Always include tools_reload
         tools.push(ToolInfo {
             name: "portal_tools_reload".to_string(),
@@ -211,12 +280,24 @@ impl ToolHost {
 
         // Built-in tools
         match tool_name {
-            "portal_exec" => exec::execute(&self.config, arguments).await,
+            "portal_exec" => {
+                if !self.config.tools.exec {
+                    anyhow::bail!("portal_exec is disabled in configuration");
+                }
+                exec::execute(&self.config, &self.process_manager, arguments).await
+            }
+            "portal_process" => {
+                if !self.config.tools.exec {
+                    anyhow::bail!("portal_process is disabled in configuration");
+                }
+                process::handle(&self.process_manager, arguments).await
+            }
             "portal_file_read" => file::read(&self.config, arguments).await,
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
+            "portal_search" => search::search(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
-            "portal_web_search" => search::search(arguments).await,
+            "portal_web_search" => web_search::search(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
             _ => anyhow::bail!("Unknown tool: {}", tool_name),
         }

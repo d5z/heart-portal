@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Cowork</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+<style>
+:root {
+  --bg-deep: #0c0e14;
+  --bg: #12141c;
+  --bg-surface: #1a1d28;
+  --bg-elevated: #222530;
+  --bg-hover: #282b38;
+  --border: #2a2d3a;
+  --border-subtle: #1e2130;
+  --text: #e0ddd5;
+  --text-secondary: #9a968e;
+  --text-muted: #5c5952;
+  --text-ghost: #3a372f;
+  --accent: #e8845a;
+  --accent-dim: rgba(232, 132, 90, 0.12);
+  --accent-glow: rgba(232, 132, 90, 0.25);
+  --accent-bright: #f09a6e;
+  --green: #6ec99a;
+  --green-dim: rgba(110, 201, 154, 0.15);
+  --yellow: #e8c45a;
+  --red: #d95555;
+  --purple: #b088d0;
+  --purple-dim: rgba(176, 136, 208, 0.12);
+  --radius: 6px;
+  --radius-lg: 10px;
+  --sidebar-w: 256px;
+  --topbar-h: 48px;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', Helvetica, Arial, sans-serif;
+  --transition: 0.15s ease;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg-deep);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-bright); }
+
+/* ─── Scrollbar ─── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ─── Soul Card ─── */
+#soul-card {
+  display: none; position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);
+  align-items: center; justify-content: center;
+  animation: fadeIn 0.2s ease;
+}
+#soul-card.active { display: flex; }
+#soul-card-inner {
+  background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 32px; max-width: 340px; width: 90%;
+  text-align: center; position: relative;
+  animation: cardIn 0.3s ease;
+}
+@keyframes cardIn { from { opacity:0; transform:scale(0.95) translateY(8px); } to { opacity:1; transform:scale(1) translateY(0); } }
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+
+#soul-card-inner .soul-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--green); margin: 0 auto 14px;
+  animation: breathe 4s ease-in-out infinite;
+}
+#soul-card-inner .soul-name {
+  font-family: var(--font-mono); font-size: 18px; font-weight: 600;
+  color: var(--accent); margin-bottom: 4px;
+}
+#soul-card-inner .soul-role {
+  font-size: 11px; color: var(--text-muted); margin-bottom: 16px;
+  font-family: var(--font-mono); letter-spacing: 1.5px; text-transform: uppercase;
+}
+#soul-card-inner .soul-quote {
+  font-size: 13px; color: var(--text-secondary); font-style: italic;
+  line-height: 1.7; margin-bottom: 16px; padding: 0 8px;
+}
+#soul-card-inner .soul-meta {
+  font-size: 10px; color: var(--text-muted);
+  font-family: var(--font-mono);
+  display: flex; justify-content: center; gap: 16px;
+}
+#soul-card .close-btn {
+  position: absolute; top: 10px; right: 14px;
+  background: none; border: none; color: var(--text-muted);
+  font-size: 16px; cursor: pointer; transition: color var(--transition);
+}
+#soul-card .close-btn:hover { color: var(--text); }
+
+/* ─── Top Bar ─── */
+#topbar {
+  height: var(--topbar-h);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 10px;
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.being-identity { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.being-identity:hover .being-name { color: var(--accent-bright); }
+
+#topbar .being-emoji {
+  font-size: 22px;
+  animation: breathe 4s ease-in-out infinite;
+}
+@keyframes breathe {
+  0%, 100% { transform: scale(0.96); opacity: 0.85; }
+  50% { transform: scale(1.04); opacity: 1; }
+}
+
+#topbar .being-name {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+  transition: color var(--transition);
+}
+
+.status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: background 0.3s, box-shadow 0.3s;
+  flex-shrink: 0;
+}
+.status-dot.connected { background: var(--green); animation: breathe 4s ease-in-out infinite; }
+.status-dot.thinking { background: var(--yellow); animation: pulse 1.2s infinite; }
+.status-dot.error { background: var(--red); }
+.status-dot.disconnected { background: var(--red); }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+#topbar .spacer { flex: 1; }
+
+#topbar .status-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.sidebar-toggle {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all var(--transition);
+  font-family: var(--font-mono);
+}
+.sidebar-toggle:hover { color: var(--text-secondary); background: var(--bg-surface); }
+.sidebar-toggle.active { color: var(--accent); border-color: var(--border); background: var(--bg-surface); }
+
+#hamburger {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px;
+}
+
+/* ─── Layout ─── */
+#main-layout { display: flex; flex: 1; overflow: hidden; position: relative; }
+
+#sidebar {
+  width: var(--sidebar-w);
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  flex-shrink: 0;
+  transition: width 0.2s ease, opacity 0.2s ease;
+}
+#sidebar.collapsed {
+  width: 0;
+  overflow: hidden;
+  border-right: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#content { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-deep); }
+
+/* ─── Sidebar Sections ─── */
+.sidebar-section { padding: 12px; }
+.sidebar-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: 1.5px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ─── Status in sidebar ─── */
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border-radius: var(--radius);
+  border: 1px solid var(--border-subtle);
+}
+.status-grid .label { color: var(--text-muted); }
+.status-grid .value { color: var(--text-secondary); text-align: right; }
+.status-grid .value.active { color: var(--green); }
+.status-grid .value.warning { color: var(--yellow); }
+
+/* ─── Activity Feed ─── */
+.activity-item {
+  padding: 3px 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: fadeIn 0.15s ease;
+}
+.activity-item .time { color: var(--text-ghost); margin-right: 6px; }
+.activity-item .tool-name { color: var(--purple); }
+
+/* ─── Space View ─── */
+#space-view { display: flex; height: 100%; flex-direction: column; }
+
+#file-tabs {
+  display: flex;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  flex-shrink: 0;
+  min-height: 38px;
+  padding: 0 4px;
+  gap: 2px;
+  align-items: flex-end;
+}
+.file-tab {
+  padding: 7px 14px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all var(--transition);
+}
+.file-tab:hover { color: var(--text); background: var(--bg-surface); }
+.file-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.file-tab .close { font-size: 14px; opacity: 0.3; cursor: pointer; transition: opacity var(--transition); line-height: 1; }
+.file-tab .close:hover { opacity: 1; }
+.file-tab .modified { color: var(--accent); font-size: 8px; }
+
+#file-content { flex: 1; overflow: auto; padding: 0; position: relative; }
+
+#file-editor {
+  width: 100%; height: 100%;
+  background: var(--bg-deep); color: var(--text);
+  border: none; font-family: var(--font-mono);
+  font-size: 13px; line-height: 1.6;
+  padding: 20px 24px; resize: none; outline: none; tab-size: 2;
+}
+
+#file-preview {
+  padding: 24px 32px; line-height: 1.7;
+  overflow-y: auto; height: 100%; max-width: 760px;
+}
+#file-preview h1 { font-size: 22px; margin: 20px 0 10px; font-weight: 600; }
+#file-preview h2 { font-size: 18px; margin: 16px 0 8px; font-weight: 600; }
+#file-preview h3 { font-size: 15px; margin: 12px 0 6px; font-weight: 600; }
+#file-preview p { margin: 8px 0; }
+#file-preview code { background: var(--bg-surface); padding: 2px 6px; border-radius: 4px; font-family: var(--font-mono); font-size: 13px; color: var(--accent-bright); }
+#file-preview pre { background: var(--bg-surface); padding: 14px 16px; border-radius: var(--radius); overflow-x: auto; border: 1px solid var(--border-subtle); margin: 12px 0; }
+#file-preview pre code { background: none; padding: 0; color: var(--text); }
+#file-preview img { max-width: 100%; border-radius: var(--radius); }
+#file-preview ul, #file-preview ol { padding-left: 24px; margin: 8px 0; }
+#file-preview li { margin: 4px 0; }
+#file-preview hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+#file-preview blockquote { border-left: 3px solid var(--accent); padding: 4px 16px; margin: 12px 0; color: var(--text-secondary); background: var(--accent-dim); border-radius: 0 var(--radius) var(--radius) 0; }
+#file-preview table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+#file-preview th, #file-preview td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+#file-preview th { background: var(--bg-surface); font-weight: 600; }
+#file-preview strong { color: var(--text); }
+
+#file-iframe { width: 100%; height: 100%; border: none; background: #fff; }
+
+.file-mode-bar {
+  display: flex; gap: 2px; padding: 6px 12px;
+  background: var(--bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.file-mode-btn {
+  font-size: 12px; font-family: var(--font-mono); padding: 4px 12px;
+  border-radius: 4px; cursor: pointer; background: none;
+  border: 1px solid transparent; color: var(--text-muted); transition: all var(--transition);
+}
+.file-mode-btn:hover { color: var(--text-secondary); }
+.file-mode-btn.active { background: var(--bg-surface); color: var(--text); border-color: var(--border); }
+
+/* File tree */
+.tree-item {
+  padding: 5px 8px 5px 0; cursor: pointer;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-family: var(--font-mono);
+  border-radius: 4px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--text-secondary); transition: all var(--transition);
+}
+.tree-item:hover { background: var(--bg-surface); color: var(--text); }
+.tree-item .icon { width: 16px; text-align: center; flex-shrink: 0; font-size: 12px; }
+.tree-children { padding-left: 16px; }
+
+.upload-btn {
+  background: none; border: 1px solid var(--border);
+  color: var(--text-muted); cursor: pointer;
+  font-family: var(--font-mono); font-size: 10px;
+  padding: 2px 8px; border-radius: 4px; transition: all var(--transition);
+}
+.upload-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+.drop-overlay {
+  display: none; position: absolute; inset: 0;
+  background: var(--accent-dim); border: 2px dashed var(--accent);
+  border-radius: var(--radius); z-index: 100;
+  align-items: center; justify-content: center;
+  font-family: var(--font-mono); font-size: 14px; color: var(--accent);
+}
+.drop-active .drop-overlay { display: flex; }
+
+#file-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; color: var(--text-muted); gap: 10px;
+}
+#file-empty .icon { font-size: 36px; opacity: 0.4; }
+#file-empty .label { font-family: var(--font-mono); font-size: 12px; }
+
+/* ─── Context Menu ─── */
+.ctx-menu {
+  position: fixed;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 0;
+  min-width: 140px;
+  z-index: 300;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.ctx-menu-item {
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.1s;
+}
+.ctx-menu-item:hover { background: var(--bg-hover); color: var(--text); }
+.ctx-menu-item.danger:hover { color: var(--red); }
+
+/* ─── Responsive ─── */
+@media (max-width: 768px) {
+  #sidebar {
+    position: absolute; left: -100%;
+    top: var(--topbar-h); bottom: 0; z-index: 50;
+    transition: left 0.2s ease; box-shadow: 4px 0 16px rgba(0,0,0,0.4);
+  }
+  #sidebar.open { left: 0; }
+  #hamburger { display: block; }
+  :root { --sidebar-w: 260px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Soul Card -->
+<div id="soul-card" onclick="if(event.target===this)toggleSoulCard()">
+  <div id="soul-card-inner">
+    <button class="close-btn" onclick="toggleSoulCard()">✕</button>
+    <div class="soul-dot"></div>
+    <div class="soul-name" id="soul-name">—</div>
+    <div class="soul-role" id="soul-role">BEING</div>
+    <div class="soul-quote" id="soul-quote">"..."</div>
+    <div class="soul-meta">
+      <span id="soul-born">—</span>
+      <span id="soul-status">—</span>
+    </div>
+  </div>
+</div>
+
+<!-- Top Bar -->
+<div id="topbar">
+  <button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+  <div class="being-identity" onclick="toggleSoulCard()">
+    <span class="being-emoji" id="being-emoji">🧵</span>
+    <span class="being-name" id="being-name">Being</span>
+  </div>
+  <div class="status-dot" id="status-dot"></div>
+  <div class="spacer"></div>
+  <button class="sidebar-toggle" id="sidebar-toggle" onclick="toggleSidebar()" title="toggle sidebar">☰</button>
+</div>
+
+<div id="main-layout">
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-title">Status</div>
+      <div class="status-grid">
+        <span class="label">state</span><span class="value" id="st-state">—</span>
+        <span class="label">ctx</span><span class="value" id="st-context">—</span>
+        <span class="label">tools</span><span class="value" id="st-tools">—</span>
+        <span class="label">uptime</span><span class="value" id="st-uptime">—</span>
+      </div>
+      <div class="sidebar-title">Activity</div>
+      <div id="activity-list"></div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">
+        Files
+        <button class="upload-btn" onclick="uploadFiles()">↑ Upload</button>
+      </div>
+      <div id="file-tree" style="position:relative">
+        <div class="drop-overlay">Drop files here</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Content -->
+  <div id="content">
+    <div id="space-view">
+      <div id="file-tabs"></div>
+      <div class="file-mode-bar" id="file-mode-bar" style="display:none">
+        <button class="file-mode-btn active" onclick="setFileMode('preview')">Preview</button>
+        <button class="file-mode-btn" onclick="setFileMode('edit')">Edit</button>
+        <button class="file-mode-btn" onclick="setFileMode('app')" id="btn-app-mode" style="display:none">App</button>
+      </div>
+      <div id="file-content">
+        <div id="file-preview" style="display:none"></div>
+        <textarea id="file-editor" style="display:none" spellcheck="false"></textarea>
+        <iframe id="file-iframe" style="display:none" sandbox="allow-scripts allow-forms"></iframe>
+        <div id="file-empty">
+          <span class="icon">📂</span>
+          <span class="label">Select a file to explore</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="file-upload-input" multiple style="display:none" onchange="handleUpload(this.files)">
+
+<script>
+// ─── State ───
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+let openFiles = [];
+let activeFileIdx = -1;
+let ws = null;
+let wsRetry = 1000;
+let soulInfo = {};
+let saveTimers = {};
+let beingName = 'Being';
+let connected = false;
+let connectTime = null;
+
+// ─── Init ───
+async function init() {
+  await loadSoul();
+  connectWs();
+  checkHealth();
+  setInterval(checkHealth, 15000);
+  setInterval(updateUptime, 30000);
+  loadFileTree();
+}
+
+async function loadSoul() {
+  try {
+    const r = await fetch('/api/soul');
+    soulInfo = await r.json();
+    if (soulInfo.name) {
+      beingName = soulInfo.name;
+      $('#being-name').textContent = beingName;
+      document.title = `Cowork · ${beingName}`;
+      $('#soul-name').textContent = beingName;
+    }
+    if (soulInfo.emoji) {
+      $('#being-emoji').textContent = soulInfo.emoji;
+    }
+    if (soulInfo.role) $('#soul-role').textContent = soulInfo.role;
+    if (soulInfo.quote) $('#soul-quote').textContent = '"' + soulInfo.quote + '"';
+  } catch(e) { console.warn('soul load failed', e); }
+}
+
+// ─── Soul Card ───
+let soulCardOpen = false;
+function toggleSoulCard() {
+  soulCardOpen = !soulCardOpen;
+  $('#soul-card').classList.toggle('active', soulCardOpen);
+}
+
+// ─── Sidebar ───
+let sidebarOpen = true;
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  $('#sidebar').classList.toggle('collapsed', !sidebarOpen);
+  $('#sidebar-toggle').classList.toggle('active', sidebarOpen);
+}
+
+// ─── Status ───
+function setStatus(state) {
+  const dot = $('#status-dot');
+  dot.className = 'status-dot ' + (state || '');
+  const stState = $('#st-state');
+  const labels = { connected:'idle', thinking:'thinking', error:'offline', disconnected:'offline' };
+  if (stState) {
+    stState.textContent = labels[state] || state;
+    stState.className = 'value' + (state === 'connected' ? ' active' : state === 'error' ? ' warning' : '');
+  }
+}
+
+function updateUptime() {
+  if (!connectTime) return;
+  const mins = Math.floor((Date.now() - connectTime) / 60000);
+  const h = Math.floor(mins / 60), m = mins % 60;
+  $('#st-uptime').textContent = h > 0 ? `${h}h${m}m` : `${m}m`;
+}
+
+async function checkHealth() {
+  try {
+    const r = await fetch('/api/health');
+    if (r.ok && !connected) {
+      connected = true;
+      setStatus('connected');
+      connectTime = Date.now();
+      updateUptime();
+    }
+    if (!r.ok && connected) { connected = false; setStatus('error'); }
+  } catch { if (connected) { connected = false; setStatus('error'); } }
+}
+
+// ─── Activity ───
+function addActivity(text) {
+  const el = $('#activity-list');
+  const item = document.createElement('div');
+  item.className = 'activity-item';
+  const time = new Date().toLocaleTimeString('en-US', { hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit' });
+  item.innerHTML = `<span class="time">${time}</span>${text}`;
+  el.prepend(item);
+  while (el.children.length > 30) el.lastChild.remove();
+}
+
+// ─── Markdown ───
+function renderMd(text) {
+  if (typeof marked !== 'undefined') {
+    try {
+      const html = marked.parse(text || '');
+      return typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+    } catch(e) {}
+  }
+  return (text || '').replace(/</g, '&lt;').replace(/\n/g, '<br>');
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ─── WebSocket ───
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsToken = new URLSearchParams(location.search).get('token') || '';
+  const wsUrl = `${proto}//${location.host}/ws${wsToken ? '?token=' + encodeURIComponent(wsToken) : ''}`;
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { setStatus('connected'); wsRetry = 1000; };
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const icon = data.type === 'file-created' ? '+' : data.type === 'file-deleted' ? '−' : '~';
+      addActivity(`${icon} ${escHtml(data.path)}`);
+      loadFileTree();
+      const idx = openFiles.findIndex(f => f.path === data.path);
+      if (idx >= 0 && !openFiles[idx].modified) {
+        fetch(`/api/file?path=${encodeURIComponent(data.path)}`)
+          .then(r => r.text())
+          .then(content => { openFiles[idx].content = content; if(idx===activeFileIdx)showFileContent(openFiles[idx]); });
+      }
+    } catch(e) {}
+  };
+  ws.onclose = () => { setStatus('disconnected'); setTimeout(connectWs, wsRetry); wsRetry = Math.min(wsRetry*2, 8000); };
+  ws.onerror = () => ws.close();
+  setInterval(() => { if(ws && ws.readyState===1) ws.send('ping'); }, 30000);
+}
+
+// ─── Space: Files ───
+async function loadFileTree() {
+  try {
+    const r = await fetch('/api/files');
+    const entries = await r.json();
+    $('#file-tree').innerHTML = '<div class="drop-overlay">Drop files here</div>' + renderTree(entries, '');
+    setupTreeDragDrop();
+  } catch(e) { $('#file-tree').innerHTML = '<div style="color:var(--red);padding:8px;font-size:12px">Failed to load</div>'; }
+}
+
+function renderTree(entries, prefix) {
+  let html = '';
+  for (const e of entries) {
+    const depth = prefix ? prefix.split('/').length : 0;
+    const indent = `padding-left:${depth*16+8}px`;
+    if (e.is_dir) {
+      html += `<div class="tree-item" style="${indent}" onclick="toggleDir(this)" data-path="${e.path}"><span class="icon">▸</span> ${escHtml(e.name)}</div>`;
+      html += e.children?.length
+        ? `<div class="tree-children" style="display:none">${renderTree(e.children, e.path)}</div>`
+        : `<div class="tree-children" style="display:none" data-lazy="${e.path}"></div>`;
+    } else {
+      html += `<div class="tree-item" style="${indent}" onclick="openFile('${e.path}')"><span class="icon">${fileIcon(e.name)}</span> ${escHtml(e.name)}</div>`;
+    }
+  }
+  return html;
+}
+
+function fileIcon(name) {
+  if (/\.md$/i.test(name)) return '◇';
+  if (/\.html?$/i.test(name)) return '◈';
+  if (/\.(png|jpe?g|gif|svg|webp)$/i.test(name)) return '▣';
+  if (/\.pdf$/i.test(name)) return '▤';
+  if (/\.(mp3|wav|ogg|m4a)$/i.test(name)) return '♪';
+  if (/\.(mp4|webm)$/i.test(name)) return '▶';
+  if (/\.(rs|js|ts|py|toml|json|yml|yaml|sh)$/i.test(name)) return '▪';
+  return '·';
+}
+
+function toggleDir(el) {
+  const children = el.nextElementSibling;
+  if (!children) return;
+  const open = children.style.display !== 'none';
+  children.style.display = open ? 'none' : 'block';
+  el.querySelector('.icon').textContent = open ? '▸' : '▾';
+  const lazy = children.dataset.lazy;
+  if (lazy && !children.innerHTML) {
+    fetch(`/api/files?path=${encodeURIComponent(lazy)}`)
+      .then(r => r.json())
+      .then(entries => { children.innerHTML = renderTree(entries, lazy); })
+      .catch(() => { children.innerHTML = '<div style="color:var(--red);padding:4px 8px;font-size:12px">Error</div>'; });
+  }
+}
+
+async function openFile(path) {
+  let idx = openFiles.findIndex(f => f.path === path);
+  if (idx >= 0) { activateTab(idx); return; }
+  const ext = path.split('.').pop().toLowerCase();
+  const isImage = ['png','jpg','jpeg','gif','svg','webp'].includes(ext);
+  const isMd = ext === 'md';
+  const isHtml = ['html','htm'].includes(ext);
+  const isPdf = ext === 'pdf';
+  const isAudio = ['mp3','wav','ogg','m4a'].includes(ext);
+  const isVideo = ['mp4','webm'].includes(ext);
+  const isBinary = isImage || isPdf || isAudio || isVideo;
+  let content = '';
+  if (!isBinary) { try { content = await (await fetch(`/api/file?path=${encodeURIComponent(path)}`)).text(); } catch(e) { content = '(failed)'; } }
+  const mode = isImage?'image':isPdf?'pdf':isAudio?'audio':isVideo?'video':isMd?'preview':isHtml?'app':'edit';
+  openFiles.push({ path, content, mode, modified:false, isImage, isMd, isHtml, isPdf, isAudio, isVideo });
+  idx = openFiles.length - 1;
+  renderTabs(); activateTab(idx);
+}
+
+function renderTabs() {
+  $('#file-tabs').innerHTML = openFiles.map((f,i) => {
+    const name = f.path.split('/').pop();
+    const mod = f.modified ? '<span class="modified">●</span>' : '';
+    return `<div class="file-tab ${i===activeFileIdx?'active':''}" onclick="activateTab(${i})">${escHtml(name)} ${mod} <span class="close" onclick="event.stopPropagation();closeTab(${i})">×</span></div>`;
+  }).join('');
+}
+
+function activateTab(idx) {
+  if (idx < 0 || idx >= openFiles.length) return;
+  activeFileIdx = idx;
+  renderTabs();
+  const f = openFiles[idx];
+  $('#file-preview').style.display = 'none';
+  $('#file-editor').style.display = 'none';
+  $('#file-iframe').style.display = 'none';
+  $('#file-empty').style.display = 'none';
+  $('#file-mode-bar').style.display = 'flex';
+  $('#btn-app-mode').style.display = f.isHtml ? 'inline-block' : 'none';
+  $$('.file-mode-btn').forEach(b => b.classList.toggle('active', b.textContent.trim().toLowerCase() === f.mode));
+  showFileContent(f);
+}
+
+function showFileContent(f) {
+  $('#file-preview').style.display = 'none';
+  $('#file-editor').style.display = 'none';
+  $('#file-iframe').style.display = 'none';
+  const fileUrl = `/api/file?path=${encodeURIComponent(f.path)}`;
+  if (f.mode === 'image') {
+    $('#file-preview').style.display = 'block';
+    $('#file-preview').innerHTML = `<img src="${fileUrl}" alt="${escHtml(f.path)}">`;
+    $('#file-mode-bar').style.display = 'none';
+  } else if (f.mode === 'pdf') {
+    $('#file-preview').style.display = 'block';
+    $('#file-preview').style.maxWidth = 'none';
+    $('#file-preview').innerHTML = `<object data="${fileUrl}" type="application/pdf" style="width:100%;height:100%;min-height:80vh;border:none;border-radius:var(--radius)"><p style="padding:40px;text-align:center;color:var(--text-muted)">PDF preview not available. <a href="${fileUrl}" target="_blank" style="color:var(--accent)">Download</a></p></object>`;
+    $('#file-mode-bar').style.display = 'none';
+  } else if (f.mode === 'audio') {
+    $('#file-preview').style.display = 'block';
+    $('#file-preview').innerHTML = `<div style="padding:40px;text-align:center"><div style="font-size:48px;margin-bottom:16px">♪</div><div style="margin-bottom:16px;color:var(--text-secondary);font-family:var(--font-mono);font-size:13px">${escHtml(f.path.split('/').pop())}</div><audio controls src="${fileUrl}" style="width:100%;max-width:400px"></audio></div>`;
+    $('#file-mode-bar').style.display = 'none';
+  } else if (f.mode === 'video') {
+    $('#file-preview').style.display = 'block';
+    $('#file-preview').innerHTML = `<div style="padding:20px;text-align:center"><video controls src="${fileUrl}" style="max-width:100%;max-height:70vh;border-radius:var(--radius)"></video></div>`;
+    $('#file-mode-bar').style.display = 'none';
+  } else if (f.mode === 'preview') {
+    $('#file-preview').style.display = 'block';
+    $('#file-preview').innerHTML = renderMd(f.content);
+  } else if (f.mode === 'edit') {
+    const ed = $('#file-editor'); ed.style.display = 'block'; ed.value = f.content;
+    ed.oninput = () => { f.content = ed.value; f.modified = true; renderTabs(); debounceSave(f); };
+  } else if (f.mode === 'app') {
+    const iframe = $('#file-iframe'); iframe.style.display = 'block'; iframe.srcdoc = f.content;
+  }
+}
+
+function setFileMode(mode) {
+  if (activeFileIdx < 0) return;
+  const f = openFiles[activeFileIdx]; if(f.isImage) return;
+  f.mode = mode;
+  $$('.file-mode-btn').forEach(b => b.classList.toggle('active', b.textContent.trim().toLowerCase() === mode));
+  showFileContent(f);
+}
+
+function closeTab(idx) {
+  openFiles.splice(idx, 1);
+  if (idx < activeFileIdx) activeFileIdx--;
+  else if (activeFileIdx >= openFiles.length) activeFileIdx = openFiles.length - 1;
+  renderTabs();
+  if (activeFileIdx >= 0) activateTab(activeFileIdx);
+  else { $('#file-preview').style.display='none'; $('#file-editor').style.display='none'; $('#file-iframe').style.display='none'; $('#file-empty').style.display='flex'; $('#file-mode-bar').style.display='none'; }
+}
+
+function debounceSave(f) { if(saveTimers[f.path])clearTimeout(saveTimers[f.path]); saveTimers[f.path]=setTimeout(()=>saveFile(f),500); }
+async function saveFile(f) { try { await fetch(`/api/file?path=${encodeURIComponent(f.path)}`,{method:'PUT',headers:{'Content-Type':'text/plain'},body:f.content}); f.modified=false; renderTabs(); } catch(e){} }
+
+function uploadFiles() { $('#file-upload-input').click(); }
+async function handleUpload(files) { for(const f of files){const fd=new FormData();fd.append('file',f);try{await fetch('/api/upload?path=',{method:'POST',body:fd});}catch(e){}} loadFileTree(); }
+function setupTreeDragDrop() {
+  const tree=$('#file-tree');
+  tree.addEventListener('dragover',e=>{e.preventDefault();tree.classList.add('drop-active');});
+  tree.addEventListener('dragleave',()=>tree.classList.remove('drop-active'));
+  tree.addEventListener('drop',async e=>{e.preventDefault();tree.classList.remove('drop-active');if(e.dataTransfer.files.length)await handleUpload(e.dataTransfer.files);});
+}
+
+// ─── Context Menu ───
+let ctxMenuEl = null;
+let ctxTarget = null;
+
+function showContextMenu(x, y, path, isDir, treeItemEl) {
+  dismissContextMenu();
+  ctxTarget = { path, isDir, el: treeItemEl };
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  const items = [
+    { label: '✏ Rename', action: 'rename' },
+    { label: '🗑 Delete', action: 'delete', cls: 'danger' },
+  ];
+  if (!isDir) items.push({ label: '📄 Open', action: 'open' });
+  for (const it of items) {
+    const d = document.createElement('div');
+    d.className = 'ctx-menu-item' + (it.cls ? ' ' + it.cls : '');
+    d.textContent = it.label;
+    d.onclick = () => {
+      const saved = ctxTarget; // save before dismiss clears it
+      dismissContextMenu();
+      if (saved) handleCtxActionWith(it.action, saved);
+    };
+    menu.appendChild(d);
+  }
+  // Position: keep on screen
+  document.body.appendChild(menu);
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  menu.style.left = Math.min(x, window.innerWidth - mw - 8) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - mh - 8) + 'px';
+  ctxMenuEl = menu;
+}
+
+function dismissContextMenu() {
+  if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; }
+  ctxTarget = null;
+}
+
+document.addEventListener('click', e => { if (ctxMenuEl && !ctxMenuEl.contains(e.target)) dismissContextMenu(); });
+document.addEventListener('contextmenu', e => {
+  const ti = e.target.closest('.tree-item');
+  if (!ti) return;
+  e.preventDefault();
+  const path = ti.dataset.path || ti.getAttribute('onclick')?.match(/openFile\('([^']+)'\)/)?.[1];
+  if (!path) return;
+  const isDir = !!ti.querySelector('.icon')?.textContent?.match(/[▸▾]/);
+  showContextMenu(e.clientX, e.clientY, path, isDir, ti);
+});
+
+// Long press for mobile
+let longPressTimer = null;
+document.addEventListener('touchstart', e => {
+  const ti = e.target.closest('.tree-item');
+  if (!ti) return;
+  longPressTimer = setTimeout(() => {
+    const touch = e.touches[0];
+    const path = ti.dataset.path || ti.getAttribute('onclick')?.match(/openFile\('([^']+)'\)/)?.[1];
+    if (!path) return;
+    const isDir = !!ti.querySelector('.icon')?.textContent?.match(/[▸▾]/);
+    showContextMenu(touch.clientX, touch.clientY, path, isDir, ti);
+    e.preventDefault();
+  }, 500);
+}, { passive: false });
+document.addEventListener('touchend', () => { clearTimeout(longPressTimer); });
+document.addEventListener('touchmove', () => { clearTimeout(longPressTimer); });
+
+async function handleCtxActionWith(action, target) {
+  const { path, isDir } = target;
+  if (action === 'open') {
+    openFile(path);
+    return;
+  }
+  if (action === 'rename') {
+    const oldName = path.split('/').pop();
+    const newName = prompt('Rename to:', oldName);
+    if (!newName || newName === oldName) return;
+    const dir = path.includes('/') ? path.substring(0, path.lastIndexOf('/') + 1) : '';
+    const newPath = dir + newName;
+    try {
+      const r = await fetch('/api/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: path, to: newPath }) });
+      if (r.ok) {
+        // Update open tabs
+        const idx = openFiles.findIndex(f => f.path === path);
+        if (idx >= 0) { openFiles[idx].path = newPath; renderTabs(); }
+        loadFileTree();
+        addActivity('✏ renamed ' + escHtml(oldName) + ' → ' + escHtml(newName));
+      } else { alert('Rename failed: ' + await r.text()); }
+    } catch(e) { alert('Rename failed'); }
+  } else if (action === 'delete') {
+    const name = path.split('/').pop();
+    if (!confirm('Delete ' + name + '?')) return;
+    try {
+      const r = await fetch('/api/file?path=' + encodeURIComponent(path), { method: 'DELETE' });
+      if (r.ok) {
+        const idx = openFiles.findIndex(f => f.path === path);
+        if (idx >= 0) closeTab(idx);
+        loadFileTree();
+        addActivity('🗑 deleted ' + escHtml(name));
+      } else { alert('Delete failed'); }
+    } catch(e) { alert('Delete failed'); }
+  }
+}
+
+// ─── Start ───
+// Cmd/Ctrl+S to save current file
+document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+    e.preventDefault();
+    if (activeFileIdx >= 0 && openFiles[activeFileIdx]?.modified) {
+      saveFile(openFiles[activeFileIdx]);
+    }
+  }
+});
+
+$('#sidebar-toggle').classList.add('active');
+init();
+</script>
+</body>
+</html>

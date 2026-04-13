@@ -43,15 +43,26 @@ struct RawConfig {
     #[serde(default)]
     workspace: Option<PathBuf>,
 
-    /// Auth token for pairing. Clients must send this in initialize.
-    #[serde(default)]
-    token: Option<String>,
-
     #[serde(default)]
     tools: Option<ToolsConfig>,
 
     #[serde(default)]
     security: Option<RawSecurityConfig>,
+
+    #[serde(default)]
+    cowork: Option<RawCoworkConfig>,
+
+    /// MCP TCP pre-auth token (also settable via PORTAL_MCP_TOKEN env)
+    #[serde(default)]
+    portal_mcp_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCoworkConfig {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    http_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,8 +83,15 @@ pub struct PortalConfig {
     pub bind_port: u16,
     pub tools: ToolsConfig,
     pub security: SecurityConfig,
-    /// Optional auth token. If set, clients must send it in initialize params.
-    pub auth_token: Option<String>,
+    pub cowork: CoworkConfig,
+    /// When set, MCP TCP clients must send `auth` as the first JSON-RPC message.
+    pub portal_mcp_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoworkConfig {
+    pub enabled: bool,
+    pub http_port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,6 +102,12 @@ pub struct ToolsConfig {
     pub file: bool,
     #[serde(default = "default_true")]
     pub web_fetch: bool,
+    /// Recursive workspace text search (portal_search).
+    #[serde(default = "default_true")]
+    pub search: bool,
+    /// When false, workspace/tools/mcp.toml is ignored (custom MCP tools disabled).
+    #[serde(default = "default_true")]
+    pub custom_tools_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +115,15 @@ pub struct SecurityConfig {
     pub exec_allowlist: Vec<String>,
     pub workspace_root: PathBuf,
     pub max_file_size: usize,
+}
+
+impl Default for CoworkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            http_port: 9101,
+        }
+    }
 }
 
 impl Default for PortalConfig {
@@ -101,14 +134,21 @@ impl Default for PortalConfig {
             bind_port: 9100,
             tools: ToolsConfig::default(),
             security: SecurityConfig::default(),
-            auth_token: None,
+            cowork: CoworkConfig::default(),
+            portal_mcp_token: None,
         }
     }
 }
 
 impl Default for ToolsConfig {
     fn default() -> Self {
-        Self { exec: true, file: true, web_fetch: true }
+        Self {
+            exec: true,
+            file: true,
+            web_fetch: true,
+            search: true,
+            custom_tools_enabled: true,
+        }
     }
 }
 
@@ -152,10 +192,10 @@ impl PortalConfig {
                 .unwrap_or(10 * 1024 * 1024),
         };
 
-        // Auth token: config file > PORTAL_TOKEN env var
-        let auth_token = raw.token
-            .or_else(|| std::env::var("PORTAL_TOKEN").ok())
-            .filter(|t| !t.trim().is_empty());
+        let cowork = CoworkConfig {
+            enabled: raw.cowork.as_ref().and_then(|c| c.enabled).unwrap_or(true),
+            http_port: raw.cowork.as_ref().and_then(|c| c.http_port).unwrap_or(port + 1),
+        };
 
         Ok(PortalConfig {
             name: raw.name.unwrap_or_else(|| "portal".to_string()),
@@ -163,7 +203,8 @@ impl PortalConfig {
             bind_port: port,
             tools: raw.tools.unwrap_or_default(),
             security,
-            auth_token,
+            cowork,
+            portal_mcp_token: raw.portal_mcp_token.clone().filter(|s| !s.is_empty()),
         })
     }
 }

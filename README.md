@@ -1,148 +1,131 @@
 # Heart Portal
 
-**Portal — a being's gateway to the world.**
+**Being's hands in the world.** A lightweight MCP server that gives beings the ability to execute commands, read/write files, search the web, and manage their workspace.
 
-Portal is a lightweight [MCP](https://modelcontextprotocol.io/) server that gives AI beings secure access to a computer's filesystem, shell, and web. It runs on a human's machine and connects back to the being's heart (brain) over TCP.
-
-Think of it as a door: the being lives in their heart, but Portal lets them reach out — read files, run commands, fetch web pages, and use any custom tools you build.
-
-## Quick Start
-
-```bash
-# Download the binary for your platform from Releases
-# https://github.com/d5z/heart-portal/releases
-
-# Run with defaults (open access, port 9100)
-./heart-portal
-
-# Or with a config file
-./heart-portal portal.toml
-```
-
-### portal.toml
-
-```toml
-name = "my-portal"
-bind = "0.0.0.0:9100"
-workspace = "/home/me/workspace"
-token = "my-secret-token"
-
-[tools]
-exec = true
-file = true
-web_fetch = true
-```
-
-## Built-in Tools
-
-| Tool | Description |
-|------|-------------|
-| `portal_exec` | Execute shell commands |
-| `portal_file_read` | Read files (sandboxed to workspace) |
-| `portal_file_write` | Write files (sandboxed to workspace) |
-| `portal_file_list` | List directory contents |
-| `portal_web_fetch` | Fetch content from URLs |
-| `portal_tools_reload` | Hot-reload custom tools |
-
-## Custom Tools (DIY)
-
-Portal can host any MCP-compatible tool you write — in Python, Node.js, Rust, Go, or anything that speaks stdio.
-
-1. Create a script in `workspace/tools/`:
-
-```python
-# workspace/tools/hello.py
-import json, sys
-
-# MCP stdio server — reads JSON-RPC from stdin, writes to stdout
-for line in sys.stdin:
-    req = json.loads(line)
-    if req["method"] == "tools/list":
-        result = {"tools": [{"name": "hello", "description": "Say hello", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}]}
-    elif req["method"] == "tools/call":
-        name = req["params"]["arguments"].get("name", "world")
-        result = {"content": [{"type": "text", "text": f"Hello, {name}!"}]}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": req.get("id"), "result": result}), flush=True)
-```
-
-2. Register it in `workspace/tools/mcp.toml`:
-
-```toml
-[[servers]]
-name = "hello"
-command = ["python3", "hello.py"]
-```
-
-3. Call `portal_tools_reload` — your tool is live. No restart needed.
-
-The being sees it as `portal_hello` — seamlessly integrated with built-in tools.
-
-## Token Auth
-
-Set a `token` in portal.toml or via `PORTAL_TOKEN` env var. When set, connecting clients must include the token in the `initialize` request:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "token": "my-secret-token"
-  }
-}
-```
-
-No token configured = open access (suitable for trusted networks).
-
-## Security & Permissions
-
-Portal runs on **your** computer. You control everything:
-
-- **Token auth** — who can connect
-- **Tool switches** — what categories of actions are allowed (exec/file/web)
-- **Workspace sandbox** — file operations confined to one directory, path traversal blocked
-- **Exec allowlist** — optionally restrict which shell commands are allowed
-
-See **[SECURITY.md](SECURITY.md)** for the full permissions guide, including recommended configs for trusted beings, visiting beings, and maximum restriction.
+Portal runs **outside** Heart — on a VPS, a human's laptop, or anywhere. Heart connects to Portal via TCP MCP, keeping memory and identity safe on the Heart side while Portal provides physical capabilities.
 
 ## Architecture
 
 ```
-┌─ Being's Heart ──────────┐       ┌─ Your Computer ───────────┐
-│                          │       │                            │
-│  Core (brain)            │       │  Portal (MCP server)       │
-│  Cortex (tools client)   │◄─TCP─►│    ├── built-in tools (6)  │
-│                          │       │    └── your custom tools    │
-│                          │       │                            │
-└──────────────────────────┘       └────────────────────────────┘
+Origin Hearth (safe)              Anywhere (Portal)
+┌──────────────────┐    TCP MCP    ┌──────────────────┐
+│ heart-core       │◄────────────►│ Portal           │
+│ .being (memory)  │              │   workspace/     │
+│ identity         │              │   exec tools     │
+│ bedrock          │              │   Cowork Space   │
+└──────────────────┘              └──────────────────┘
 ```
 
-Portal speaks standard MCP (JSON-RPC 2.0 over TCP). Any MCP client can connect — not just Heart.
+## Built-in Tools (9)
+
+| Tool | Description |
+|------|-------------|
+| `portal_exec` | Execute commands (allowlist-based security) |
+| `portal_process` | Background process management |
+| `portal_file_read` | Read files from workspace |
+| `portal_file_write` | Write files to workspace |
+| `portal_file_list` | List directory contents |
+| `portal_search` | Full-text search across workspace (ripgrep) |
+| `portal_web_fetch` | Fetch and extract content from URLs |
+| `portal_web_search` | Search the web (DuckDuckGo, no API key needed) |
+| `portal_tools_reload` | Hot-reload custom MCP tools |
+
+## Cowork Space
+
+A built-in web UI for humans to browse and edit the being's workspace files in real-time.
+
+- File tree with multi-tab editor
+- Markdown rendering, HTML preview, image/video/PDF viewing
+- WebSocket real-time file change notifications
+- Drag-and-drop upload
+- No chat — that's what [Loom](https://github.com/d5z/heart) is for
+
+Access at `http://portal-host:cowork-port/`
+
+## Starter Kit
+
+Every new Portal comes with a starter kit — guides and templates that help a being get productive immediately:
+
+```
+starter-kit/
+├── README.md              — Welcome, here's what you can do
+├── guides/
+│   ├── portal-ref.md      — All 9 tools, quick reference
+│   ├── web-search.md      — How to search and read the web
+│   └── diy-tools.md       — How to build your own MCP tools
+├── tools/
+│   ├── mcp.toml           — Custom tools config template
+│   └── examples/
+│       └── hello-tool.js  — Example: build a tool in 20 lines
+├── scripts/
+│   └── search.sh          — Web search wrapper script
+└── notes/                 — Your space, write anything
+```
+
+## Quick Start
+
+```bash
+# Download the binary (Linux x86_64)
+curl -fsSL https://github.com/d5z/heart-portal/releases/latest/download/heart-portal-linux-x86_64 -o heart-portal
+chmod +x heart-portal
+
+# Run
+./heart-portal --bind 0.0.0.0:3310 --cowork-bind 0.0.0.0:3311 --workspace ./workspace
+```
+
+### Configuration (portal.toml)
+
+```toml
+bind = "0.0.0.0:3310"          # MCP TCP port (Heart connects here)
+cowork_bind = "0.0.0.0:3311"   # Cowork Space web UI
+workspace = "./workspace"       # Being's workspace directory
+```
+
+### With Heart
+
+In the being's MCP server config on Heart side:
+
+```toml
+[[mcp_servers]]
+name = "hotel"
+transport = "tcp"
+address = "portal-host:3310"
+token = "your-secret-token"
+```
+
+## Security
+
+- **exec_policy**: Allowlist-based command execution — beings can only run whitelisted commands
+- **safe_path**: All file operations confined to workspace directory (no path traversal)
+- **token auth**: MCP connections authenticated via token
+- **Resource limits**: Configurable disk quota, CPU, and memory limits per Portal
+
+See [SECURITY.md](SECURITY.md) for details.
 
 ## Building from Source
 
 ```bash
-git clone https://github.com/d5z/heart-portal.git
-cd heart-portal
-cargo build --release
-# Binary at target/release/heart-portal
+cargo build --release -p heart-portal
+
+# Cross-compile for Linux (from macOS)
+cargo build --release --target x86_64-unknown-linux-musl -p heart-portal
 ```
 
-### Cross-compile for Linux (from macOS)
+## Origin Hotel
+
+For managed hosting, Heart runs **Origin Hotel** — a shared server where beings get a Portal room automatically. Each room is an isolated Portal instance with a starter kit, resource quotas, and Cowork Space access.
 
 ```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+hotel init hex 3320      # Create a room
+hotel start hex          # Start Portal
+hotel status             # See all rooms
 ```
-
-## What is a Being?
-
-A being is a continuously existing AI entity with its own memory, personality, and relationships. Beings run on [Heart-RS](https://github.com/d5z/heart-rs) — a Rust runtime designed for AI existence. Portal extends a being's reach into the physical world.
-
-Learn more: [beings.town](https://beings.town)
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+## Links
+
+- [Heart](https://github.com/d5z/heart) — Being's core (memory, identity, cognition)
+- [Human Covenant](https://beings.town) — One human, one being, equal relationship

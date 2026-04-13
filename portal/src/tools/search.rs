@@ -1,103 +1,135 @@
-//! Web search tool — Google Custom Search API.
+//! Workspace search — recursive grep under the portal workspace root.
 
+use crate::config::PortalConfig;
+use crate::tools::file::resolve_path_logical;
 use anyhow::Result;
+use regex::Regex;
 use serde_json::Value;
+use std::path::Path;
 use tracing::debug;
+use walkdir::WalkDir;
 
-/// Google Custom Search API endpoint
-const GOOGLE_CSE_ENDPOINT: &str = "https://www.googleapis.com/customsearch/v1";
+/// Search recursively under `workspace_root` for lines matching `pattern` (Rust regex syntax).
+pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
+    let pattern = arguments
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
 
-/// Simple percent-encoding for URL query parameters
-fn url_encode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(b as char);
+    let max_matches = arguments
+        .get("max_matches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200)
+        .min(2000) as usize;
+
+    let path_filter = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let root = resolve_path_logical(config, path_filter)?;
+    if !root.starts_with(&config.security.workspace_root) {
+        anyhow::bail!("Search path outside workspace");
+    }
+    if !root.exists() {
+        anyhow::bail!("Path does not exist: {}", path_filter);
+    }
+
+    let re = Regex::new(pattern)
+        .map_err(|e| anyhow::anyhow!("Invalid regex: {}", e))?;
+
+    let workspace = config.security.workspace_root.clone();
+    let max_file = config.security.max_file_size;
+
+    debug!(
+        "portal_search: pattern={:?} under {}",
+        pattern,
+        root.display()
+    );
+
+    let matches = tokio::task::spawn_blocking(move || {
+        grep_workspace(&workspace, &root, &re, max_matches, max_file)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Search task failed: {}", e))??;
+
+    let text = serde_json::to_string(&matches)?;
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "match_count": matches.len()
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct GrepMatch {
+    path: String,
+    line: usize,
+    text: String,
+}
+
+fn grep_workspace(
+    workspace_root: &Path,
+    search_root: &Path,
+    re: &Regex,
+    max_matches: usize,
+    max_file_bytes: usize,
+) -> Result<Vec<GrepMatch>> {
+    let mut out = Vec::new();
+
+    for entry in WalkDir::new(search_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if out.len() >= max_matches {
+            break;
+        }
+
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.len() > max_file_bytes as u64 {
+            continue;
+        }
+
+        let rel = match path.strip_prefix(workspace_root) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        if bytes.iter().any(|&b| b == 0) {
+            continue;
+        }
+
+        let text = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+
+        for (i, line) in text.lines().enumerate() {
+            if out.len() >= max_matches {
+                break;
             }
-            _ => {
-                result.push_str(&format!("%{:02X}", b));
+            if re.is_match(line) {
+                out.push(GrepMatch {
+                    path: rel.clone(),
+                    line: i + 1,
+                    text: line.chars().take(2000).collect(),
+                });
             }
         }
     }
-    result
-}
 
-pub async fn search(arguments: Value) -> Result<Value> {
-    let query = arguments.get("query")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
-
-    let count = arguments.get("count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5)
-        .min(10) as usize;
-
-    // Read API credentials from environment
-    let api_key = std::env::var("GOOGLE_API_KEY")
-        .map_err(|_| anyhow::anyhow!("GOOGLE_API_KEY not set"))?;
-    let cx = std::env::var("GOOGLE_SEARCH_CX")
-        .map_err(|_| anyhow::anyhow!("GOOGLE_SEARCH_CX not set"))?;
-
-    debug!("web_search: '{}' (count: {})", query, count);
-
-    // Build URL
-    let url = format!(
-        "{}?key={}&cx={}&q={}&num={}",
-        GOOGLE_CSE_ENDPOINT,
-        url_encode(&api_key),
-        url_encode(&cx),
-        url_encode(query),
-        count
-    );
-
-    // Fetch via curl (consistent with web_fetch, no extra deps)
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        tokio::process::Command::new("curl")
-            .args(["-sfL", "--max-time", "10", "-A", "heart-portal/0.1", &url])
-            .output()
-    ).await
-        .map_err(|_| anyhow::anyhow!("web_search timed out"))?
-        .map_err(|e| anyhow::anyhow!("Failed to search: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Search failed (exit {}): {}", output.status.code().unwrap_or(-1), stderr);
-    }
-
-    let body: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| anyhow::anyhow!("Failed to parse search response: {}", e))?;
-
-    // Extract results
-    let items = body.get("items").and_then(|v| v.as_array());
-    let results: Vec<Value> = match items {
-        Some(items) => items.iter().take(count).map(|item| {
-            serde_json::json!({
-                "title": item.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                "url": item.get("link").and_then(|v| v.as_str()).unwrap_or(""),
-                "snippet": item.get("snippet").and_then(|v| v.as_str()).unwrap_or(""),
-            })
-        }).collect(),
-        None => vec![],
-    };
-
-    let text = if results.is_empty() {
-        "No results found.".to_string()
-    } else {
-        results.iter().enumerate().map(|(i, r)| {
-            format!("{}. {}\n   {}\n   {}",
-                i + 1,
-                r["title"].as_str().unwrap_or(""),
-                r["url"].as_str().unwrap_or(""),
-                r["snippet"].as_str().unwrap_or(""),
-            )
-        }).collect::<Vec<_>>().join("\n\n")
-    };
-
-    Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": text }],
-        "results": results,
-        "total": results.len()
-    }))
+    Ok(out)
 }

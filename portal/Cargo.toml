@@ -1,7 +1,7 @@
 [package]
 name = "heart-portal"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
 description = "Portal — Being's gateway to the world. Lightweight MCP server with built-in tools."
 
 [[bin]]
@@ -9,6 +9,7 @@ name = "heart-portal"
 path = "src/main.rs"
 
 [dependencies]
+heart-mcp = { path = "../heart-mcp" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,4 +17,21 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
-reqwest = "0.11"
+axum = { version = "0.8", features = ["ws"] }
+axum-extra = { version = "0.10", features = ["multipart"] }
+tower-http = { version = "0.6", features = ["cors", "limit"] }
+tokio-tungstenite = "0.24"
+notify = "7"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+bytes = "1"
+regex = "1"
+scraper = "0.22"
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

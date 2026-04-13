@@ -1,0 +1,9 @@
+# Optional: register custom MCP servers (stdio) for this workspace.
+# Portal loads this file when custom tools are enabled.
+#
+# Example shape (uncomment and edit):
+#
+# [[servers]]
+# name = "example"
+# command = "node"
+# args = ["tools/examples/hello-tool.js"]
