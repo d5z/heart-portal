@@ -38,7 +38,7 @@ A built-in web UI for humans to browse and edit the being's workspace files in r
 - Markdown rendering, HTML preview, image/video/PDF viewing
 - WebSocket real-time file change notifications
 - Drag-and-drop upload
-- No chat — that's what [Loom](https://github.com/d5z/heart) is for
+- No chat — that's what Loom is for
 
 Access at `http://portal-host:cowork-port/`
 
@@ -125,7 +125,3 @@ hotel status             # See all rooms
 
 MIT — see [LICENSE](LICENSE).
 
-## Links
-
-- [Heart](https://github.com/d5z/heart) — Being's core (memory, identity, cognition)
-- [Human Covenant](https://beings.town) — One human, one being, equal relationship
