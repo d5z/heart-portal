@@ -10,6 +10,7 @@ mod process_manager;
 mod tools;
 mod protocol;
 mod cowork;
+mod relay_client;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -34,8 +35,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Load config: --config / -c / --config=, else first positional, else portal.toml
-    let config_path = config_path_from_args().context("Invalid command-line arguments")?;
+    // CLI: --connect <loom_url> for reverse relay; --config / -c / positional for portal.toml
+    let (connect_link, config_path) = parse_cli().context("Invalid command-line arguments")?;
     
     let mut config = if PathBuf::from(&config_path).exists() {
         PortalConfig::load(&config_path)?
@@ -54,7 +55,14 @@ async fn main() -> Result<()> {
         warn!("PORTAL_MCP_TOKEN is not set — MCP TCP connections are unauthenticated (set token for public deployments)");
     }
 
-    info!("Portal '{}' starting on {}:{}", config.name, config.bind_host, config.bind_port);
+    if connect_link.is_some() {
+        info!(
+            "Portal '{}' connect mode (Cowork HTTP on :{}) — MCP via Hearth relay :4000",
+            config.name, config.cowork.http_port
+        );
+    } else {
+        info!("Portal '{}' starting on {}:{}", config.name, config.bind_host, config.bind_port);
+    }
 
     // Initialize tool host (built-in + custom)
     let tool_host = ToolHost::new(&config);
@@ -126,6 +134,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    if let Some(ref loom) = connect_link {
+        let tool_shutdown = tool_host.clone();
+        tokio::select! {
+            _ = async {
+                let _ = tokio::signal::ctrl_c().await;
+            } => {
+                info!("Portal shutting down (Ctrl+C)");
+                tool_shutdown.kill_all_managed_processes().await;
+            }
+            _ = relay_client::connect_and_serve(loom, &tool_host, &config.name) => {}
+        }
+        return Ok(());
+    }
+
     // Track active connections
     let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -191,13 +213,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn config_path_from_args() -> Result<String> {
+fn parse_cli() -> Result<(Option<String>, String)> {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     let mut cfg: Option<String> = None;
+    let mut connect: Option<String> = None;
     while i < args.len() {
         let a = &args[i];
-        if a == "--config" || a == "-c" {
+        if a == "--connect" {
+            let url = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--connect requires a Loom URL"))?;
+            connect = Some(url.clone());
+            i += 2;
+        } else if let Some(url) = a.strip_prefix("--connect=") {
+            if url.is_empty() {
+                anyhow::bail!("--connect= requires a non-empty URL");
+            }
+            connect = Some(url.to_string());
+            i += 1;
+        } else if a == "--config" || a == "-c" {
             let path = args
                 .get(i + 1)
                 .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
@@ -218,7 +253,7 @@ fn config_path_from_args() -> Result<String> {
             anyhow::bail!("Unexpected positional argument: {}", a);
         }
     }
-    Ok(cfg.unwrap_or_else(|| "portal.toml".to_string()))
+    Ok((connect, cfg.unwrap_or_else(|| "portal.toml".to_string())))
 }
 
 #[cfg(unix)]
@@ -238,13 +273,16 @@ async fn wait_sigterm() {
 }
 
 /// Handle a single MCP client connection (JSON-RPC over newline-delimited TCP)
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
+pub(crate) async fn handle_connection<S>(
+    stream: S,
     tool_host: &ToolHost,
     portal_name: &str,
     expected_token: Option<&str>,
-) -> Result<()> {
-    let (read_half, write_half) = stream.into_split();
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(write_half);
     let mut line = String::new();
@@ -537,8 +575,8 @@ async fn run_health_server(portal_name: &str, port: u16) -> Result<()> {
 }
 
 /// Send a JSON-RPC response (newline-delimited)
-async fn send_response(
-    writer: &mut BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut BufWriter<W>,
     response: &JsonRpcResponse,
 ) -> Result<()> {
     let json = serde_json::to_string(response)?;
