@@ -488,6 +488,19 @@ a:hover { color: var(--accent-bright); }
 <input type="file" id="file-upload-input" multiple style="display:none" onchange="handleUpload(this.files)">
 
 <script>
+// ─── Token passthrough for Caddy auth ───
+const _urlToken = new URLSearchParams(location.search).get('token');
+if (_urlToken) {
+  const _origFetch = window.fetch;
+  window.fetch = (url, opts) => {
+    if (typeof url === 'string' && url.startsWith('/api/')) {
+      const sep = url.includes('?') ? '&' : '?';
+      url = url + sep + 'token=' + _urlToken;
+    }
+    return _origFetch(url, opts);
+  };
+}
+
 // ─── State ───
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
