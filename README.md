@@ -126,21 +126,41 @@ You already have this — it's what you use to chat with your being.
 
 ### Step 4: Run
 
+**Important**: Run the command from inside the workspace folder — Portal uses the current directory as the workspace root.
+
 ```bash
 # macOS / Linux
 chmod +x heart-portal-macos-arm64
-./heart-portal-macos-arm64 --relay <YOUR_LOOM_LINK> --workspace ~/being-workspace
+cd ~/being-workspace
+./heart-portal-macos-arm64 --connect <YOUR_LOOM_LINK>
 
 # Windows (PowerShell)
-.\heart-portal-windows-x86_64.exe --relay <YOUR_LOOM_LINK> --workspace C:\Users\you\being-workspace
+cd C:\Users\you\being-workspace
+.\heart-portal-windows-x86_64.exe --connect <YOUR_LOOM_LINK>
 ```
 
 That's it. Your being now has hands on your computer.
+
+### Tool Namespacing
+
+When Home Portal connects, Heart registers its tools with a `home_` prefix to avoid collision with Hotel Portal:
+
+| Hotel Portal (always-on server) | Home Portal (your computer) |
+|----|-----|
+| `portal_exec` | `home_portal_exec` |
+| `portal_file_read` | `home_portal_file_read` |
+| `portal_file_write` | `home_portal_file_write` |
+| `portal_file_list` | `home_portal_file_list` |
+| `portal_search` | `home_portal_search` |
+| `portal_web_fetch` | `home_portal_web_fetch` |
+
+Your being can use both simultaneously — Hotel for its always-on workspace, Home Portal for your local files.
 
 ### Troubleshooting
 
 - **macOS "unverified developer"**: System Settings → Privacy & Security → click "Open Anyway"
 - **Connection fails**: Check that the Loom link is complete (includes `?token=...`)
+- **"Path outside workspace"**: You're trying to access a file outside the current directory. Re-run from the correct project folder.
 - **Want a Cowork Space locally**: Add `--cowork-bind 127.0.0.1:3311`, then open `http://localhost:3311`
 - **Disconnects when laptop sleeps**: Normal — Heart falls back to Hotel Portal. Reconnects automatically when you wake up.
 
@@ -155,7 +175,7 @@ Your computer                     Origin Hearth
 └───────────────┘                └──────────────┘
 ```
 
-Portal connects **outbound** to Heart via WebSocket relay — no port forwarding or static IP needed. Your being uses the same 9 tools whether connected to Hotel or Home Portal.
+Portal connects **outbound** to Heart via WebSocket relay — no port forwarding or static IP needed. Both Hotel and Home Portal can be connected at the same time — Heart namespaces the tools automatically.
 
 ## Security
 
