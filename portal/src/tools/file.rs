@@ -6,6 +6,20 @@ use serde_json::Value;
 use std::path::PathBuf;
 use tracing::debug;
 
+/// Strip Windows `\\?\` prefix if present, for consistent path comparison.
+#[cfg(windows)]
+fn strip_unc_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_unc_prefix(p: PathBuf) -> PathBuf { p }
+
 /// Resolve a path relative to workspace root. Prevent logical `..` traversal only.
 pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let root = &config.security.workspace_root;
@@ -49,7 +63,7 @@ pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Res
 /// Existing path: follow symlinks and ensure the real path stays under workspace.
 fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let logical = resolve_path_logical(config, path_str)?;
-    let root_canon = config.security.workspace_root.canonicalize().map_err(|e| {
+    let root_canon = config.security.workspace_root.canonicalize().map(strip_unc_prefix).map_err(|e| {
         anyhow::anyhow!(
             "workspace root cannot be canonicalized ({}): {}",
             config.security.workspace_root.display(),
@@ -59,7 +73,7 @@ fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBu
     if !logical.exists() {
         anyhow::bail!("Path does not exist: {}", path_str);
     }
-    let c = logical.canonicalize().map_err(|e| {
+    let c = logical.canonicalize().map(strip_unc_prefix).map_err(|e| {
         anyhow::anyhow!("path cannot be canonicalized ({}): {}", logical.display(), e)
     })?;
     if !c.starts_with(&root_canon) {
@@ -77,7 +91,7 @@ fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBu
 fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let logical = resolve_path_logical(config, path_str)?;
     let root = &config.security.workspace_root;
-    let root_canon = root.canonicalize().map_err(|e| {
+    let root_canon = root.canonicalize().map(strip_unc_prefix).map_err(|e| {
         anyhow::anyhow!("workspace root cannot be canonicalized ({}): {}", root.display(), e)
     })?;
     let rel = logical.strip_prefix(root).map_err(|_| {
@@ -87,7 +101,7 @@ fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> 
     for comp in rel.components() {
         cur.push(comp);
         if cur.exists() {
-            let c = cur.canonicalize().map_err(|e| {
+            let c = cur.canonicalize().map(strip_unc_prefix).map_err(|e| {
                 anyhow::anyhow!("path cannot be canonicalized ({}): {}", cur.display(), e)
             })?;
             if !c.starts_with(&root_canon) {
