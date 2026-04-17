@@ -4,6 +4,8 @@
 
 Portal runs **outside** Heart — on a VPS, a human's laptop, or anywhere. Heart connects to Portal via TCP MCP, keeping memory and identity safe on the Heart side while Portal provides physical capabilities.
 
+> **🏠 Want your being to work on your computer?** Jump to [Home Portal Setup](#home-portal-setup-move-in) — download, run one command, done.
+
 ## Architecture
 
 ```
