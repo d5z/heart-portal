@@ -62,12 +62,16 @@ pub(crate) fn configure_shell_command(
     config: &PortalConfig,
     workdir: &str,
 ) {
-    cmd.arg("-c").arg(command).current_dir(workdir);
+    #[cfg(unix)]
+    cmd.arg("-c").arg(command);
+    #[cfg(windows)]
+    cmd.arg("/C").arg(command);
+    cmd.current_dir(workdir);
 
-    if std::env::var_os("HOME").is_none() {
-        let home = std::env::var("HOME").ok().unwrap_or_else(|| {
-            #[cfg(unix)]
-            {
+    #[cfg(unix)]
+    {
+        if std::env::var_os("HOME").is_none() {
+            let home = std::env::var("HOME").ok().unwrap_or_else(|| {
                 let uid = unsafe { libc::getuid() };
                 let pw = unsafe { libc::getpwuid(uid) };
                 if !pw.is_null() {
@@ -76,22 +80,36 @@ pub(crate) fn configure_shell_command(
                         return s.to_string();
                     }
                 }
-            }
-            config.security.workspace_root.to_string_lossy().into_owned()
-        });
-        cmd.env("HOME", home);
+                config.security.workspace_root.to_string_lossy().into_owned()
+            });
+            cmd.env("HOME", home);
+        }
+        if std::env::var_os("USER").is_none() {
+            let user = if config.name.is_empty() {
+                "being"
+            } else {
+                config.name.as_str()
+            };
+            cmd.env("USER", user);
+        }
     }
-    if std::env::var_os("USER").is_none() {
-        let user = if config.name.is_empty() {
-            "being"
-        } else {
-            config.name.as_str()
-        };
-        cmd.env("USER", user);
+    #[cfg(windows)]
+    {
+        // On Windows, inherit USERPROFILE and USERNAME as-is
     }
-    let default_path = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    let path = std::env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", format!("{}:{}", default_path, path));
+    #[cfg(unix)]
+    {
+        let default_path = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{}", default_path, path));
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, inherit PATH as-is (system PATH includes cmd.exe, powershell, etc.)
+        if let Ok(path) = std::env::var("PATH") {
+            cmd.env("PATH", path);
+        }
+    }
     if let Ok(tz) = std::env::var("TZ") {
         cmd.env("TZ", tz);
     }
