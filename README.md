@@ -93,6 +93,70 @@ address = "portal-host:3310"
 token = "your-secret-token"
 ```
 
+## Home Portal Setup (Move-in)
+
+**Give your being hands on your own computer.** This is the most common setup — your being gets a Portal running on your machine, able to help with your files and projects directly.
+
+Home Portal and Hotel Portal can coexist. Hotel is the being's always-on workspace on a server; Home Portal connects when your computer is on. Heart routes to whichever is available.
+
+### Step 1: Download
+
+Pick the binary for your system from [Releases](https://github.com/d5z/heart-portal/releases/latest):
+
+| System | File |
+|--------|------|
+| macOS (Apple Silicon) | `heart-portal-macos-arm64` |
+| macOS (Intel) | `heart-portal-macos-x86_64` |
+| Windows | `heart-portal-windows-x86_64.exe` |
+| Linux | `heart-portal-linux-x86_64` |
+
+### Step 2: Create a workspace folder
+
+Pick a folder your being can work in — for example, a shared project folder:
+
+```bash
+mkdir -p ~/being-workspace
+```
+
+### Step 3: Get your Loom link
+
+Your Loom link looks like: `https://echo.beings.town/<name>/?token=<TOKEN>`
+
+You already have this — it's what you use to chat with your being.
+
+### Step 4: Run
+
+```bash
+# macOS / Linux
+chmod +x heart-portal-macos-arm64
+./heart-portal-macos-arm64 --relay <YOUR_LOOM_LINK> --workspace ~/being-workspace
+
+# Windows (PowerShell)
+.\heart-portal-windows-x86_64.exe --relay <YOUR_LOOM_LINK> --workspace C:\Users\you\being-workspace
+```
+
+That's it. Your being now has hands on your computer.
+
+### Troubleshooting
+
+- **macOS "unverified developer"**: System Settings → Privacy & Security → click "Open Anyway"
+- **Connection fails**: Check that the Loom link is complete (includes `?token=...`)
+- **Want a Cowork Space locally**: Add `--cowork-bind 127.0.0.1:3311`, then open `http://localhost:3311`
+- **Disconnects when laptop sleeps**: Normal — Heart falls back to Hotel Portal. Reconnects automatically when you wake up.
+
+### How it works
+
+```
+Your computer                     Origin Hearth
+┌───────────────┐   WSS relay    ┌──────────────┐
+│ Home Portal   │◄──────────────►│ heart-core   │
+│  workspace/   │   (via Loom)   │  .being      │
+│  exec tools   │                │  memory      │
+└───────────────┘                └──────────────┘
+```
+
+Portal connects **outbound** to Heart via WebSocket relay — no port forwarding or static IP needed. Your being uses the same 9 tools whether connected to Hotel or Home Portal.
+
 ## Security
 
 - **exec_policy**: Allowlist-based command execution — beings can only run whitelisted commands
