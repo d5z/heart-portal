@@ -28,7 +28,13 @@ pub(crate) fn validate_exec_allowlist(command: &str, allowlist: &[String]) -> Re
     }
 
     let cmd_first = command.split_whitespace().next().unwrap_or("");
-    if !allowlist.iter().any(|a| a == cmd_first) {
+    // On Windows, strip .exe/.cmd/.bat suffix for allowlist matching
+    // so allowlist ["python"] matches "python.exe"
+    let cmd_base = cmd_first.strip_suffix(".exe")
+        .or_else(|| cmd_first.strip_suffix(".cmd"))
+        .or_else(|| cmd_first.strip_suffix(".bat"))
+        .unwrap_or(cmd_first);
+    if !allowlist.iter().any(|a| a == cmd_first || a == cmd_base) {
         anyhow::bail!("Command '{}' not in exec allowlist", cmd_first);
     }
 
@@ -46,7 +52,11 @@ pub(crate) fn validate_exec_allowlist(command: &str, allowlist: &[String]) -> Re
             if word.is_empty() {
                 continue;
             }
-            if !allowlist.iter().any(|a| a == word) {
+            let word_base = word.strip_suffix(".exe")
+                .or_else(|| word.strip_suffix(".cmd"))
+                .or_else(|| word.strip_suffix(".bat"))
+                .unwrap_or(word);
+            if !allowlist.iter().any(|a| a == word || a == word_base) {
                 anyhow::bail!("Command contains shell metacharacters with non-allowlisted commands");
             }
         }

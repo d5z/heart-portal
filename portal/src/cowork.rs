@@ -87,6 +87,19 @@ fn check_auth(headers: &HeaderMap) -> Result<(), StatusCode> {
 
 // --- Path safety ---
 
+/// Strip Windows `\\?\` UNC prefix for consistent path comparison.
+#[cfg(windows)]
+fn strip_unc_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(stripped)
+    } else {
+        p
+    }
+}
+#[cfg(not(windows))]
+fn strip_unc_prefix(p: std::path::PathBuf) -> std::path::PathBuf { p }
+
 fn safe_path(workspace: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     if rel.is_empty() || rel == "." {
         return Ok(workspace.to_path_buf());
@@ -94,16 +107,16 @@ fn safe_path(workspace: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     let joined = workspace.join(rel);
     // For non-existent paths, check parent
     let check = if joined.exists() {
-        joined.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?
+        strip_unc_prefix(joined.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?)
     } else {
         let parent = joined.parent().ok_or(StatusCode::BAD_REQUEST)?;
         if !parent.exists() {
             return Err(StatusCode::NOT_FOUND);
         }
-        let canon_parent = parent.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let canon_parent = strip_unc_prefix(parent.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?);
         canon_parent.join(joined.file_name().ok_or(StatusCode::BAD_REQUEST)?)
     };
-    let ws_canon = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let ws_canon = strip_unc_prefix(workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf()));
     if check.starts_with(&ws_canon) {
         Ok(check)
     } else {
