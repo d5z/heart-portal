@@ -8,6 +8,7 @@ mod config;
 mod exec_policy;
 mod process_manager;
 mod tools;
+mod mcp;
 mod protocol;
 mod cowork;
 mod relay_client;
@@ -36,7 +37,8 @@ async fn main() -> Result<()> {
         .init();
 
     // CLI: --connect <loom_url> for reverse relay; --config / -c / positional for portal.toml
-    let (connect_link, config_path) = parse_cli().context("Invalid command-line arguments")?;
+    let (connect_link, config_path, cli_portal_name) =
+        parse_cli().context("Invalid command-line arguments")?;
     
     let mut config = if PathBuf::from(&config_path).exists() {
         PortalConfig::load(&config_path)?
@@ -135,6 +137,9 @@ async fn main() -> Result<()> {
     }
 
     if let Some(ref loom) = connect_link {
+        // Relay handshake identity: --name, non-generic config name, then host name.
+        let relay_portal_name =
+            relay_portal_name(cli_portal_name, &config.name, default_relay_portal_name);
         let tool_shutdown = tool_host.clone();
         tokio::select! {
             _ = async {
@@ -143,7 +148,7 @@ async fn main() -> Result<()> {
                 info!("Portal shutting down (Ctrl+C)");
                 tool_shutdown.kill_all_managed_processes().await;
             }
-            _ = relay_client::connect_and_serve(loom, &tool_host, &config.name) => {}
+            _ = relay_client::connect_and_serve(loom, &tool_host, &relay_portal_name) => {}
         }
         return Ok(());
     }
@@ -213,11 +218,35 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_cli() -> Result<(Option<String>, String)> {
+fn default_relay_portal_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "portal".to_string())
+}
+
+fn relay_portal_name(
+    cli_portal_name: Option<String>,
+    config_name: &str,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    cli_portal_name
+        .or_else(|| {
+            if !config_name.is_empty() && config_name != "portal" {
+                Some(config_name.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(fallback)
+}
+
+fn parse_cli() -> Result<(Option<String>, String, Option<String>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     let mut cfg: Option<String> = None;
     let mut connect: Option<String> = None;
+    let mut portal_name: Option<String> = None;
     while i < args.len() {
         let a = &args[i];
         if a == "--connect" {
@@ -231,6 +260,21 @@ fn parse_cli() -> Result<(Option<String>, String)> {
                 anyhow::bail!("--connect= requires a non-empty URL");
             }
             connect = Some(url.to_string());
+            i += 1;
+        } else if a == "--name" {
+            let n = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--name requires a value"))?;
+            if n.is_empty() {
+                anyhow::bail!("--name must be non-empty");
+            }
+            portal_name = Some(n.clone());
+            i += 2;
+        } else if let Some(n) = a.strip_prefix("--name=") {
+            if n.is_empty() {
+                anyhow::bail!("--name= requires a non-empty name");
+            }
+            portal_name = Some(n.to_string());
             i += 1;
         } else if a == "--config" || a == "-c" {
             let path = args
@@ -253,7 +297,11 @@ fn parse_cli() -> Result<(Option<String>, String)> {
             anyhow::bail!("Unexpected positional argument: {}", a);
         }
     }
-    Ok((connect, cfg.unwrap_or_else(|| "portal.toml".to_string())))
+    Ok((
+        connect,
+        cfg.unwrap_or_else(|| "portal.toml".to_string()),
+        portal_name,
+    ))
 }
 
 #[cfg(unix)]
@@ -417,13 +465,19 @@ where
         let response = handle_request(&request, tool_host, portal_name).await;
         send_response(&mut writer, &response).await?;
 
-        // After tool reload, close connection to trigger Hearth reconnect → re-discover tools
+        // After tool reload, send MCP notification instead of closing connection
         if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {
             tool_host.needs_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
-            info!("🔄 Closing connection after tools reload — Hearth will auto-reconnect");
-            // Small delay to ensure result is flushed
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            return Ok(());
+            info!("🔄 Sending notifications/tools/list_changed after tools reload");
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {}
+            });
+            if let Err(e) = send_notification(&mut writer, &notification).await {
+                warn!("Failed to send tools/list_changed notification: {e}, closing connection");
+                return Ok(());
+            }
         }
     }
 }
@@ -585,4 +639,46 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Send a JSON-RPC notification (no id, no response expected).
+async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut BufWriter<W>,
+    notification: &serde_json::Value,
+) -> Result<()> {
+    let json = serde_json::to_string(notification)?;
+    debug!("→ (notification) {}", json);
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_portal_name_prefers_cli_name() {
+        let name = relay_portal_name(Some("foo".to_string()), "cotton", || "host".to_string());
+        assert_eq!(name, "foo");
+    }
+
+    #[test]
+    fn relay_portal_name_uses_non_generic_config_name() {
+        let name = relay_portal_name(None, "cotton", || "host".to_string());
+        assert_eq!(name, "cotton");
+    }
+
+    #[test]
+    fn relay_portal_name_skips_generic_config_name() {
+        let name = relay_portal_name(None, "portal", || "host".to_string());
+        assert_eq!(name, "host");
+    }
+
+    #[test]
+    fn relay_portal_name_skips_empty_config_name() {
+        let name = relay_portal_name(None, "", || "host".to_string());
+        assert_eq!(name, "host");
+    }
 }

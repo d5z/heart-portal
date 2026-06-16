@@ -1,14 +1,35 @@
 //! Connect mode — Portal dials Hearth relay via WebSocket (reverse path for NAT traversal).
 //! The relay endpoint is at `wss://host/_relay`, derived from the Loom URL.
+//!
+//! D-077 (Portal Relay 独立化): duplex relay with explicit heartbeat.
+//! D-078 (断连不立即注销工具): client treats heartbeat loss as disconnect and reconnects;
+//! server-side grace lives in `hearth::portal_relay`.
 
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{info, warn};
+use tokio::time::MissedTickBehavior;
 
 use crate::tools::ToolHost;
+
+/// Portal → relay JSON handshake ping interval (D-077).
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+/// If no Pong is received within this window, reconnect (D-077).
+const HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+
+/// Build relay handshake JSON (`portal_name` identifies this Portal instance; D-077).
+pub(crate) fn relay_handshake_json(being_id: &str, loom_token: &str, portal_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "being_id": being_id,
+        "loom_token": loom_token,
+        "portal_name": portal_name,
+    })
+}
 
 /// Parse a Loom link: `https://host[:port]/being/?token=...` → (host_with_port, being_id, token).
 pub fn parse_loom_link(s: &str) -> Result<(String, String, String)> {
@@ -70,8 +91,8 @@ pub async fn connect_and_serve(
     };
     let relay_url = derive_relay_url(loom_link, &host);
     info!(
-        "Portal connect mode: relay {} (being_id={}, host={})",
-        relay_url, being_id, host
+        "Portal connect mode: relay {} (being_id={}, portal_name={}, host={})",
+        relay_url, being_id, portal_name, host
     );
 
     let mut backoff = Duration::from_secs(5);
@@ -102,12 +123,8 @@ async fn run_one_session(
         .await
         .with_context(|| format!("WebSocket connect to relay {relay_url}"))?;
 
-    // Send handshake
-    let handshake = serde_json::json!({
-        "being_id": being_id,
-        "loom_token": token,
-    });
-    ws.send(Message::Text(handshake.to_string().into())).await?;
+    let handshake = relay_handshake_json(being_id, token, portal_name);
+    ws.send(Message::Text(handshake.to_string())).await?;
 
     // Read handshake response
     let resp = match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
@@ -125,25 +142,37 @@ async fn run_one_session(
 
     info!("Portal relay handshake OK — starting MCP server on WebSocket bridge");
 
-    // Bridge WebSocket ↔ MCP TCP connection.
-    // Portal's handle_connection expects a TcpStream-like AsyncRead+AsyncWrite.
-    // We create a duplex pipe: one end for the portal MCP handler, other end bridged to WebSocket.
     let (portal_stream, bridge_stream) = tokio::io::duplex(65536);
 
     let (mut ws_write, mut ws_read) = ws.split();
+    let ws_write = std::sync::Arc::new(Mutex::new(ws_write));
+    let last_pong = std::sync::Arc::new(Mutex::new(Instant::now()));
+
     let (bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
     let mut bridge_reader = tokio::io::BufReader::new(bridge_read);
 
-    // Task 1: WS → bridge (relay sends MCP requests via WS, portal reads from bridge)
+    let ws_write_ping = std::sync::Arc::clone(&ws_write);
+    let last_pong_ping = std::sync::Arc::clone(&last_pong);
     let ws_to_bridge = tokio::spawn(async move {
         while let Some(msg) = ws_read.next().await {
             match msg {
                 Ok(Message::Text(t)) => {
-                    let mut data = t.as_str().as_bytes().to_vec();
+                    let mut data = t.as_bytes().to_vec();
                     data.push(b'\n');
                     if tokio::io::AsyncWriteExt::write_all(&mut bridge_write, &data).await.is_err() {
                         break;
                     }
+                }
+                Ok(Message::Ping(_)) => {
+                    // tokio-tungstenite may auto-reply when using unsplit stream; we split,
+                    // so reply explicitly (D-077).
+                    let mut w = ws_write_ping.lock().await;
+                    if w.send(Message::Pong(vec![])).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Pong(_)) => {
+                    *last_pong_ping.lock().await = Instant::now();
                 }
                 Ok(Message::Close(_)) => break,
                 Ok(_) => {}
@@ -152,7 +181,7 @@ async fn run_one_session(
         }
     });
 
-    // Task 2: bridge → WS (portal writes MCP responses to bridge, we send via WS)
+    let ws_write_out = std::sync::Arc::clone(&ws_write);
     let bridge_to_ws = tokio::spawn(async move {
         let mut line = String::new();
         loop {
@@ -161,25 +190,67 @@ async fn run_one_session(
                 Ok(0) => break,
                 Ok(_) => {
                     let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        if ws_write.send(Message::Text(trimmed.to_string().into())).await.is_err() {
+                    if !trimmed.is_empty()
+                        && ws_write_out.lock().await.send(Message::Text(trimmed.to_string())).await.is_err() {
                             break;
                         }
-                    }
                 }
                 Err(_) => break,
             }
         }
     });
 
-    // Task 3: Portal MCP handler on the duplex stream
-    crate::handle_connection(portal_stream, tool_host, portal_name, None).await?;
+    let ws_write_hb = std::sync::Arc::clone(&ws_write);
+    let last_pong_hb = std::sync::Arc::clone(&last_pong);
+    let mut heartbeat = tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            {
+                let lp = *last_pong_hb.lock().await;
+                if Instant::now().saturating_duration_since(lp)
+                    > Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)
+                {
+                    let _ = ws_write_hb.lock().await.close().await;
+                    anyhow::bail!(
+                        "no WebSocket Pong within {}s (D-077)",
+                        HEARTBEAT_TIMEOUT_SECS
+                    );
+                }
+            }
+            let mut w = ws_write_hb.lock().await;
+            if w.send(Message::Ping(vec![])).await.is_err() {
+                anyhow::bail!("failed to send WebSocket Ping (D-077)");
+            }
+        }
+    });
 
-    // When handle_connection ends, abort bridges
-    ws_to_bridge.abort();
-    bridge_to_ws.abort();
+    let th = tool_host.clone();
+    let pn = portal_name.to_string();
+    let mut hc_task = tokio::spawn(async move {
+        crate::handle_connection(portal_stream, &th, &pn, None).await
+    });
 
-    Ok(())
+    tokio::select! {
+        r = &mut hc_task => {
+            heartbeat.abort();
+            ws_to_bridge.abort();
+            bridge_to_ws.abort();
+            r?
+        }
+        hb = &mut heartbeat => {
+            hc_task.abort();
+            ws_to_bridge.abort();
+            bridge_to_ws.abort();
+            match hb {
+                Ok(Ok(())) => Err(anyhow::anyhow!("heartbeat task exited unexpectedly")),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("heartbeat join error: {e}")),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,5 +317,13 @@ mod tests {
     fn derive_relay_url_localhost() {
         let url = derive_relay_url("http://localhost:3100/alice/?token=t", "localhost:3100");
         assert_eq!(url, "ws://localhost:3100/_relay");
+    }
+
+    #[test]
+    fn relay_handshake_json_shape() {
+        let v = relay_handshake_json("being1", "tok", "my-laptop");
+        assert_eq!(v["being_id"], "being1");
+        assert_eq!(v["loom_token"], "tok");
+        assert_eq!(v["portal_name"], "my-laptop");
     }
 }

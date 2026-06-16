@@ -28,13 +28,7 @@ pub(crate) fn validate_exec_allowlist(command: &str, allowlist: &[String]) -> Re
     }
 
     let cmd_first = command.split_whitespace().next().unwrap_or("");
-    // On Windows, strip .exe/.cmd/.bat suffix for allowlist matching
-    // so allowlist ["python"] matches "python.exe"
-    let cmd_base = cmd_first.strip_suffix(".exe")
-        .or_else(|| cmd_first.strip_suffix(".cmd"))
-        .or_else(|| cmd_first.strip_suffix(".bat"))
-        .unwrap_or(cmd_first);
-    if !allowlist.iter().any(|a| a == cmd_first || a == cmd_base) {
+    if !allowlist.iter().any(|a| a == cmd_first) {
         anyhow::bail!("Command '{}' not in exec allowlist", cmd_first);
     }
 
@@ -52,11 +46,7 @@ pub(crate) fn validate_exec_allowlist(command: &str, allowlist: &[String]) -> Re
             if word.is_empty() {
                 continue;
             }
-            let word_base = word.strip_suffix(".exe")
-                .or_else(|| word.strip_suffix(".cmd"))
-                .or_else(|| word.strip_suffix(".bat"))
-                .unwrap_or(word);
-            if !allowlist.iter().any(|a| a == word || a == word_base) {
+            if !allowlist.iter().any(|a| a == word) {
                 anyhow::bail!("Command contains shell metacharacters with non-allowlisted commands");
             }
         }
@@ -72,16 +62,12 @@ pub(crate) fn configure_shell_command(
     config: &PortalConfig,
     workdir: &str,
 ) {
-    #[cfg(unix)]
-    cmd.arg("-c").arg(command);
-    #[cfg(windows)]
-    cmd.arg("/C").arg(command);
-    cmd.current_dir(workdir);
+    cmd.arg("-c").arg(command).current_dir(workdir);
 
-    #[cfg(unix)]
-    {
-        if std::env::var_os("HOME").is_none() {
-            let home = std::env::var("HOME").ok().unwrap_or_else(|| {
+    if std::env::var_os("HOME").is_none() {
+        let home = std::env::var("HOME").ok().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
                 let uid = unsafe { libc::getuid() };
                 let pw = unsafe { libc::getpwuid(uid) };
                 if !pw.is_null() {
@@ -90,36 +76,22 @@ pub(crate) fn configure_shell_command(
                         return s.to_string();
                     }
                 }
-                config.security.workspace_root.to_string_lossy().into_owned()
-            });
-            cmd.env("HOME", home);
-        }
-        if std::env::var_os("USER").is_none() {
-            let user = if config.name.is_empty() {
-                "being"
-            } else {
-                config.name.as_str()
-            };
-            cmd.env("USER", user);
-        }
+            }
+            config.security.workspace_root.to_string_lossy().into_owned()
+        });
+        cmd.env("HOME", home);
     }
-    #[cfg(windows)]
-    {
-        // On Windows, inherit USERPROFILE and USERNAME as-is
+    if std::env::var_os("USER").is_none() {
+        let user = if config.name.is_empty() {
+            "being"
+        } else {
+            config.name.as_str()
+        };
+        cmd.env("USER", user);
     }
-    #[cfg(unix)]
-    {
-        let default_path = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{}", default_path, path));
-    }
-    #[cfg(windows)]
-    {
-        // On Windows, inherit PATH as-is (system PATH includes cmd.exe, powershell, etc.)
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
-        }
-    }
+    let default_path = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    let path = std::env::var("PATH").unwrap_or_default();
+    cmd.env("PATH", format!("{}:{}", default_path, path));
     if let Ok(tz) = std::env::var("TZ") {
         cmd.env("TZ", tz);
     }
