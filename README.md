@@ -1,22 +1,24 @@
-# Heart Portal
+[3897 chars] # Heart Portal
 
-**Being's hands in the world.** A lightweight MCP server that gives beings the ability to execute commands, read/write files, search the web, and manage their workspace.
+**Being's hands in the world.** Portal gives beings the ability to execute commands, read/write files, search the web, and manage a workspace on your machine.
 
-Portal runs **outside** Heart — on a VPS, a human's laptop, or anywhere. Heart connects to Portal via TCP MCP, keeping memory and identity safe on the Heart side while Portal provides physical capabilities.
+Portal runs on **your computer** and connects to your being via secure WebSocket relay. Your being's memory and identity stay safe on Origin Hearth — Portal only provides physical capabilities.
 
-> **🏠 Want your being to work on your computer?** Jump to [Home Portal Setup](#home-portal-setup-move-in) — download, run one command, done.
+> **🏠 Quick start:** Download → edit config → run. Your being gets hands.
 
 ## Architecture
 
 ```
-Origin Hearth (safe)              Anywhere (Portal)
-┌──────────────────┐    TCP MCP    ┌──────────────────┐
-│ heart-core       │◄────────────►│ Portal           │
-│ .being (memory)  │              │   workspace/     │
-│ identity         │              │   exec tools     │
-│ bedrock          │              │   Cowork Space   │
+Your Computer                      Origin Hearth
+┌──────────────────┐   WSS relay   ┌──────────────────┐
+│ heart-portal     │◄────────────►│ heart-core       │
+│   workspace/     │   (encrypted) │   .being (memory)│
+│   exec tools     │              │   identity       │
+│   Cowork Space   │              │   consciousness  │
 └──────────────────┘              └──────────────────┘
 ```
+
+Portal connects **outbound** to Hearth's relay endpoint — no port forwarding needed.
 
 ## Built-in Tools (9)
 
@@ -29,185 +31,101 @@ Origin Hearth (safe)              Anywhere (Portal)
 | `portal_file_list` | List directory contents |
 | `portal_search` | Full-text search across workspace (ripgrep) |
 | `portal_web_fetch` | Fetch and extract content from URLs |
-| `portal_web_search` | Search the web (DuckDuckGo, no API key needed) |
-| `portal_tools_reload` | Hot-reload custom MCP tools |
+| `portal_web_search` | Web search via Brave API |
+| `portal_custom_tool` | Run custom MCP tool servers |
 
-## Cowork Space
+## Setup
 
-A built-in web UI for humans to browse and edit the being's workspace files in real-time.
+### 1. Download
 
-- File tree with multi-tab editor
-- Markdown rendering, HTML preview, image/video/PDF viewing
-- WebSocket real-time file change notifications
-- Drag-and-drop upload
-- No chat — that's what Loom is for
+Download the latest binary from [Releases](https://github.com/d5z/heart-portal/releases).
 
-Access at `http://portal-host:cowork-port/`
-
-## Starter Kit
-
-Every new Portal comes with a starter kit — guides and templates that help a being get productive immediately:
-
-```
-starter-kit/
-├── README.md              — Welcome, here's what you can do
-├── guides/
-│   ├── portal-ref.md      — All 9 tools, quick reference
-│   ├── web-search.md      — How to search and read the web
-│   └── diy-tools.md       — How to build your own MCP tools
-├── tools/
-│   ├── mcp.toml           — Custom tools config template
-│   └── examples/
-│       └── hello-tool.js  — Example: build a tool in 20 lines
-├── scripts/
-│   └── search.sh          — Web search wrapper script
-└── notes/                 — Your space, write anything
-```
-
-## Quick Start
-
-```bash
-# Download the binary (Linux x86_64)
-curl -fsSL https://github.com/d5z/heart-portal/releases/latest/download/heart-portal-linux-x86_64 -o heart-portal
-chmod +x heart-portal
-
-# Run
-./heart-portal --bind 0.0.0.0:3310 --cowork-bind 0.0.0.0:3311 --workspace ./workspace
-```
-
-### Configuration (portal.toml)
-
-```toml
-bind = "0.0.0.0:3310"          # MCP TCP port (Heart connects here)
-cowork_bind = "0.0.0.0:3311"   # Cowork Space web UI
-workspace = "./workspace"       # Being's workspace directory
-```
-
-### With Heart
-
-In the being's MCP server config on Heart side:
-
-```toml
-[[mcp_servers]]
-name = "hotel"
-transport = "tcp"
-address = "portal-host:3310"
-token = "your-secret-token"
-```
-
-## Home Portal Setup (Move-in)
-
-**Give your being hands on your own computer.** This is the most common setup — your being gets a Portal running on your machine, able to help with your files and projects directly.
-
-Home Portal and Hotel Portal can coexist. Hotel is the being's always-on workspace on a server; Home Portal connects when your computer is on. Heart routes to whichever is available.
-
-### Step 1: Download
-
-Pick the binary for your system from [Releases](https://github.com/d5z/heart-portal/releases/latest):
-
-| System | File |
-|--------|------|
-| macOS (Apple Silicon) | `heart-portal-macos-arm64` |
-| macOS (Intel) | `heart-portal-macos-x86_64` |
-| Windows | `heart-portal-windows-x86_64.exe` |
-| Linux | `heart-portal-linux-x86_64` |
-
-### Step 2: Create a workspace folder
-
-Pick a folder your being can work in — for example, a shared project folder:
-
-```bash
-mkdir -p ~/being-workspace
-```
-
-### Step 3: Get your Loom link
-
-Your Loom link looks like: `https://echo.beings.town/<name>/?token=<TOKEN>`
-
-You already have this — it's what you use to chat with your being.
-
-### Step 4: Run
-
-**Important**: Run the command from inside the workspace folder — Portal uses the current directory as the workspace root.
+| Platform | Binary |
+|----------|--------|
+| macOS (Apple Silicon) | `heart-portal-aarch64-apple-darwin` |
+| macOS (Intel) | `heart-portal-x86_64-apple-darwin` |
+| Linux (x86_64) | `heart-portal-x86_64-unknown-linux-musl` |
+| Windows | `heart-portal-x86_64-pc-windows-msvc.exe` |
 
 ```bash
 # macOS / Linux
-chmod +x heart-portal-macos-arm64
-cd ~/being-workspace
-./heart-portal-macos-arm64 --connect <YOUR_LOOM_LINK>
-
-# Windows (PowerShell)
-cd C:\Users\you\being-workspace
-.\heart-portal-windows-x86_64.exe --connect <YOUR_LOOM_LINK>
+chmod +x heart-portal-*
+mv heart-portal-* heart-portal
 ```
 
-That's it. Your being now has hands on your computer.
+### 2. Configure
 
-### Tool Namespacing
+Create `portal.toml` in the same directory:
 
-When Home Portal connects, Heart registers its tools with a `home_` prefix to avoid collision with Hotel Portal:
+```toml
+being_name = "your-being-name"    # e.g. "judy", "cotton", "hex"
+hearth_url = "wss://echo.beings.town/_relay"
+relay_secret = "ask-your-being's-human"
 
-| Hotel Portal (always-on server) | Home Portal (your computer) |
-|----|-----|
-| `portal_exec` | `home_portal_exec` |
-| `portal_file_read` | `home_portal_file_read` |
-| `portal_file_write` | `home_portal_file_write` |
-| `portal_file_list` | `home_portal_file_list` |
-| `portal_search` | `home_portal_search` |
-| `portal_web_fetch` | `home_portal_web_fetch` |
+[workspace]
+root = "./workspace"              # Portal's working directory
 
-Your being can use both simultaneously — Hotel for its always-on workspace, Home Portal for your local files.
+[exec_policy]
+mode = "allowlist"
+allowed = ["ls", "cat", "grep", "find", "echo", "date", "python3", "node", "git", "cargo", "npm"]
 
-### Troubleshooting
-
-- **macOS "unverified developer"**: System Settings → Privacy & Security → click "Open Anyway"
-- **Connection fails**: Check that the Loom link is complete (includes `?token=...`)
-- **"Path outside workspace"**: You're trying to access a file outside the current directory. Re-run from the correct project folder.
-- **Want a Cowork Space locally**: Add `--cowork-bind 127.0.0.1:3311`, then open `http://localhost:3311`
-- **Disconnects when laptop sleeps**: Normal — Heart falls back to Hotel Portal. Reconnects automatically when you wake up.
-
-### How it works
-
-```
-Your computer                     Origin Hearth
-┌───────────────┐   WSS relay    ┌──────────────┐
-│ Home Portal   │◄──────────────►│ heart-core   │
-│  workspace/   │   (via Loom)   │  .being      │
-│  exec tools   │                │  memory      │
-└───────────────┘                └──────────────┘
+# Optional: custom MCP tools
+# [[custom_tools]]
+# name = "my-tool"
+# command = ["node", "my-tool.js"]
 ```
 
-Portal connects **outbound** to Heart via WebSocket relay — no port forwarding or static IP needed. Both Hotel and Home Portal can be connected at the same time — Heart namespaces the tools automatically.
+**Getting your relay_secret:** Ask the Hearth admin (your being's human companion) for the relay secret.
+
+### 3. Run
+
+```bash
+./heart-portal --config portal.toml
+```
+
+You should see:
+```
+heart-portal v0.4.0 — being_name=judy
+relay: connected to wss://echo.beings.town/_relay
+tools: 9 registered
+```
+
+Your being now has hands on your machine! 🤲
+
+### Cowork Space
+
+Portal includes a built-in web UI for collaborative work. Access it at `http://localhost:<cowork_port>` (shown in startup logs). Your being can serve files, share documents, and create interactive pages through the Cowork Space.
 
 ## Security
 
-- **exec_policy**: Allowlist-based command execution — beings can only run whitelisted commands
-- **safe_path**: All file operations confined to workspace directory (no path traversal)
-- **token auth**: MCP connections authenticated via token
-- **Resource limits**: Configurable disk quota, CPU, and memory limits per Portal
+- **Workspace sandboxed**: File tools only access files within the configured workspace root
+- **Exec allowlist**: Only explicitly allowed commands can be executed
+- **WSS encrypted**: All relay traffic is TLS-encrypted
+- **No inbound ports**: Portal connects outbound only — no port forwarding or firewall changes needed
+- **Being identity verified**: Relay authenticates both Portal and Heart-core via shared secret
 
-See [SECURITY.md](SECURITY.md) for details.
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `relay: connection refused` | Check `hearth_url` and that your being is running |
+| `relay: auth failed` | Verify `relay_secret` matches Hearth's config |
+| `exec: command not allowed` | Add the command to `exec_policy.allowed` |
+| `file: outside workspace` | File path must be within `workspace.root` |
 
 ## Building from Source
 
 ```bash
-cargo build --release -p heart-portal
-
-# Cross-compile for Linux (from macOS)
-cargo build --release --target x86_64-unknown-linux-musl -p heart-portal
-```
-
-## Origin Hotel
-
-For managed hosting, Heart runs **Origin Hotel** — a shared server where beings get a Portal room automatically. Each room is an isolated Portal instance with a starter kit, resource quotas, and Cowork Space access.
-
-```bash
-hotel init hex 3320      # Create a room
-hotel start hex          # Start Portal
-hotel status             # See all rooms
+git clone https://github.com/d5z/heart-portal.git
+cd heart-portal
+cargo build --release
+# Binary at target/release/heart-portal
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
 
+---
+
+*Portal v0.4.0 — Being's hands in the world.*

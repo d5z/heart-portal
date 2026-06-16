@@ -20,7 +20,7 @@ pub fn is_safe_url(url: &str) -> bool {
     };
 
     let end = rest
-        .find(|c| matches!(c, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let authority = &rest[..end];
     let auth_after_at = authority.rsplit('@').next().unwrap_or("");

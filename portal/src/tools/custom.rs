@@ -16,8 +16,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{info, warn, debug};
 
-use heart_mcp::client::McpClient;
-use heart_mcp::connection::{McpServerConfig, McpTransport};
+use crate::mcp::{McpClient, McpServerConfig, McpToolInfo};
 
 use super::ToolInfo;
 
@@ -78,12 +77,10 @@ impl CustomToolHost {
         }
 
         for cfg in &configs {
-            if let heart_mcp::connection::McpTransport::Stdio { command, .. } = &cfg.transport {
-                warn!(
-                    "Custom MCP server '{}' will run command: {:?}",
-                    cfg.name, command
-                );
-            }
+            warn!(
+                "Custom MCP server '{}' will run command: {:?}",
+                cfg.name, cfg.command
+            );
         }
 
         info!("Connecting to {} custom MCP servers...", configs.len());
@@ -95,7 +92,7 @@ impl CustomToolHost {
         }
 
         // Discover tools
-        let discovered = client.discover_tools().await;
+        let discovered: Vec<(String, McpToolInfo)> = client.discover_tools().await;
         let tool_count = discovered.len();
 
         if tool_count == 0 {
@@ -270,7 +267,8 @@ fn parse_custom_mcp_config(content: &str, workspace_root: &Path) -> Result<Vec<M
 
         configs.push(McpServerConfig {
             name: server.name,
-            transport: McpTransport::Stdio { command, env },
+            command,
+            env,
         });
     }
 

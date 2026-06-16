@@ -66,10 +66,7 @@ pub async fn execute(
         command, workdir, timeout_secs
     );
 
-    #[cfg(unix)]
     let mut cmd = Command::new("sh");
-    #[cfg(windows)]
-    let mut cmd = Command::new("cmd");
     configure_shell_command(&mut cmd, command, config, &workdir);
 
     let output = tokio::time::timeout(
