@@ -167,6 +167,27 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .or_else(|| {
+            // Fallback for systemd services where $HOME is not set
+            #[cfg(unix)]
+            {
+                // SAFETY: getuid is always safe
+                let uid = unsafe { libc::getuid() };
+                // SAFETY: getpwuid returns a pointer to a static struct or null
+                let pw = unsafe { libc::getpwuid(uid) };
+                if !pw.is_null() {
+                    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+                    if let Ok(s) = dir.to_str() {
+                        return Some(PathBuf::from(s));
+                    }
+                }
+                None
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        })
 }
 
 #[cfg(test)]
