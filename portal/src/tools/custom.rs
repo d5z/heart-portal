@@ -269,6 +269,7 @@ fn parse_custom_mcp_config(content: &str, workspace_root: &Path) -> Result<Vec<M
             name: server.name,
             command,
             env,
+            cwd: Some(tools_dir.clone()),
         });
     }
 
