@@ -4,6 +4,7 @@
 mod exec;
 mod file;
 mod process;
+mod screenshot;
 mod search;
 mod web;
 mod web_search;
@@ -232,6 +233,30 @@ impl ToolHost {
             });
         }
 
+        if self.config.tools.screenshot {
+            tools.push(ToolInfo {
+                name: "portal_screenshot".to_string(),
+                description: "Capture a screenshot of the screen or a specific window/region".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Output file path (relative to workspace). Defaults to '.screenshots/capture-<timestamp>.png'"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Capture region: 'full' (entire screen), 'window' (frontmost window), or 'x,y,w,h' (rectangle). Default: 'full'"
+                        },
+                        "display": {
+                            "type": "integer",
+                            "description": "Display number for multi-monitor (0-indexed). Default: main display"
+                        }
+                    }
+                }),
+            });
+        }
+
         if self.config.tools.search {
             tools.push(ToolInfo {
                 name: "portal_search".to_string(),
@@ -295,6 +320,12 @@ impl ToolHost {
             "portal_file_read" => file::read(&self.config, arguments).await,
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
+            "portal_screenshot" => {
+                if !self.config.tools.screenshot {
+                    anyhow::bail!("portal_screenshot is disabled in configuration");
+                }
+                screenshot::capture(&self.config, arguments).await
+            }
             "portal_search" => search::search(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
             "portal_web_search" => web_search::search(arguments).await,

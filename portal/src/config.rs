@@ -101,6 +101,8 @@ pub struct ToolsConfig {
     #[serde(default = "default_true")]
     pub file: bool,
     #[serde(default = "default_true")]
+    pub screenshot: bool,
+    #[serde(default = "default_true")]
     pub web_fetch: bool,
     /// Recursive workspace text search (portal_search).
     #[serde(default = "default_true")]
@@ -145,6 +147,7 @@ impl Default for ToolsConfig {
         Self {
             exec: true,
             file: true,
+            screenshot: true,
             web_fetch: true,
             search: true,
             custom_tools_enabled: true,
