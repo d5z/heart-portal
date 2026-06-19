@@ -20,19 +20,20 @@ Your Computer                      Origin Hearth
 
 Portal connects **outbound** to Hearth's relay endpoint — no port forwarding needed.
 
-## Built-in Tools (9)
+## Built-in Tools (10)
 
-| Tool | Description |
-|------|-------------|
-| `portal_exec` | Execute commands (allowlist-based security) |
-| `portal_process` | Background process management |
-| `portal_file_read` | Read files from workspace |
-| `portal_file_write` | Write files to workspace |
-| `portal_file_list` | List directory contents |
-| `portal_search` | Full-text search across workspace (ripgrep) |
-| `portal_web_fetch` | Fetch and extract content from URLs |
-| `portal_web_search` | Web search via Brave API |
-| `portal_custom_tool` | Run custom MCP tool servers |
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `portal_exec` | `command`, `workdir`, `timeout_secs`, `background` | Execute shell commands with allowlist-based security. |
+| `portal_process` | `action`, `session_id`, `data` | Manage background command sessions. |
+| `portal_file_read` | `path`, `offset`, `limit` | Read files from the workspace. |
+| `portal_file_write` | `path`, `content` | Write files inside the workspace. |
+| `portal_file_list` | `path` | List directory contents. |
+| `portal_web_fetch` | `url` | Fetch content from a URL. |
+| `portal_web_search` | `query` | Search the web. |
+| `portal_search` | `query` | Search text across the workspace. |
+| `portal_screenshot` | `path`, `region`, `display` | Capture a screenshot to a workspace file. |
+| `portal_tools_reload` | none | Reload custom tools from `workspace/tools/mcp.toml`. |
 
 ## Setup
 
@@ -85,9 +86,9 @@ allowed = ["ls", "cat", "grep", "find", "echo", "date", "python3", "node", "git"
 
 You should see:
 ```
-heart-portal v0.4.0 — being_name=judy
+heart-portal v0.6.0 — being_name=judy
 relay: connected to wss://echo.beings.town/_relay
-tools: 9 registered
+tools: 10 registered
 ```
 
 Your being now has hands on your machine! 🤲
@@ -128,4 +129,4 @@ MIT
 
 ---
 
-*Portal v0.4.0 — Being's hands in the world.*
+*Portal v0.6.0 — Being's hands in the world.*

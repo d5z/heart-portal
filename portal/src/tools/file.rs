@@ -74,7 +74,7 @@ fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Result<PathBu
 
 /// Write path: walk each path component; if a prefix exists, canonicalize it before creating parents
 /// (prevents `create_dir_all` from following a symlink that escapes the workspace).
-fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let logical = resolve_path_logical(config, path_str)?;
     let root = &config.security.workspace_root;
     let root_canon = root.canonicalize().map_err(|e| {
