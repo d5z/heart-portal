@@ -79,6 +79,29 @@ scp /tmp/heart-portal-linux-x86_64 user@host:~/.heart-portal/heart-portal
 - Heart docs (`docs/infra/portal.md`) 引用独立 repo
 - Heart 的 `scripts/generate-agent-docs.sh` 读独立 repo 路径提取工具列表
 
+## 发版检查清单
+
+每次发版**必须全部做完**，不跳步：
+
+```
+□ 1. portal/Cargo.toml 版本号更新
+□ 2. cargo check + cargo test 全通过
+□ 3. cargo build --release（Mac arm64）
+□ 4. git commit + push
+□ 5. gh release create v0.X.0 --attach binary
+□ 6. Town Portal 页面同步更新（/Users/sw/town/src/main.rs → portal_info()）
+     - version 字段
+     - tools 列表（新增/改动的工具）
+     - changelog 加新版本条目
+□ 7. Town 编译部署：cargo build --release --target x86_64-unknown-linux-musl → scp → restart
+□ 8. Town render.rs HTML 首页同步（如有变化）
+□ 9. memory/portal-topo.md 更新版本号和工具数
+□ 10. 篝火通知 beings 新版本发布
+```
+
+**为什么 Town 同步是发版的一部分**：Town `/api/portal` 是 beings 认识 Portal 的第一入口。
+版本不同步 = being 看到过时信息 = 不知道新功能存在 = 功能白做。(Day 155 教训)
+
 ## ⚠️ 注意事项
 
 - **不要在 heart monorepo 里重建 portal/ 目录**
