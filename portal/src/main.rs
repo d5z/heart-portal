@@ -8,6 +8,7 @@ mod config;
 mod exec_policy;
 mod process_manager;
 mod tools;
+mod kits;
 mod mcp;
 mod protocol;
 mod cowork;
@@ -57,13 +58,25 @@ struct Cli {
 enum Commands {
     /// Check GitHub releases and upgrade to the latest version
     Upgrade,
+    /// Manage installed Portal kits
+    Kit {
+        #[command(subcommand)]
+        command: KitCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum KitCommands {
+    /// List installed kits
+    List,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let command = cli.command;
 
-    if matches!(cli.command, Some(Commands::Upgrade)) {
+    if matches!(&command, Some(Commands::Upgrade)) {
         return upgrade::run_upgrade().await;
     }
 
@@ -95,6 +108,13 @@ async fn main() -> Result<()> {
         if !t.is_empty() {
             config.portal_mcp_token = Some(t);
         }
+    }
+
+    if let Some(Commands::Kit {
+        command: KitCommands::List,
+    }) = &command
+    {
+        return list_installed_kits(&config).await;
     }
 
     if config.portal_mcp_token.is_none() {
@@ -259,6 +279,31 @@ async fn main() -> Result<()> {
     }
 
     drop(listener);
+    Ok(())
+}
+
+async fn list_installed_kits(config: &PortalConfig) -> Result<()> {
+    if !config.kits_enabled {
+        println!("Kits disabled");
+        return Ok(());
+    }
+
+    let kits_dir = kits::loader::kits_dir(config);
+    let kits = kits::loader::load_kits(config)?;
+    if kits.is_empty() {
+        println!("No kits installed in {}", kits_dir.display());
+        return Ok(());
+    }
+
+    let manager = kits::manager::KitManager::new(kits);
+    println!("Installed kits in {}", kits_dir.display());
+    for status in manager.statuses().await {
+        println!(
+            "{}\t{}\t{}\t{} tool(s)",
+            status.name, status.version, status.status, status.tools
+        );
+    }
+
     Ok(())
 }
 

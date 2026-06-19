@@ -1,5 +1,5 @@
 pub use client::McpClient;
-pub use connection::McpServerConfig;
+pub use connection::{McpConnection, McpServerConfig};
 pub use protocol::McpToolInfo;
 
 mod client;

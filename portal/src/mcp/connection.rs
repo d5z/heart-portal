@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -16,6 +17,7 @@ pub struct McpServerConfig {
     pub name: String,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
+    pub cwd: Option<PathBuf>,
 }
 
 /// A stdio JSON-RPC connection to a single MCP server.
@@ -35,19 +37,24 @@ impl McpConnection {
             anyhow::bail!("Empty command for MCP server '{}'", config.name);
         }
 
-        let mut child = tokio::process::Command::new(&config.command[0])
+        let mut command = tokio::process::Command::new(&config.command[0]);
+        command
             .args(&config.command[1..])
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Failed to spawn MCP server '{}' with command: {:?}",
-                    config.name, config.command
-                )
-            })?;
+            .stderr(std::process::Stdio::null());
+
+        if let Some(cwd) = &config.cwd {
+            command.current_dir(cwd);
+        }
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "Failed to spawn MCP server '{}' with command: {:?}",
+                config.name, config.command
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -337,7 +344,6 @@ impl McpConnection {
     }
 
     /// Check whether the connection reader task is still alive.
-    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
@@ -347,14 +353,7 @@ impl McpConnection {
         debug!("Shutting down MCP server '{}'", self.config.name);
 
         if let Some(ref mut child) = self.child {
-            match child.kill().await {
-                Ok(_) => {
-                    debug!("MCP server '{}' process killed", self.config.name);
-                }
-                Err(e) => {
-                    warn!("Failed to kill MCP server '{}' process: {}", self.config.name, e);
-                }
-            }
+            terminate_child(child, &self.config.name).await;
 
             match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
                 Ok(Ok(status)) => {
@@ -368,10 +367,39 @@ impl McpConnection {
                 }
                 Err(_) => {
                     warn!("Timeout waiting for MCP server '{}' process to exit", self.config.name);
+                    if let Err(e) = child.kill().await {
+                        warn!("Failed to kill MCP server '{}' process: {}", self.config.name, e);
+                    }
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_child(child: &mut Child, server_name: &str) {
+    let Some(pid) = child.id() else {
+        return;
+    };
+
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if rc == 0 {
+        debug!("Sent SIGTERM to MCP server '{}'", server_name);
+    } else {
+        warn!(
+            "Failed to send SIGTERM to MCP server '{}': {}",
+            server_name,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_child(child: &mut Child, server_name: &str) {
+    match child.kill().await {
+        Ok(_) => debug!("MCP server '{}' process killed", server_name),
+        Err(e) => warn!("Failed to kill MCP server '{}' process: {}", server_name, e),
     }
 }

@@ -1,4 +1,4 @@
-//! Tool host — manages built-in + custom (being-defined) tools.
+//! Tool host — manages built-in, custom (being-defined), and kit tools.
 //! Built-in: exec, file, web. Custom: loaded from workspace/tools/mcp.toml.
 
 mod exec;
@@ -11,13 +11,14 @@ mod web_search;
 pub mod custom;
 
 use crate::config::PortalConfig;
+use crate::kits::{loader, manager::KitManager};
 use crate::process_manager::ProcessManager;
 use custom::CustomToolHost;
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Tool metadata for tools/list response
 #[derive(Debug, Clone)]
@@ -27,11 +28,12 @@ pub struct ToolInfo {
     pub input_schema: Value,
 }
 
-/// Hosts all available tools (built-in + custom), dispatches calls
+/// Hosts all available tools (built-in + custom + kit), dispatches calls
 #[derive(Clone)]
 pub struct ToolHost {
     config: PortalConfig,
     custom: CustomToolHost,
+    kits: KitManager,
     process_manager: Arc<ProcessManager>,
     /// Set to true after reload — signals connection handler to close TCP
     pub needs_reconnect: Arc<AtomicBool>,
@@ -39,9 +41,23 @@ pub struct ToolHost {
 
 impl ToolHost {
     pub fn new(config: &PortalConfig) -> Self {
+        let loaded_kits = match loader::load_kits(config) {
+            Ok(kits) => {
+                if !kits.is_empty() {
+                    info!("Loaded {} kit manifest(s)", kits.len());
+                }
+                kits
+            }
+            Err(err) => {
+                warn!("Failed to load kits: {}", err);
+                Vec::new()
+            }
+        };
+
         Self {
             config: config.clone(),
             custom: CustomToolHost::new(),
+            kits: KitManager::new(loaded_kits),
             process_manager: Arc::new(ProcessManager::new()),
             needs_reconnect: Arc::new(AtomicBool::new(false)),
         }
@@ -49,6 +65,7 @@ impl ToolHost {
 
     pub async fn kill_all_managed_processes(&self) {
         self.process_manager.kill_all().await;
+        self.kits.shutdown().await;
     }
 
     pub async fn cleanup_background_sessions(&self) {
@@ -85,6 +102,8 @@ impl ToolHost {
         let mut tools = self.list_builtin_tools();
         let custom = self.custom.list_tools().await;
         tools.extend(custom);
+        let kit_tools = self.kits.list_tools().await;
+        tools.extend(kit_tools);
         tools
     }
 
@@ -301,6 +320,13 @@ impl ToolHost {
         // Check custom tools first
         if self.custom.has_tool(tool_name).await {
             return self.custom.call(tool_name, arguments).await;
+        }
+
+        if let Some((kit_name, real_tool_name)) = self.kits.resolve_tool(tool_name).await {
+            return self
+                .kits
+                .call_tool(&kit_name, &real_tool_name, arguments)
+                .await;
         }
 
         // Built-in tools
