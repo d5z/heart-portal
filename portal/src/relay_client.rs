@@ -144,7 +144,7 @@ async fn run_one_session(
 
     let (portal_stream, bridge_stream) = tokio::io::duplex(65536);
 
-    let (mut ws_write, mut ws_read) = ws.split();
+    let (ws_write, mut ws_read) = ws.split();
     let ws_write = std::sync::Arc::new(Mutex::new(ws_write));
     let last_pong = std::sync::Arc::new(Mutex::new(Instant::now()));
 
@@ -233,24 +233,34 @@ async fn run_one_session(
         crate::handle_connection(portal_stream, &th, &pn, None).await
     });
 
-    tokio::select! {
+    let (exit_reason, result) = tokio::select! {
         r = &mut hc_task => {
             heartbeat.abort();
             ws_to_bridge.abort();
             bridge_to_ws.abort();
-            r?
+            let exit_reason = format!("mcp_handler: {:?}", r);
+            let result = match r {
+                Ok(inner) => inner,
+                Err(e) => Err(anyhow::anyhow!("mcp handler join error: {e}")),
+            };
+            (exit_reason, result)
         }
         hb = &mut heartbeat => {
             hc_task.abort();
             ws_to_bridge.abort();
             bridge_to_ws.abort();
-            match hb {
+            let exit_reason = format!("heartbeat: {:?}", hb);
+            let result = match hb {
                 Ok(Ok(())) => Err(anyhow::anyhow!("heartbeat task exited unexpectedly")),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("heartbeat join error: {e}")),
-            }
+            };
+            (exit_reason, result)
         }
-    }
+    };
+
+    warn!("relay session ended: {}", exit_reason);
+    result
 }
 
 #[cfg(test)]

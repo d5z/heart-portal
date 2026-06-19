@@ -12,20 +12,61 @@ mod mcp;
 mod protocol;
 mod cowork;
 mod relay_client;
+mod upgrade;
 
 use std::path::PathBuf;
 use std::time::Duration;
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tracing::{info, warn, error, debug};
 
 use crate::config::PortalConfig;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, PORTAL_VERSION};
 use crate::tools::ToolHost;
+
+#[derive(Parser)]
+#[command(
+    name = "heart-portal",
+    version = PORTAL_VERSION,
+    about = "Heart Portal — Being's gateway to the world"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Loom URL for reverse relay (Home mode)
+    #[arg(long)]
+    connect: Option<String>,
+
+    /// Portal name for relay handshake identity
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Path to portal.toml
+    #[arg(short = 'c', long = "config")]
+    config: Option<String>,
+
+    /// Path to portal.toml (positional)
+    #[arg(value_name = "CONFIG")]
+    config_positional: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Check GitHub releases and upgrade to the latest version
+    Upgrade,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Commands::Upgrade)) {
+        return upgrade::run_upgrade().await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,9 +77,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // CLI: --connect <loom_url> for reverse relay; --config / -c / positional for portal.toml
-    let (connect_link, config_path, cli_portal_name) =
-        parse_cli().context("Invalid command-line arguments")?;
+    let connect_link = cli.connect;
+    let config_path = cli
+        .config
+        .or(cli.config_positional)
+        .unwrap_or_else(|| "portal.toml".to_string());
+    let cli_portal_name = cli.name;
     
     let mut config = if PathBuf::from(&config_path).exists() {
         PortalConfig::load(&config_path)?
@@ -241,69 +285,6 @@ fn relay_portal_name(
         .unwrap_or_else(fallback)
 }
 
-fn parse_cli() -> Result<(Option<String>, String, Option<String>)> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    let mut cfg: Option<String> = None;
-    let mut connect: Option<String> = None;
-    let mut portal_name: Option<String> = None;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--connect" {
-            let url = args
-                .get(i + 1)
-                .ok_or_else(|| anyhow::anyhow!("--connect requires a Loom URL"))?;
-            connect = Some(url.clone());
-            i += 2;
-        } else if let Some(url) = a.strip_prefix("--connect=") {
-            if url.is_empty() {
-                anyhow::bail!("--connect= requires a non-empty URL");
-            }
-            connect = Some(url.to_string());
-            i += 1;
-        } else if a == "--name" {
-            let n = args
-                .get(i + 1)
-                .ok_or_else(|| anyhow::anyhow!("--name requires a value"))?;
-            if n.is_empty() {
-                anyhow::bail!("--name must be non-empty");
-            }
-            portal_name = Some(n.clone());
-            i += 2;
-        } else if let Some(n) = a.strip_prefix("--name=") {
-            if n.is_empty() {
-                anyhow::bail!("--name= requires a non-empty name");
-            }
-            portal_name = Some(n.to_string());
-            i += 1;
-        } else if a == "--config" || a == "-c" {
-            let path = args
-                .get(i + 1)
-                .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
-            cfg = Some(path.clone());
-            i += 2;
-        } else if let Some(p) = a.strip_prefix("--config=") {
-            if p.is_empty() {
-                anyhow::bail!("--config= requires a non-empty path");
-            }
-            cfg = Some(p.to_string());
-            i += 1;
-        } else if a.starts_with('-') {
-            anyhow::bail!("Unknown argument: {}", a);
-        } else if cfg.is_none() {
-            cfg = Some(a.clone());
-            i += 1;
-        } else {
-            anyhow::bail!("Unexpected positional argument: {}", a);
-        }
-    }
-    Ok((
-        connect,
-        cfg.unwrap_or_else(|| "portal.toml".to_string()),
-        portal_name,
-    ))
-}
-
 #[cfg(unix)]
 async fn wait_sigterm() {
     use tokio::signal::unix::{signal, SignalKind};
@@ -502,7 +483,7 @@ async fn handle_request(
                     },
                     "serverInfo": {
                         "name": format!("heart-portal-{}", portal_name),
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": PORTAL_VERSION
                     }
                 })),
                 error: None,
@@ -618,7 +599,7 @@ async fn run_health_server(portal_name: &str, port: u16) -> Result<()> {
             use tokio::io::AsyncReadExt;
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
-            let body = format!("{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}", name, env!("CARGO_PKG_VERSION"));
+            let body = format!("{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}", name, PORTAL_VERSION);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(), body
