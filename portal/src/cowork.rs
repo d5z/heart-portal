@@ -10,7 +10,7 @@ use axum::extract::{Query, State, ws};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{extract::DefaultBodyLimit, Json, Router};
 use axum_extra::extract::Multipart;
 use futures_util::{SinkExt, StreamExt};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -137,6 +137,7 @@ pub fn cowork_router(state: CoworkState) -> Router {
         .route("/api/mkdir", post(api_mkdir))
         .route("/api/rename", post(api_rename))
         .route("/ws", get(ws_handler))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10MB, match config.security.max_file_size
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

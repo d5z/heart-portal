@@ -31,7 +31,7 @@ pub struct ToolInfo {
 pub struct ToolHost {
     config: PortalConfig,
     custom: CustomToolHost,
-    process_manager: Arc<ProcessManager>,
+    pub process_manager: Arc<ProcessManager>,
     /// Set to true after reload — signals connection handler to close TCP
     pub needs_reconnect: Arc<AtomicBool>,
 }
