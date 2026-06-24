@@ -374,56 +374,71 @@ where
         }
     }
 
+    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
+    tool_host
+        .process_manager
+        .set_notification_sender(notification_tx);
+
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            debug!("Client disconnected (EOF)");
-            return Ok(());
-        }
+        tokio::select! {
+            result = reader.read_line(&mut line) => {
+                let bytes_read = result?;
+                if bytes_read == 0 {
+                    debug!("Client disconnected (EOF)");
+                    return Ok(());
+                }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
 
-        debug!("← {}", trimmed);
+                debug!("← {}", trimmed);
 
-        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Invalid JSON-RPC: {}", e);
-                let error_resp = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: None,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: format!("Parse error: {}", e),
-                        data: None,
-                    }),
+                let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Invalid JSON-RPC: {}", e);
+                        let error_resp = JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: None,
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32700,
+                                message: format!("Parse error: {}", e),
+                                data: None,
+                            }),
+                        };
+                        send_response(&mut writer, &error_resp).await?;
+                        continue;
+                    }
                 };
-                send_response(&mut writer, &error_resp).await?;
-                continue;
+
+                // Notifications (no id) — just ack
+                if request.id.is_none() {
+                    debug!("Notification: {}", request.method);
+                    continue;
+                }
+
+                let response = handle_request(&request, tool_host, portal_name).await;
+                send_response(&mut writer, &response).await?;
+
+                // After tool reload, close connection to trigger Hearth reconnect → re-discover tools
+                if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {
+                    tool_host.needs_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
+                    info!("🔄 Closing connection after tools reload — Hearth will auto-reconnect");
+                    // Small delay to ensure result is flushed
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    return Ok(());
+                }
             }
-        };
-
-        // Notifications (no id) — just ack
-        if request.id.is_none() {
-            debug!("Notification: {}", request.method);
-            continue;
-        }
-
-        let response = handle_request(&request, tool_host, portal_name).await;
-        send_response(&mut writer, &response).await?;
-
-        // After tool reload, close connection to trigger Hearth reconnect → re-discover tools
-        if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {
-            tool_host.needs_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
-            info!("🔄 Closing connection after tools reload — Hearth will auto-reconnect");
-            // Small delay to ensure result is flushed
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            return Ok(());
+            Some(notification) = notification_rx.recv() => {
+                debug!("→ {}", notification);
+                writer.write_all(notification.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+            }
         }
     }
 }
@@ -585,4 +600,105 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    async fn write_request<W: AsyncWriteExt + Unpin>(
+        writer: &mut BufWriter<W>,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<()> {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        writer.write_all(req.to_string().as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn read_json_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        Ok(serde_json::from_str(line.trim())?)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exec_allowlist config — validates full handle_connection loop"]
+    async fn background_task_notification_reaches_writer() {
+        let config = PortalConfig::default();
+        let tool_host = ToolHost::new(&config);
+
+        let (client_stream, portal_stream) = tokio::io::duplex(65536);
+        let (read_half, write_half) = tokio::io::split(client_stream);
+
+        let host = tool_host.clone();
+        let server = tokio::spawn(async move {
+            handle_connection(portal_stream, &host, "test", None).await
+        });
+
+        let mut client_writer = BufWriter::new(write_half);
+        let mut client_reader = BufReader::new(read_half);
+
+        write_request(
+            &mut client_writer,
+            1,
+            "initialize",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        let init = read_json_line(&mut client_reader).await.unwrap();
+        assert!(init.get("result").is_some());
+
+        write_request(
+            &mut client_writer,
+            2,
+            "tools/call",
+            serde_json::json!({
+                "name": "portal_exec",
+                "arguments": {
+                    "command": "echo writer_notify_test",
+                    "background": true
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let exec_resp = read_json_line(&mut client_reader).await.unwrap();
+        assert!(exec_resp.get("result").is_some());
+
+        let notification = tokio::time::timeout(
+            Duration::from_secs(5),
+            async {
+                loop {
+                    let line = read_json_line(&mut client_reader).await.unwrap();
+                    if line.get("method").and_then(|m| m.as_str())
+                        == Some("notifications/portal/task_complete")
+                    {
+                        return line;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("timed out waiting for task_complete notification");
+
+        assert_eq!(
+            notification["params"]["command"],
+            "echo writer_notify_test"
+        );
+        assert_eq!(notification["params"]["exit_code"], 0);
+
+        drop(client_writer);
+        let _ = server.await;
+    }
 }

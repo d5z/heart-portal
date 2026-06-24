@@ -4,11 +4,11 @@ use crate::config::PortalConfig;
 use crate::exec_policy::{configure_shell_command, validate_exec_allowlist};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio::time;
 use tracing::debug;
 
@@ -23,10 +23,13 @@ pub const MAX_STDIN_WRITE_BYTES: usize = 256 * 1024;
 /// Session ids are `sess_` + UUID; reject oversized / odd keys.
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 
+const NOTIFICATION_OUTPUT_MAX_BYTES: usize = 500;
+
 pub struct ProcessManager {
-    sessions: Arc<Mutex<HashMap<String, ManagedProcess>>>,
+    sessions: Arc<AsyncMutex<HashMap<String, ManagedProcess>>>,
     max_sessions: usize,
     max_output_bytes: usize,
+    notification_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
 }
 
 pub struct ManagedProcess {
@@ -35,8 +38,8 @@ pub struct ManagedProcess {
     pub command: String,
     pub started_at: tokio::time::Instant,
     pub stdin: Option<ChildStdin>,
-    pub output: Arc<Mutex<OutputBuffer>>,
-    pub status: Arc<Mutex<ProcessStatus>>,
+    pub output: Arc<AsyncMutex<OutputBuffer>>,
+    pub status: Arc<AsyncMutex<ProcessStatus>>,
     pub(crate) notify: Arc<Notify>,
     pub(crate) exited_at: Option<tokio::time::Instant>,
 }
@@ -160,7 +163,7 @@ pub fn validate_session_id(session_id: &str) -> Result<()> {
 
 async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
     mut stream: R,
-    output: Arc<Mutex<OutputBuffer>>,
+    output: Arc<AsyncMutex<OutputBuffer>>,
     notify: Arc<Notify>,
 ) {
     let mut buf = [0u8; 8192];
@@ -177,13 +180,39 @@ async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+fn task_complete_notification(
+    session_id: &str,
+    command: &str,
+    exit_code: i32,
+    output: &OutputBuffer,
+) -> String {
+    let end = output.data.len().min(NOTIFICATION_OUTPUT_MAX_BYTES);
+    let output_summary = String::from_utf8_lossy(&output.data[..end]).into_owned();
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/portal/task_complete",
+        "params": {
+            "session_id": session_id,
+            "command": command,
+            "exit_code": exit_code,
+            "output": output_summary,
+        }
+    })
+    .to_string()
+}
+
 impl ProcessManager {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            notification_tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_notification_sender(&self, tx: mpsc::UnboundedSender<String>) {
+        *self.notification_tx.lock().unwrap() = Some(tx);
     }
 
     pub async fn spawn(
@@ -213,8 +242,8 @@ impl ProcessManager {
         }
 
         let session_id = format!("sess_{}", uuid::Uuid::new_v4());
-        let output = Arc::new(Mutex::new(OutputBuffer::new(self.max_output_bytes)));
-        let status = Arc::new(Mutex::new(ProcessStatus::Running));
+        let output = Arc::new(AsyncMutex::new(OutputBuffer::new(self.max_output_bytes)));
+        let status = Arc::new(AsyncMutex::new(ProcessStatus::Running));
         let notify = Arc::new(Notify::new());
 
         #[cfg(unix)]
@@ -262,6 +291,9 @@ impl ProcessManager {
         let n_exit = Arc::clone(&notify);
         let sessions_wait = Arc::clone(&self.sessions);
         let sid_wait = session_id.clone();
+        let cmd_wait = command.to_string();
+        let output_wait = Arc::clone(&output);
+        let notification_tx = Arc::clone(&self.notification_tx);
         tokio::spawn(async move {
             let code = match child.wait().await {
                 Ok(s) => s.code().unwrap_or_else(|| {
@@ -279,6 +311,17 @@ impl ProcessManager {
             }
             let mut st = st_b.lock().await;
             *st = ProcessStatus::Exited(code);
+            drop(st);
+
+            let maybe_tx = notification_tx.lock().unwrap().clone();
+            if let Some(tx) = maybe_tx {
+                let notification = {
+                    let buf = output_wait.lock().await;
+                    task_complete_notification(&sid_wait, &cmd_wait, code, &buf)
+                };
+                let _ = tx.send(notification);
+            }
+
             n_exit.notify_waiters();
         });
 
@@ -589,5 +632,61 @@ mod tests {
         assert!(validate_session_id("").is_err());
         assert!(validate_session_id("nope").is_err());
         assert!(validate_session_id(&format!("sess_{}", "x".repeat(200))).is_err());
+    }
+
+    #[tokio::test]
+    async fn notification_sent_on_process_exit() {
+        use crate::config::PortalConfig;
+
+        let pm = ProcessManager::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pm.set_notification_sender(tx);
+
+        let config = PortalConfig::default();
+        let info = pm
+            .spawn(&config, "echo portal_notify_test", ".", &[])
+            .await
+            .unwrap();
+
+        let notification = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for notification")
+            .expect("notification channel closed");
+
+        let v: serde_json::Value = serde_json::from_str(&notification).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "notifications/portal/task_complete");
+        assert_eq!(v["params"]["session_id"], info.session_id);
+        assert_eq!(v["params"]["command"], "echo portal_notify_test");
+        assert_eq!(v["params"]["exit_code"], 0);
+        assert!(
+            v["params"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("portal_notify_test")
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_output_truncated_at_500_bytes() {
+        use crate::config::PortalConfig;
+
+        let pm = ProcessManager::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        pm.set_notification_sender(tx);
+
+        let config = PortalConfig::default();
+        pm.spawn(&config, "python3 -c \"print('x' * 600)\"", ".", &[])
+            .await
+            .unwrap();
+
+        let notification = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for notification")
+            .expect("notification channel closed");
+
+        let v: serde_json::Value = serde_json::from_str(&notification).unwrap();
+        let output = v["params"]["output"].as_str().unwrap();
+        assert!(output.len() <= 500);
     }
 }
