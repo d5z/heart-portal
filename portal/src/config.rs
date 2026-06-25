@@ -55,6 +55,14 @@ struct RawConfig {
     /// MCP TCP pre-auth token (also settable via PORTAL_MCP_TOKEN env)
     #[serde(default)]
     portal_mcp_token: Option<String>,
+
+    /// Directory containing installed Portal kits.
+    #[serde(default)]
+    kits_dir: Option<String>,
+
+    /// Enable kit discovery and tool proxying.
+    #[serde(default)]
+    kits_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +94,8 @@ pub struct PortalConfig {
     pub cowork: CoworkConfig,
     /// When set, MCP TCP clients must send `auth` as the first JSON-RPC message.
     pub portal_mcp_token: Option<String>,
+    pub kits_dir: Option<String>,
+    pub kits_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +110,8 @@ pub struct ToolsConfig {
     pub exec: bool,
     #[serde(default = "default_true")]
     pub file: bool,
+    #[serde(default = "default_true")]
+    pub screenshot: bool,
     #[serde(default = "default_true")]
     pub web_fetch: bool,
     /// Recursive workspace text search (portal_search).
@@ -136,6 +148,8 @@ impl Default for PortalConfig {
             security: SecurityConfig::default(),
             cowork: CoworkConfig::default(),
             portal_mcp_token: None,
+            kits_dir: Some(default_kits_dir()),
+            kits_enabled: true,
         }
     }
 }
@@ -145,6 +159,7 @@ impl Default for ToolsConfig {
         Self {
             exec: true,
             file: true,
+            screenshot: true,
             web_fetch: true,
             search: true,
             custom_tools_enabled: true,
@@ -156,7 +171,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             exec_allowlist: vec![],
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/workspace")),
+            workspace_root: PathBuf::from("/workspace"),
             max_file_size: 10 * 1024 * 1024,
         }
     }
@@ -180,7 +195,7 @@ impl PortalConfig {
         // Resolve workspace: flat `workspace` > security.workspace_root > default
         let workspace = raw.workspace
             .or_else(|| raw.security.as_ref().and_then(|s| s.workspace_root.clone()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/workspace")));
+            .unwrap_or_else(|| PathBuf::from("/workspace"));
 
         let security = SecurityConfig {
             exec_allowlist: raw.security.as_ref()
@@ -205,6 +220,11 @@ impl PortalConfig {
             security,
             cowork,
             portal_mcp_token: raw.portal_mcp_token.clone().filter(|s| !s.is_empty()),
+            kits_dir: raw
+                .kits_dir
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| Some(default_kits_dir())),
+            kits_enabled: raw.kits_enabled.unwrap_or(true),
         })
     }
 }
@@ -225,6 +245,10 @@ fn parse_bind(bind: &str) -> Result<(String, u16)> {
 }
 
 fn default_true() -> bool { true }
+
+fn default_kits_dir() -> String {
+    "~/.heart-portal/kits/".to_string()
+}
 
 #[cfg(test)]
 mod tests {
@@ -264,5 +288,20 @@ web_fetch = false
         assert_eq!(config.bind_port, 9100);
         assert_eq!(config.security.workspace_root, PathBuf::from("/workspace/vale"));
         assert_eq!(config.tools.web_fetch, false);
+        assert_eq!(config.kits_dir.as_deref(), Some("~/.heart-portal/kits/"));
+        assert!(config.kits_enabled);
+    }
+
+    #[test]
+    fn test_kits_config() {
+        let toml = r#"
+name = "vale"
+kits_dir = "/tmp/portal-kits"
+kits_enabled = false
+"#;
+        std::fs::write("/tmp/test-portal-kits.toml", toml).unwrap();
+        let config = PortalConfig::load("/tmp/test-portal-kits.toml").unwrap();
+        assert_eq!(config.kits_dir.as_deref(), Some("/tmp/portal-kits"));
+        assert!(!config.kits_enabled);
     }
 }

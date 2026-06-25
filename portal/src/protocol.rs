@@ -3,6 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Portal release version (from Cargo.toml at compile time).
+pub const PORTAL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,

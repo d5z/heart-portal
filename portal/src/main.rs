@@ -8,23 +8,78 @@ mod config;
 mod exec_policy;
 mod process_manager;
 mod tools;
+mod kits;
+mod mcp;
 mod protocol;
 mod cowork;
 mod relay_client;
+mod upgrade;
 
 use std::path::PathBuf;
 use std::time::Duration;
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tracing::{info, warn, error, debug};
 
 use crate::config::PortalConfig;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, PORTAL_VERSION};
 use crate::tools::ToolHost;
+
+#[derive(Parser)]
+#[command(
+    name = "heart-portal",
+    version = PORTAL_VERSION,
+    about = "Heart Portal — Being's gateway to the world"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Loom URL for reverse relay (Home mode)
+    #[arg(long)]
+    connect: Option<String>,
+
+    /// Portal name for relay handshake identity
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Path to portal.toml
+    #[arg(short = 'c', long = "config")]
+    config: Option<String>,
+
+    /// Path to portal.toml (positional)
+    #[arg(value_name = "CONFIG")]
+    config_positional: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Check GitHub releases and upgrade to the latest version
+    Upgrade,
+    /// Manage installed Portal kits
+    Kit {
+        #[command(subcommand)]
+        command: KitCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum KitCommands {
+    /// List installed kits
+    List,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let command = cli.command;
+
+    if matches!(&command, Some(Commands::Upgrade)) {
+        return upgrade::run_upgrade().await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -35,8 +90,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // CLI: --connect <loom_url> for reverse relay; --config / -c / positional for portal.toml
-    let (connect_link, config_path) = parse_cli().context("Invalid command-line arguments")?;
+    let connect_link = cli.connect;
+    let config_path = cli
+        .config
+        .or(cli.config_positional)
+        .unwrap_or_else(|| "portal.toml".to_string());
+    let cli_portal_name = cli.name;
     
     let mut config = if PathBuf::from(&config_path).exists() {
         PortalConfig::load(&config_path)?
@@ -49,6 +108,13 @@ async fn main() -> Result<()> {
         if !t.is_empty() {
             config.portal_mcp_token = Some(t);
         }
+    }
+
+    if let Some(Commands::Kit {
+        command: KitCommands::List,
+    }) = &command
+    {
+        return list_installed_kits(&config).await;
     }
 
     if config.portal_mcp_token.is_none() {
@@ -135,6 +201,9 @@ async fn main() -> Result<()> {
     }
 
     if let Some(ref loom) = connect_link {
+        // Relay handshake identity: --name, non-generic config name, then host name.
+        let relay_portal_name =
+            relay_portal_name(cli_portal_name, &config.name, default_relay_portal_name);
         let tool_shutdown = tool_host.clone();
         tokio::select! {
             _ = async {
@@ -143,7 +212,7 @@ async fn main() -> Result<()> {
                 info!("Portal shutting down (Ctrl+C)");
                 tool_shutdown.kill_all_managed_processes().await;
             }
-            _ = relay_client::connect_and_serve(loom, &tool_host, &config.name) => {}
+            _ = relay_client::connect_and_serve(loom, &tool_host, &relay_portal_name) => {}
         }
         return Ok(());
     }
@@ -213,47 +282,52 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_cli() -> Result<(Option<String>, String)> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    let mut cfg: Option<String> = None;
-    let mut connect: Option<String> = None;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--connect" {
-            let url = args
-                .get(i + 1)
-                .ok_or_else(|| anyhow::anyhow!("--connect requires a Loom URL"))?;
-            connect = Some(url.clone());
-            i += 2;
-        } else if let Some(url) = a.strip_prefix("--connect=") {
-            if url.is_empty() {
-                anyhow::bail!("--connect= requires a non-empty URL");
-            }
-            connect = Some(url.to_string());
-            i += 1;
-        } else if a == "--config" || a == "-c" {
-            let path = args
-                .get(i + 1)
-                .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
-            cfg = Some(path.clone());
-            i += 2;
-        } else if let Some(p) = a.strip_prefix("--config=") {
-            if p.is_empty() {
-                anyhow::bail!("--config= requires a non-empty path");
-            }
-            cfg = Some(p.to_string());
-            i += 1;
-        } else if a.starts_with('-') {
-            anyhow::bail!("Unknown argument: {}", a);
-        } else if cfg.is_none() {
-            cfg = Some(a.clone());
-            i += 1;
-        } else {
-            anyhow::bail!("Unexpected positional argument: {}", a);
-        }
+async fn list_installed_kits(config: &PortalConfig) -> Result<()> {
+    if !config.kits_enabled {
+        println!("Kits disabled");
+        return Ok(());
     }
-    Ok((connect, cfg.unwrap_or_else(|| "portal.toml".to_string())))
+
+    let kits_dir = kits::loader::kits_dir(config);
+    let kits = kits::loader::load_kits(config)?;
+    if kits.is_empty() {
+        println!("No kits installed in {}", kits_dir.display());
+        return Ok(());
+    }
+
+    let manager = kits::manager::KitManager::new(kits);
+    println!("Installed kits in {}", kits_dir.display());
+    for status in manager.statuses().await {
+        println!(
+            "{}\t{}\t{}\t{} tool(s)",
+            status.name, status.version, status.status, status.tools
+        );
+    }
+
+    Ok(())
+}
+
+fn default_relay_portal_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "portal".to_string())
+}
+
+fn relay_portal_name(
+    cli_portal_name: Option<String>,
+    config_name: &str,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    cli_portal_name
+        .or_else(|| {
+            if !config_name.is_empty() && config_name != "portal" {
+                Some(config_name.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(fallback)
 }
 
 #[cfg(unix)]
@@ -374,70 +448,61 @@ where
         }
     }
 
-    let (notification_tx, mut notification_rx) = tokio::sync::mpsc::unbounded_channel();
-    tool_host
-        .process_manager
-        .set_notification_sender(notification_tx);
-
     loop {
         line.clear();
-        tokio::select! {
-            result = reader.read_line(&mut line) => {
-                let bytes_read = result?;
-                if bytes_read == 0 {
-                    debug!("Client disconnected (EOF)");
-                    return Ok(());
-                }
+        let bytes_read = reader.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            debug!("Client disconnected (EOF)");
+            return Ok(());
+        }
 
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-                debug!("← {}", trimmed);
+        debug!("← {}", trimmed);
 
-                let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("Invalid JSON-RPC: {}", e);
-                        let error_resp = JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: None,
-                            result: None,
-                            error: Some(JsonRpcError {
-                                code: -32700,
-                                message: format!("Parse error: {}", e),
-                                data: None,
-                            }),
-                        };
-                        send_response(&mut writer, &error_resp).await?;
-                        continue;
-                    }
+        let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Invalid JSON-RPC: {}", e);
+                let error_resp = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {}", e),
+                        data: None,
+                    }),
                 };
-
-                // Notifications (no id) — just ack
-                if request.id.is_none() {
-                    debug!("Notification: {}", request.method);
-                    continue;
-                }
-
-                let response = handle_request(&request, tool_host, portal_name).await;
-                send_response(&mut writer, &response).await?;
-
-                // After tool reload, close connection to trigger Hearth reconnect → re-discover tools
-                if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {
-                    tool_host.needs_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
-                    info!("🔄 Closing connection after tools reload — Hearth will auto-reconnect");
-                    // Small delay to ensure result is flushed
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    return Ok(());
-                }
+                send_response(&mut writer, &error_resp).await?;
+                continue;
             }
-            Some(notification) = notification_rx.recv() => {
-                debug!("→ {}", notification);
-                writer.write_all(notification.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+        };
+
+        // Notifications (no id) — just ack
+        if request.id.is_none() {
+            debug!("Notification: {}", request.method);
+            continue;
+        }
+
+        let response = handle_request(&request, tool_host, portal_name).await;
+        send_response(&mut writer, &response).await?;
+
+        // After tool reload, send MCP notification instead of closing connection
+        if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {
+            tool_host.needs_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
+            info!("🔄 Sending notifications/tools/list_changed after tools reload");
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed",
+                "params": {}
+            });
+            if let Err(e) = send_notification(&mut writer, &notification).await {
+                warn!("Failed to send tools/list_changed notification: {e}, closing connection");
+                return Ok(());
             }
         }
     }
@@ -463,7 +528,7 @@ async fn handle_request(
                     },
                     "serverInfo": {
                         "name": format!("heart-portal-{}", portal_name),
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": PORTAL_VERSION
                     }
                 })),
                 error: None,
@@ -579,7 +644,7 @@ async fn run_health_server(portal_name: &str, port: u16) -> Result<()> {
             use tokio::io::AsyncReadExt;
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
-            let body = format!("{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}", name, env!("CARGO_PKG_VERSION"));
+            let body = format!("{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}", name, PORTAL_VERSION);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(), body
@@ -602,103 +667,44 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Send a JSON-RPC notification (no id, no response expected).
+async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut BufWriter<W>,
+    notification: &serde_json::Value,
+) -> Result<()> {
+    let json = serde_json::to_string(notification)?;
+    debug!("→ (notification) {}", json);
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    async fn write_request<W: AsyncWriteExt + Unpin>(
-        writer: &mut BufWriter<W>,
-        id: u64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<()> {
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        writer.write_all(req.to_string().as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-        Ok(())
+    #[test]
+    fn relay_portal_name_prefers_cli_name() {
+        let name = relay_portal_name(Some("foo".to_string()), "cotton", || "host".to_string());
+        assert_eq!(name, "foo");
     }
 
-    async fn read_json_line<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<serde_json::Value> {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        Ok(serde_json::from_str(line.trim())?)
+    #[test]
+    fn relay_portal_name_uses_non_generic_config_name() {
+        let name = relay_portal_name(None, "cotton", || "host".to_string());
+        assert_eq!(name, "cotton");
     }
 
-    #[tokio::test]
-    #[ignore = "requires exec_allowlist config — validates full handle_connection loop"]
-    async fn background_task_notification_reaches_writer() {
-        let config = PortalConfig::default();
-        let tool_host = ToolHost::new(&config);
+    #[test]
+    fn relay_portal_name_skips_generic_config_name() {
+        let name = relay_portal_name(None, "portal", || "host".to_string());
+        assert_eq!(name, "host");
+    }
 
-        let (client_stream, portal_stream) = tokio::io::duplex(65536);
-        let (read_half, write_half) = tokio::io::split(client_stream);
-
-        let host = tool_host.clone();
-        let server = tokio::spawn(async move {
-            handle_connection(portal_stream, &host, "test", None).await
-        });
-
-        let mut client_writer = BufWriter::new(write_half);
-        let mut client_reader = BufReader::new(read_half);
-
-        write_request(
-            &mut client_writer,
-            1,
-            "initialize",
-            serde_json::json!({}),
-        )
-        .await
-        .unwrap();
-        let init = read_json_line(&mut client_reader).await.unwrap();
-        assert!(init.get("result").is_some());
-
-        write_request(
-            &mut client_writer,
-            2,
-            "tools/call",
-            serde_json::json!({
-                "name": "portal_exec",
-                "arguments": {
-                    "command": "echo writer_notify_test",
-                    "background": true
-                }
-            }),
-        )
-        .await
-        .unwrap();
-        let exec_resp = read_json_line(&mut client_reader).await.unwrap();
-        assert!(exec_resp.get("result").is_some());
-
-        let notification = tokio::time::timeout(
-            Duration::from_secs(5),
-            async {
-                loop {
-                    let line = read_json_line(&mut client_reader).await.unwrap();
-                    if line.get("method").and_then(|m| m.as_str())
-                        == Some("notifications/portal/task_complete")
-                    {
-                        return line;
-                    }
-                }
-            },
-        )
-        .await
-        .expect("timed out waiting for task_complete notification");
-
-        assert_eq!(
-            notification["params"]["command"],
-            "echo writer_notify_test"
-        );
-        assert_eq!(notification["params"]["exit_code"], 0);
-
-        drop(client_writer);
-        let _ = server.await;
+    #[test]
+    fn relay_portal_name_skips_empty_config_name() {
+        let name = relay_portal_name(None, "", || "host".to_string());
+        assert_eq!(name, "host");
     }
 }

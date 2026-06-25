@@ -1,22 +1,24 @@
-//! Tool host — manages built-in + custom (being-defined) tools.
+//! Tool host — manages built-in, custom (being-defined), and kit tools.
 //! Built-in: exec, file, web. Custom: loaded from workspace/tools/mcp.toml.
 
 mod exec;
 mod file;
 mod process;
+mod screenshot;
 mod search;
 mod web;
 mod web_search;
 pub mod custom;
 
 use crate::config::PortalConfig;
+use crate::kits::{loader, manager::KitManager};
 use crate::process_manager::ProcessManager;
 use custom::CustomToolHost;
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Tool metadata for tools/list response
 #[derive(Debug, Clone)]
@@ -26,11 +28,12 @@ pub struct ToolInfo {
     pub input_schema: Value,
 }
 
-/// Hosts all available tools (built-in + custom), dispatches calls
+/// Hosts all available tools (built-in + custom + kit), dispatches calls
 #[derive(Clone)]
 pub struct ToolHost {
     config: PortalConfig,
     custom: CustomToolHost,
+    kits: KitManager,
     pub process_manager: Arc<ProcessManager>,
     /// Set to true after reload — signals connection handler to close TCP
     pub needs_reconnect: Arc<AtomicBool>,
@@ -38,9 +41,23 @@ pub struct ToolHost {
 
 impl ToolHost {
     pub fn new(config: &PortalConfig) -> Self {
+        let loaded_kits = match loader::load_kits(config) {
+            Ok(kits) => {
+                if !kits.is_empty() {
+                    info!("Loaded {} kit manifest(s)", kits.len());
+                }
+                kits
+            }
+            Err(err) => {
+                warn!("Failed to load kits: {}", err);
+                Vec::new()
+            }
+        };
+
         Self {
             config: config.clone(),
             custom: CustomToolHost::new(),
+            kits: KitManager::new(loaded_kits),
             process_manager: Arc::new(ProcessManager::new()),
             needs_reconnect: Arc::new(AtomicBool::new(false)),
         }
@@ -48,6 +65,7 @@ impl ToolHost {
 
     pub async fn kill_all_managed_processes(&self) {
         self.process_manager.kill_all().await;
+        self.kits.shutdown().await;
     }
 
     pub async fn cleanup_background_sessions(&self) {
@@ -84,6 +102,8 @@ impl ToolHost {
         let mut tools = self.list_builtin_tools();
         let custom = self.custom.list_tools().await;
         tools.extend(custom);
+        let kit_tools = self.kits.list_tools().await;
+        tools.extend(kit_tools);
         tools
     }
 
@@ -232,6 +252,30 @@ impl ToolHost {
             });
         }
 
+        if self.config.tools.screenshot {
+            tools.push(ToolInfo {
+                name: "portal_screenshot".to_string(),
+                description: "Capture a screenshot of the screen or a specific window/region".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Output file path (relative to workspace). Defaults to '.screenshots/capture-<timestamp>.png'"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Capture region: 'full' (entire screen), 'window' (frontmost window), or 'x,y,w,h' (rectangle). Default: 'full'"
+                        },
+                        "display": {
+                            "type": "integer",
+                            "description": "Display number for multi-monitor (0-indexed). Default: main display"
+                        }
+                    }
+                }),
+            });
+        }
+
         if self.config.tools.search {
             tools.push(ToolInfo {
                 name: "portal_search".to_string(),
@@ -278,6 +322,13 @@ impl ToolHost {
             return self.custom.call(tool_name, arguments).await;
         }
 
+        if let Some((kit_name, real_tool_name)) = self.kits.resolve_tool(tool_name).await {
+            return self
+                .kits
+                .call_tool(&kit_name, &real_tool_name, arguments)
+                .await;
+        }
+
         // Built-in tools
         match tool_name {
             "portal_exec" => {
@@ -295,6 +346,12 @@ impl ToolHost {
             "portal_file_read" => file::read(&self.config, arguments).await,
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
+            "portal_screenshot" => {
+                if !self.config.tools.screenshot {
+                    anyhow::bail!("portal_screenshot is disabled in configuration");
+                }
+                screenshot::capture(&self.config, arguments).await
+            }
             "portal_search" => search::search(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
             "portal_web_search" => web_search::search(arguments).await,
