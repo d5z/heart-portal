@@ -115,8 +115,8 @@ fn image_mime_type(ext: &str) -> Option<&'static str> {
     }
 }
 
-/// Max image file size for base64 encoding (4MB).
-const MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+/// Max image file size for base64 encoding (10MB — screenshots can be 4-6MB).
+const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
 
 pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     let path_str = arguments.get("path")
