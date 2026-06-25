@@ -602,6 +602,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-extra",
+ "base64",
  "bytes",
  "futures-util",
  "heart-mcp",
