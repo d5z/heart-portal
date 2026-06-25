@@ -246,10 +246,7 @@ impl ProcessManager {
         let status = Arc::new(AsyncMutex::new(ProcessStatus::Running));
         let notify = Arc::new(Notify::new());
 
-        #[cfg(unix)]
         let mut cmd = Command::new("sh");
-        #[cfg(windows)]
-        let mut cmd = Command::new("cmd");
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -512,18 +509,10 @@ impl ProcessManager {
                 }
             }
         }
-        #[cfg(windows)]
-        {
-            // Use taskkill for Windows process termination
-            let _ = tokio::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .output()
-                .await;
-        }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
             let _ = pid;
-            anyhow::bail!("kill is not supported on this platform");
+            anyhow::bail!("kill is only supported on Unix");
         }
 
         Ok(())

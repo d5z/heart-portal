@@ -1,6 +1,6 @@
 [package]
 name = "heart-portal"
-version = "0.1.0"
+version = "0.6.1"
 edition = "2021"
 description = "Portal — Being's gateway to the world. Lightweight MCP server with built-in tools."
 
@@ -9,7 +9,6 @@ name = "heart-portal"
 path = "src/main.rs"
 
 [dependencies]
-heart-mcp = { path = "../heart-mcp" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,6 +29,8 @@ scraper = "0.22"
 walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22.1"
+hostname = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -108,7 +108,7 @@ fn grep_workspace(
             Err(_) => continue,
         };
 
-        if bytes.iter().any(|&b| b == 0) {
+        if bytes.contains(&0) {
             continue;
         }
 
