@@ -29,6 +29,7 @@ regex = "1"
 scraper = "0.22"
 walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
+base64 = "0.22.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

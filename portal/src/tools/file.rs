@@ -117,6 +117,21 @@ fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> 
     Ok(cur)
 }
 
+/// Image extensions → MIME type mapping.
+fn image_mime_type(ext: &str) -> Option<&'static str> {
+    match ext.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Max image file size for base64 encoding (4MB).
+const MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+
 pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     let path_str = arguments.get("path")
         .and_then(|v| v.as_str())
@@ -125,6 +140,38 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     let path = resolve_existing_path(config, path_str)?;
     debug!("file_read: {}", path.display());
 
+    // Check if this is an image file
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if let Some(mime) = image_mime_type(ext) {
+        // Binary read + base64 for images
+        let bytes = tokio::fs::read(&path).await
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+
+        if bytes.len() > MAX_IMAGE_SIZE {
+            anyhow::bail!("Image too large: {} bytes (max: {})", bytes.len(), MAX_IMAGE_SIZE);
+        }
+
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        // SVG files are text — return as text, not image
+        if mime == "image/svg+xml" {
+            let text = String::from_utf8_lossy(&bytes);
+            return Ok(serde_json::json!({
+                "content": [{ "type": "text", "text": text }]
+            }));
+        }
+
+        debug!("file_read: returning image ({}, {} bytes)", mime, bytes.len());
+        return Ok(serde_json::json!({
+            "content": [
+                { "type": "text", "text": format!("[Image: {} ({} bytes)]", path.display(), bytes.len()) },
+                { "type": "image", "data": b64, "mimeType": mime }
+            ]
+        }));
+    }
+
+    // Text file path
     let content = tokio::fs::read_to_string(&path).await
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
 
