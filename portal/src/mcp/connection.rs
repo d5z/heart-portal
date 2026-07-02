@@ -396,7 +396,33 @@ async fn terminate_child(child: &mut Child, server_name: &str) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+async fn terminate_child(child: &mut Child, server_name: &str) {
+    if let Some(pid) = child.id() {
+        match tokio::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                debug!("Sent taskkill to MCP server '{}'", server_name);
+                return;
+            }
+            Ok(status) => warn!(
+                "taskkill for MCP server '{}' exited with status: {}",
+                server_name, status
+            ),
+            Err(e) => warn!("Failed to run taskkill for MCP server '{}': {}", server_name, e),
+        }
+    }
+
+    match child.kill().await {
+        Ok(_) => debug!("MCP server '{}' process killed", server_name),
+        Err(e) => warn!("Failed to kill MCP server '{}' process: {}", server_name, e),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn terminate_child(child: &mut Child, server_name: &str) {
     match child.kill().await {
         Ok(_) => debug!("MCP server '{}' process killed", server_name),

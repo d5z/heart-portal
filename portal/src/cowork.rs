@@ -100,21 +100,37 @@ fn safe_path(workspace: &Path, rel: &str) -> Result<PathBuf, StatusCode> {
     let joined = workspace.join(rel);
     // For non-existent paths, check parent
     let check = if joined.exists() {
-        joined.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?
+        strip_unc_prefix(joined.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?)
     } else {
         let parent = joined.parent().ok_or(StatusCode::BAD_REQUEST)?;
         if !parent.exists() {
             return Err(StatusCode::NOT_FOUND);
         }
-        let canon_parent = parent.canonicalize().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let canon_parent = strip_unc_prefix(
+            parent
+                .canonicalize()
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        );
         canon_parent.join(joined.file_name().ok_or(StatusCode::BAD_REQUEST)?)
     };
-    let ws_canon = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let ws_canon = strip_unc_prefix(
+        workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf()),
+    );
     if check.starts_with(&ws_canon) {
         Ok(check)
     } else {
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+fn strip_unc_prefix(p: PathBuf) -> PathBuf {
+    let stripped = p
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from);
+    stripped.unwrap_or(p)
 }
 
 // --- Router ---
@@ -521,7 +537,7 @@ mod tests {
         let ws = temp_workspace();
         std::fs::create_dir_all(ws.join("a")).unwrap();
         let p = safe_path(&ws, "a/new.txt").expect("new path under existing parent");
-        let expected = ws.join("a").canonicalize().unwrap().join("new.txt");
+        let expected = strip_unc_prefix(ws.join("a").canonicalize().unwrap()).join("new.txt");
         assert_eq!(p, expected);
     }
 
@@ -561,6 +577,18 @@ mod tests {
         std::fs::write(ws.join("f.txt"), b"x").unwrap();
         let entries = list_dir_recursive(&ws.join("f.txt"), &ws, 1).expect("list file");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn strip_unc_prefix_removes_windows_canonical_prefix() {
+        assert_eq!(
+            strip_unc_prefix(PathBuf::from(r"\\?\C:\Users\being\heart")),
+            PathBuf::from(r"C:\Users\being\heart")
+        );
+        assert_eq!(
+            strip_unc_prefix(PathBuf::from(r"C:\Users\being\heart")),
+            PathBuf::from(r"C:\Users\being\heart")
+        );
     }
 
     #[test]

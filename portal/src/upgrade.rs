@@ -20,8 +20,15 @@ pub struct Platform {
 pub fn detect_platform() -> Result<Platform> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
+    let slug = platform_slug(os, arch)?;
 
-    let slug = match os {
+    Ok(Platform {
+        slug: slug.to_string(),
+    })
+}
+
+fn platform_slug(os: &str, arch: &str) -> Result<&'static str> {
+    Ok(match os {
         "macos" => match arch {
             "aarch64" => "macos-arm64",
             "x86_64" => "macos-x86_64",
@@ -32,11 +39,12 @@ pub fn detect_platform() -> Result<Platform> {
             "aarch64" => "linux-arm64",
             other => bail!("Unsupported Linux architecture: {}", other),
         },
-        other => bail!("Unsupported OS: {} (try WSL on Windows)", other),
-    };
-
-    Ok(Platform {
-        slug: slug.to_string(),
+        "windows" => match arch {
+            "x86_64" => "windows-x86_64",
+            "aarch64" => "windows-aarch64",
+            other => bail!("Unsupported Windows architecture: {}", other),
+        },
+        other => bail!("Unsupported OS: {}", other),
     })
 }
 
@@ -81,17 +89,36 @@ fn install_dir() -> Result<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 fn binary_path(install_dir: &Path) -> PathBuf {
-    install_dir.join("heart-portal")
+    #[cfg(windows)]
+    {
+        install_dir.join("heart-portal.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        install_dir.join("heart-portal")
+    }
+}
+
+fn asset_name(platform: &Platform) -> String {
+    let suffix = if platform.slug.starts_with("windows-") {
+        ".exe"
+    } else {
+        ""
+    };
+    format!("heart-portal-{}{}", platform.slug, suffix)
 }
 
 fn latest_download_url(platform: &Platform) -> String {
     format!(
-        "https://github.com/{}/releases/latest/download/heart-portal-{}",
-        REPO, platform.slug
+        "https://github.com/{}/releases/latest/download/{}",
+        REPO,
+        asset_name(platform)
     )
 }
 
@@ -127,23 +154,48 @@ fn backup_stamp() -> String {
 }
 
 fn stop_running_portal(install_dir: &Path) {
-    let stop_sh = install_dir.join("stop.sh");
-    if stop_sh.is_file() {
-        let _ = std::process::Command::new("sh")
-            .arg(&stop_sh)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        return;
-    }
-
     #[cfg(unix)]
     {
+        let stop_sh = install_dir.join("stop.sh");
+        if stop_sh.is_file() {
+            let _ = std::process::Command::new("sh")
+                .arg(&stop_sh)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            return;
+        }
+
         let _ = std::process::Command::new("pkill")
             .args(["-f", "heart-portal"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+    #[cfg(windows)]
+    {
+        for script in ["stop.bat", "stop.cmd"] {
+            let stop_script = install_dir.join(script);
+            if stop_script.is_file() {
+                let _ = std::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg(&stop_script)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                return;
+            }
+        }
+
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "heart-portal.exe"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = install_dir;
     }
 }
 
@@ -158,22 +210,61 @@ fn unlock_gatekeeper(path: &Path) {
 fn unlock_gatekeeper(_path: &Path) {}
 
 fn restart_portal(install_dir: &Path) -> Result<()> {
-    let start_sh = install_dir.join("start.sh");
-    if !start_sh.is_file() {
-        info!("No start.sh found — binary updated; start Portal manually when ready");
-        return Ok(());
-    }
+    #[cfg(unix)]
+    {
+        let start_sh = install_dir.join("start.sh");
+        if !start_sh.is_file() {
+            info!("No start.sh found — binary updated; start Portal manually when ready");
+            return Ok(());
+        }
 
-    eprintln!("Restarting Portal...");
-    std::process::Command::new("sh")
-        .arg(&start_sh)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Failed to restart Portal via start.sh")?;
-    eprintln!("Portal restarted.");
-    Ok(())
+        eprintln!("Restarting Portal...");
+        std::process::Command::new("sh")
+            .arg(&start_sh)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to restart Portal via start.sh")?;
+        eprintln!("Portal restarted.");
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let mut start_target = None;
+        for script in ["start.bat", "start.cmd"] {
+            let start_script = install_dir.join(script);
+            if start_script.is_file() {
+                start_target = Some(start_script);
+                break;
+            }
+        }
+        let start_target = start_target.unwrap_or_else(|| binary_path(install_dir));
+        if !start_target.is_file() {
+            info!("No Windows start script or binary found — start Portal manually when ready");
+            return Ok(());
+        }
+
+        eprintln!("Restarting Portal...");
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(&start_target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to restart Portal via cmd /C start")?;
+        eprintln!("Portal restarted.");
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = install_dir;
+        info!("Automatic restart is not supported on this platform");
+        Ok(())
+    }
 }
 
 pub async fn run_upgrade() -> Result<()> {
@@ -207,7 +298,7 @@ pub async fn run_upgrade() -> Result<()> {
         }
     }
 
-    eprintln!("Downloading heart-portal-{}...", platform.slug);
+    eprintln!("Downloading {}...", asset_name(&platform));
     let download_url = latest_download_url(&platform);
     let bytes = client
         .get(&download_url)
@@ -286,6 +377,26 @@ mod tests {
     fn detect_platform_returns_slug_on_supported_host() {
         let platform = detect_platform().expect("host platform should be supported in tests");
         assert!(!platform.slug.is_empty());
-        assert!(platform.slug.starts_with("macos-") || platform.slug.starts_with("linux-"));
+        assert!(
+            platform.slug.starts_with("macos-")
+                || platform.slug.starts_with("linux-")
+                || platform.slug.starts_with("windows-")
+        );
+    }
+
+    #[test]
+    fn platform_slug_supports_windows() {
+        assert_eq!(platform_slug("windows", "x86_64").unwrap(), "windows-x86_64");
+        assert_eq!(platform_slug("windows", "aarch64").unwrap(), "windows-aarch64");
+        assert!(platform_slug("windows", "i686").is_err());
+    }
+
+    #[test]
+    fn windows_asset_name_uses_exe_suffix() {
+        let platform = Platform {
+            slug: "windows-x86_64".to_string(),
+        };
+        assert_eq!(asset_name(&platform), "heart-portal-windows-x86_64.exe");
+        assert!(latest_download_url(&platform).ends_with("heart-portal-windows-x86_64.exe"));
     }
 }
