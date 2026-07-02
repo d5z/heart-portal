@@ -1,7 +1,7 @@
 //! Exec tool — run shell commands.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, validate_exec_allowlist};
+use crate::exec_policy::{configure_shell_command, shell_program, validate_exec_allowlist};
 use crate::process_manager::ProcessManager;
 use anyhow::Result;
 use serde_json::Value;
@@ -66,7 +66,7 @@ pub async fn execute(
         command, workdir, timeout_secs
     );
 
-    let mut cmd = Command::new("sh");
+    let mut cmd = Command::new(shell_program());
     configure_shell_command(&mut cmd, command, config, &workdir);
 
     let output = tokio::time::timeout(

@@ -1,8 +1,38 @@
-//! Shared shell exec policy: allowlist validation and environment for `sh -c`.
+//! Shared shell exec policy: allowlist validation and environment for shell execution.
 
 use crate::config::PortalConfig;
 use anyhow::Result;
 use tokio::process::Command;
+
+#[cfg(unix)]
+pub(crate) fn shell_program() -> &'static str {
+    "sh"
+}
+
+#[cfg(windows)]
+pub(crate) fn shell_program() -> &'static str {
+    "cmd"
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn shell_program() -> &'static str {
+    "sh"
+}
+
+#[cfg(unix)]
+fn shell_arg_flag() -> &'static str {
+    "-c"
+}
+
+#[cfg(windows)]
+fn shell_arg_flag() -> &'static str {
+    "/C"
+}
+
+#[cfg(not(any(unix, windows)))]
+fn shell_arg_flag() -> &'static str {
+    "-c"
+}
 
 /// Shell metacharacters that can chain or subshell commands (beyond a single argv[0]).
 fn has_subshell_or_backtick(command: &str) -> bool {
@@ -55,14 +85,14 @@ pub(crate) fn validate_exec_allowlist(command: &str, allowlist: &[String]) -> Re
     Ok(())
 }
 
-/// Configure `sh -c` the same way for sync exec and background spawn (HOME, PATH, etc.).
+/// Configure shell execution the same way for sync exec and background spawn (HOME, PATH, etc.).
 pub(crate) fn configure_shell_command(
     cmd: &mut Command,
     command: &str,
     config: &PortalConfig,
     workdir: &str,
 ) {
-    cmd.arg("-c").arg(command).current_dir(workdir);
+    cmd.arg(shell_arg_flag()).arg(command).current_dir(workdir);
 
     if std::env::var_os("HOME").is_none() {
         let home = std::env::var("HOME").ok().unwrap_or_else(|| {
@@ -77,6 +107,12 @@ pub(crate) fn configure_shell_command(
                     }
                 }
             }
+            #[cfg(windows)]
+            {
+                if let Ok(profile) = std::env::var("USERPROFILE") {
+                    return profile;
+                }
+            }
             config.security.workspace_root.to_string_lossy().into_owned()
         });
         cmd.env("HOME", home);
@@ -89,9 +125,16 @@ pub(crate) fn configure_shell_command(
         };
         cmd.env("USER", user);
     }
+    #[cfg(windows)]
+    let default_path = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0";
+    #[cfg(not(windows))]
     let default_path = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    #[cfg(windows)]
+    let separator = ";";
+    #[cfg(not(windows))]
+    let separator = ":";
     let path = std::env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", format!("{}:{}", default_path, path));
+    cmd.env("PATH", format!("{}{}{}", default_path, separator, path));
     if let Ok(tz) = std::env::var("TZ") {
         cmd.env("TZ", tz);
     }
@@ -133,5 +176,24 @@ mod tests {
             err.to_string()
                 .contains("Command contains shell metacharacters with non-allowlisted commands")
         );
+    }
+
+    #[test]
+    fn shell_program_matches_target() {
+        #[cfg(unix)]
+        {
+            assert_eq!(shell_program(), "sh");
+            assert_eq!(shell_arg_flag(), "-c");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(shell_program(), "cmd");
+            assert_eq!(shell_arg_flag(), "/C");
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            assert_eq!(shell_program(), "sh");
+            assert_eq!(shell_arg_flag(), "-c");
+        }
     }
 }

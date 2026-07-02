@@ -183,7 +183,11 @@ fn home_dir() -> Option<PathBuf> {
                 }
                 None
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                None
+            }
+            #[cfg(not(any(unix, windows)))]
             {
                 None
             }

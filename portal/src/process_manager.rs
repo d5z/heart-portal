@@ -1,7 +1,7 @@
 //! Background process manager for portal_exec (background) + portal_process tools.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, validate_exec_allowlist};
+use crate::exec_policy::{configure_shell_command, shell_program, validate_exec_allowlist};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -246,7 +246,7 @@ impl ProcessManager {
         let status = Arc::new(AsyncMutex::new(ProcessStatus::Running));
         let notify = Arc::new(Notify::new());
 
-        let mut cmd = Command::new("sh");
+        let mut cmd = Command::new(shell_program());
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -509,10 +509,32 @@ impl ProcessManager {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string()])
+                .status()
+                .await;
+            time::sleep(KILL_GRACE).await;
+            let still_running = {
+                let guard = self.sessions.lock().await;
+                if let Some(s) = guard.get(session_id) {
+                    matches!(*s.status.lock().await, ProcessStatus::Running)
+                } else {
+                    false
+                }
+            };
+            if still_running {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .status()
+                    .await;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = pid;
-            anyhow::bail!("kill is only supported on Unix");
+            anyhow::bail!("kill is not supported on this platform");
         }
 
         Ok(())

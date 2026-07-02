@@ -337,13 +337,29 @@ async fn wait_sigterm() {
         Ok(mut s) => {
             s.recv().await;
         }
-        Err(_) => std::future::pending::<()>().await,
+        Err(e) => {
+            warn!("Failed to install SIGTERM handler: {}; falling back to Ctrl+C", e);
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 async fn wait_sigterm() {
-    std::future::pending::<()>().await
+    match tokio::signal::windows::ctrl_break() {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(e) => {
+            warn!("Failed to install CTRL_BREAK handler: {}; falling back to Ctrl+C", e);
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn wait_sigterm() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Handle a single MCP client connection (JSON-RPC over newline-delimited TCP)

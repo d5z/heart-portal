@@ -251,9 +251,71 @@ async fn run_linux_scrot(path: &Path, region: &CaptureRegion) -> Result<()> {
     run_command("scrot", command).await
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-async fn run_capture(_path: &Path, _region: &CaptureRegion, _display_idx: Option<u64>) -> Result<()> {
-    anyhow::bail!("portal_screenshot is only supported on macOS and Linux");
+#[cfg(target_os = "windows")]
+async fn run_capture(path: &Path, region: &CaptureRegion, display_idx: Option<u64>) -> Result<()> {
+    if display_idx.is_some() {
+        anyhow::bail!(
+            "display selection is not supported by portal_screenshot on Windows; omit 'display'"
+        );
+    }
+
+    let script = powershell_capture_script(path, region);
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    run_command("powershell", command).await.map_err(|e| {
+        if e.to_string().contains("not found") {
+            anyhow::anyhow!("powershell not found; portal_screenshot on Windows requires PowerShell")
+        } else {
+            e
+        }
+    })
+}
+
+fn powershell_capture_script(path: &Path, region: &CaptureRegion) -> String {
+    let path = powershell_single_quoted(&path.to_string_lossy());
+    match region {
+        CaptureRegion::Full => format!(
+            "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
+             $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; \
+             $bitmap = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height); \
+             $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+             $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size); \
+             $bitmap.Save({}, [System.Drawing.Imaging.ImageFormat]::Png); \
+             $graphics.Dispose(); $bitmap.Dispose()",
+            path
+        ),
+        CaptureRegion::Rect {
+            x,
+            y,
+            width,
+            height,
+        } => format!(
+            "Add-Type -AssemblyName System.Drawing; \
+             $bitmap = New-Object System.Drawing.Bitmap({w}, {h}); \
+             $graphics = [System.Drawing.Graphics]::FromImage($bitmap); \
+             $graphics.CopyFromScreen({x}, {y}, 0, 0, (New-Object System.Drawing.Size({w}, {h}))); \
+             $bitmap.Save({path}, [System.Drawing.Imaging.ImageFormat]::Png); \
+             $graphics.Dispose(); $bitmap.Dispose()",
+            w = width,
+            h = height,
+            x = x,
+            y = y,
+            path = path
+        ),
+    }
+}
+
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn run_capture(
+    _path: &Path,
+    _region: &CaptureRegion,
+    _display_idx: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("portal_screenshot is only supported on macOS, Linux, and Windows");
 }
 
 async fn run_command(name: &str, mut command: Command) -> Result<()> {
@@ -384,5 +446,29 @@ mod tests {
         bytes[16..20].copy_from_slice(&640u32.to_be_bytes());
         bytes[20..24].copy_from_slice(&480u32.to_be_bytes());
         assert_eq!(parse_png_dimensions(&bytes), Some((640, 480)));
+    }
+
+    #[test]
+    fn powershell_quotes_paths() {
+        assert_eq!(
+            powershell_single_quoted(r"C:\Users\Being's\shot.png"),
+            r"'C:\Users\Being''s\shot.png'"
+        );
+    }
+
+    #[test]
+    fn windows_rect_script_contains_region_and_png_save() {
+        let script = powershell_capture_script(
+            Path::new(r"C:\tmp\shot.png"),
+            &CaptureRegion::Rect {
+                x: 10,
+                y: 20,
+                width: 300,
+                height: 400,
+            },
+        );
+        assert!(script.contains("CopyFromScreen(10, 20, 0, 0"));
+        assert!(script.contains("System.Drawing.Size(300, 400)"));
+        assert!(script.contains("[System.Drawing.Imaging.ImageFormat]::Png"));
     }
 }
