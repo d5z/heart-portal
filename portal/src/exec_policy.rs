@@ -92,7 +92,18 @@ pub(crate) fn configure_shell_command(
     config: &PortalConfig,
     workdir: &str,
 ) {
-    cmd.arg(shell_arg_flag()).arg(command).current_dir(workdir);
+    // On Windows, Command::arg() auto-quotes arguments containing spaces/pipes,
+    // which breaks cmd.exe metacharacter processing (|, &, &&, etc.).
+    // Use raw_arg to pass the command string unquoted so cmd /C sees it verbatim.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg("/C").raw_arg(command).current_dir(workdir);
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.arg(shell_arg_flag()).arg(command).current_dir(workdir);
+    }
 
     if std::env::var_os("HOME").is_none() {
         let home = std::env::var("HOME").ok().unwrap_or_else(|| {
@@ -137,6 +148,14 @@ pub(crate) fn configure_shell_command(
     cmd.env("PATH", format!("{}{}{}", default_path, separator, path));
     if let Ok(tz) = std::env::var("TZ") {
         cmd.env("TZ", tz);
+    }
+    // Windows: ensure UTF-8 output from Python and other tools
+    #[cfg(windows)]
+    {
+        cmd.env("PYTHONIOENCODING", "utf-8");
+        cmd.env("PYTHONUTF8", "1");
+        // Force .NET/PowerShell to use UTF-8
+        cmd.env("DOTNET_CLI_UI_LANGUAGE", "en");
     }
 }
 
