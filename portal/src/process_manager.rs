@@ -23,7 +23,7 @@ pub const MAX_STDIN_WRITE_BYTES: usize = 256 * 1024;
 /// Session ids are `sess_` + UUID; reject oversized / odd keys.
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 
-const NOTIFICATION_OUTPUT_MAX_BYTES: usize = 500;
+const NOTIFICATION_OUTPUT_MAX_BYTES: usize = 16_384;
 
 pub struct ProcessManager {
     sessions: Arc<AsyncMutex<HashMap<String, ManagedProcess>>>,
@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_output_truncated_at_500_bytes() {
+    async fn notification_output_truncated_at_16k() {
         use crate::config::PortalConfig;
 
         let pm = ProcessManager::new();
@@ -687,7 +687,8 @@ mod tests {
         pm.set_notification_sender(tx);
 
         let config = PortalConfig::default();
-        pm.spawn(&config, "python3 -c \"print('x' * 600)\"", ".", &[])
+        // Output 20K chars — should be truncated to 16384
+        pm.spawn(&config, "python3 -c \"print('x' * 20000)\"", ".", &[])
             .await
             .unwrap();
 
@@ -698,6 +699,6 @@ mod tests {
 
         let v: serde_json::Value = serde_json::from_str(&notification).unwrap();
         let output = v["params"]["output"].as_str().unwrap();
-        assert!(output.len() <= 500);
+        assert!(output.len() <= 16_384);
     }
 }
