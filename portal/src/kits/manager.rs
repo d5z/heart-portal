@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::mcp::{McpConnection, McpServerConfig};
 use crate::tools::ToolInfo;
 
-use super::loader::LoadedKit;
+use super::loader::{format_command, LoadedKit};
 
 const MAX_FAILURES: u8 = 3;
+const SPAWN_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone)]
 pub struct KitManager {
@@ -62,13 +65,21 @@ impl KitManager {
         let mut tools = Vec::new();
 
         for state in kits.values() {
-            for tool in &state.kit.manifest.tools {
-                tools.push(ToolInfo {
-                    name: format!("{}_{}", state.kit.manifest.name, tool.name),
-                    description: tool.description.clone(),
-                    input_schema: tool.params.clone(),
-                });
+            push_kit_tools(state, &mut tools);
+        }
+
+        tools
+    }
+
+    pub async fn list_healthy_tools(&self) -> Vec<ToolInfo> {
+        let kits = self.kits.lock().await;
+        let mut tools = Vec::new();
+
+        for state in kits.values() {
+            if state.unhealthy {
+                continue;
             }
+            push_kit_tools(state, &mut tools);
         }
 
         tools
@@ -160,7 +171,11 @@ impl KitManager {
 
 async fn ensure_connection(state: &mut KitState) -> Result<()> {
     if state.unhealthy {
-        anyhow::bail!("Kit '{}' is unhealthy", state.kit.manifest.name);
+        anyhow::bail!(
+            "Kit '{}' is unhealthy. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+            state.kit.manifest.name,
+            format_command(&state.kit.command)
+        );
     }
 
     if state
@@ -177,34 +192,71 @@ async fn ensure_connection(state: &mut KitState) -> Result<()> {
     if state.failure_count >= MAX_FAILURES {
         state.unhealthy = true;
         anyhow::bail!(
-            "Kit '{}' is unhealthy after {} failed restart attempts",
+            "Kit '{}' is unhealthy after {} failed restart attempts. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
             state.kit.manifest.name,
-            state.failure_count
+            state.failure_count,
+            format_command(&state.kit.command)
         );
     }
 
+    let kit_name = state.kit.manifest.name.clone();
+    let command = state.kit.command.clone();
+    let command_text = format_command(&command);
+
     info!(
-        "Spawning kit '{}' with command: {:?}",
-        state.kit.manifest.name, state.kit.command
+        "Spawning kit '{}' with command: {}",
+        kit_name, command_text
     );
 
     let config = McpServerConfig {
-        name: state.kit.manifest.name.clone(),
-        command: state.kit.command.clone(),
+        name: kit_name.clone(),
+        command,
         env: kit_env(state),
         cwd: Some(state.kit.kit_dir.clone()),
     };
 
-    match McpConnection::spawn(config).await {
-        Ok(connection) => {
-            debug!("Kit '{}' spawned", state.kit.manifest.name);
+    match timeout(
+        Duration::from_secs(SPAWN_TIMEOUT_SECS),
+        McpConnection::spawn(config),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => {
+            debug!("Kit '{}' spawned", kit_name);
             state.connection = Some(connection);
             Ok(())
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             record_failure(state);
-            Err(err).with_context(|| format!("Failed to spawn kit '{}'", state.kit.manifest.name))
+            let message = format!(
+                "Kit '{}' failed to start: {}. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+                kit_name, err, command_text
+            );
+            warn!("{}", message);
+            Err(anyhow::anyhow!("{}", message))
         }
+        Err(_) => {
+            record_failure(state);
+            state.unhealthy = true;
+            let message = format!(
+                "Kit '{}' failed to start: timed out after {} seconds. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
+                kit_name,
+                SPAWN_TIMEOUT_SECS,
+                command_text
+            );
+            warn!("{}", message);
+            Err(anyhow::anyhow!("{}", message))
+        }
+    }
+}
+
+fn push_kit_tools(state: &KitState, tools: &mut Vec<ToolInfo>) {
+    for tool in &state.kit.manifest.tools {
+        tools.push(ToolInfo {
+            name: format!("{}_{}", state.kit.manifest.name, tool.name),
+            description: tool.description.clone(),
+            input_schema: tool.params.clone(),
+        });
     }
 }
 
@@ -252,8 +304,54 @@ fn status_text(state: &KitState) -> &'static str {
         .map(|connection| connection.is_alive())
         .unwrap_or(false)
     {
-        "running"
+        "healthy"
     } else {
-        "not running"
+        "not-started"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kits::manifest::{KitManifest, KitToolDef};
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn list_healthy_tools_skips_unhealthy_kits() {
+        let manager = KitManager::new(vec![loaded_kit("healthy"), loaded_kit("broken")]);
+        {
+            let mut kits = manager.kits.lock().await;
+            kits.get_mut("broken").unwrap().unhealthy = true;
+        }
+
+        let all_tools = manager.list_tools().await;
+        let healthy_tools = manager.list_healthy_tools().await;
+
+        assert_eq!(all_tools.len(), 2);
+        assert_eq!(healthy_tools.len(), 1);
+        assert_eq!(healthy_tools[0].name, "healthy_ping");
+    }
+
+    fn loaded_kit(name: &str) -> LoadedKit {
+        LoadedKit {
+            manifest: KitManifest {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: None,
+                author: None,
+                platform: None,
+                runtime: None,
+                command: vec!["definitely-missing-kit-binary".to_string()],
+                tools: vec![KitToolDef {
+                    name: "ping".to_string(),
+                    description: "Ping".to_string(),
+                    params: serde_json::json!({"type": "object"}),
+                }],
+                permissions: None,
+                workspace: None,
+            },
+            kit_dir: PathBuf::from("/tmp"),
+            command: vec!["definitely-missing-kit-binary".to_string()],
+        }
     }
 }

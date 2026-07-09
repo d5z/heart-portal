@@ -78,12 +78,10 @@ fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKi
         return Ok(None);
     }
 
-    if manifest.command.is_empty() {
-        warn!("Skipping kit '{}' because command is empty", manifest.name);
-        return Ok(None);
-    }
-
     let command = resolve_command(kit_dir, &manifest.command);
+    for warning in manifest_validation_warnings(&manifest, &command) {
+        warn!("{}", warning);
+    }
 
     Ok(Some(LoadedKit {
         manifest,
@@ -125,6 +123,10 @@ pub fn current_platform() -> &'static str {
 
 fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
     let mut resolved = command.to_vec();
+    if resolved.is_empty() {
+        return resolved;
+    }
+
     let first = Path::new(&resolved[0]);
 
     if first.is_absolute() {
@@ -138,6 +140,83 @@ fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
     }
 
     resolved
+}
+
+pub(crate) fn manifest_validation_warnings(
+    manifest: &KitManifest,
+    command: &[String],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let kit = kit_label(&manifest.name);
+
+    if !is_valid_kit_name(&manifest.name) {
+        warnings.push(format!(
+            "kit {} has invalid name; expected non-empty ASCII alphanumeric characters and hyphens only",
+            kit
+        ));
+    }
+
+    if command.is_empty() {
+        warnings.push(format!("kit {} command is empty", kit));
+    } else if !command_binary_exists(command) {
+        warnings.push(format!(
+            "kit {} command binary not found: {}",
+            kit, command[0]
+        ));
+    }
+
+    if manifest.tools.is_empty() {
+        warnings.push(format!("kit {} has no tools defined", kit));
+    }
+
+    warnings
+}
+
+pub(crate) fn is_valid_kit_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+pub(crate) fn command_binary_exists(command: &[String]) -> bool {
+    let Some(binary) = command.first().filter(|binary| !binary.trim().is_empty()) else {
+        return false;
+    };
+
+    binary_exists(binary)
+}
+
+pub(crate) fn format_command(command: &[String]) -> String {
+    if command.is_empty() {
+        "<empty>".to_string()
+    } else {
+        command.join(" ")
+    }
+}
+
+fn binary_exists(binary: &str) -> bool {
+    let path = Path::new(binary);
+    if path.is_absolute() || binary.contains('/') || binary.contains('\\') {
+        return path.exists();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(binary);
+                candidate.exists()
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn kit_label(name: &str) -> String {
+    if name.is_empty() {
+        "'<unnamed>'".to_string()
+    } else {
+        format!("'{}'", name)
+    }
 }
 
 pub fn kits_dir(config: &PortalConfig) -> PathBuf {
@@ -197,6 +276,7 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kits::manifest::KitToolDef;
 
     #[test]
     fn filters_unsupported_platforms() {
@@ -225,5 +305,64 @@ mod tests {
 
         assert_eq!(command[0], "/tmp/heart-kit/bin/server");
         assert_eq!(command[1], "--stdio");
+    }
+
+    #[test]
+    fn manifest_validation_reports_warning_conditions() {
+        let manifest = KitManifest {
+            name: "".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            platform: None,
+            runtime: None,
+            command: vec![],
+            tools: vec![],
+            permissions: None,
+            workspace: None,
+        };
+
+        let warnings = manifest_validation_warnings(&manifest, &[]);
+
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().any(|warning| warning.contains("invalid name")));
+        assert!(warnings.iter().any(|warning| warning.contains("command is empty")));
+        assert!(warnings.iter().any(|warning| warning.contains("no tools defined")));
+    }
+
+    #[test]
+    fn manifest_validation_warns_when_command_binary_is_missing() {
+        let manifest = KitManifest {
+            name: "missing-command".to_string(),
+            version: "0.1.0".to_string(),
+            description: None,
+            author: None,
+            platform: None,
+            runtime: None,
+            command: vec!["/definitely/missing/portal-kit-binary".to_string()],
+            tools: vec![KitToolDef {
+                name: "ping".to_string(),
+                description: "Ping".to_string(),
+                params: serde_json::json!({"type": "object"}),
+            }],
+            permissions: None,
+            workspace: None,
+        };
+
+        let warnings = manifest_validation_warnings(&manifest, &manifest.command);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("command binary not found"));
+    }
+
+    #[test]
+    fn validates_kit_names() {
+        assert!(is_valid_kit_name("echo-test"));
+        assert!(is_valid_kit_name("kit123"));
+        assert!(is_valid_kit_name("abc-123"));
+        assert!(!is_valid_kit_name(""));
+        assert!(!is_valid_kit_name("echo_test"));
+        assert!(!is_valid_kit_name("echo test"));
+        assert!(!is_valid_kit_name("écho"));
     }
 }
