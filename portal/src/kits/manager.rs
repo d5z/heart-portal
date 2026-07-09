@@ -44,13 +44,23 @@ impl KitManager {
             if states.contains_key(&name) {
                 warn!("Duplicate kit name '{}'; keeping the last manifest loaded", name);
             }
+            // Pre-mark unhealthy if command binary is missing or empty
+            let pre_unhealthy = kit.command.is_empty()
+                || (!kit.command[0].is_empty() && !command_binary_exists(&kit.command[0]));
+            if pre_unhealthy {
+                warn!(
+                    "Kit '{}' pre-marked unhealthy: command binary not found: {}",
+                    name,
+                    kit.command.first().map(|s| s.as_str()).unwrap_or("<empty>")
+                );
+            }
             states.insert(
                 name,
                 KitState {
                     kit,
                     connection: None,
                     failure_count: 0,
-                    unhealthy: false,
+                    unhealthy: pre_unhealthy,
                 },
             );
         }
@@ -318,11 +328,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_healthy_tools_skips_unhealthy_kits() {
+        // "broken" kit has a missing binary → pre-marked unhealthy by KitManager::new()
+        // "healthy" kit uses /bin/echo → not pre-marked
         let manager = KitManager::new(vec![loaded_kit("healthy"), loaded_kit("broken")]);
-        {
-            let mut kits = manager.kits.lock().await;
-            kits.get_mut("broken").unwrap().unhealthy = true;
-        }
 
         let all_tools = manager.list_tools().await;
         let healthy_tools = manager.list_healthy_tools().await;
@@ -333,6 +341,12 @@ mod tests {
     }
 
     fn loaded_kit(name: &str) -> LoadedKit {
+        // Use /bin/echo as a real binary so the healthy kit isn't pre-marked unhealthy
+        let cmd = if name == "broken" {
+            "definitely-missing-kit-binary".to_string()
+        } else {
+            "/bin/echo".to_string()
+        };
         LoadedKit {
             manifest: KitManifest {
                 name: name.to_string(),
@@ -341,7 +355,7 @@ mod tests {
                 author: None,
                 platform: None,
                 runtime: None,
-                command: vec!["definitely-missing-kit-binary".to_string()],
+                command: vec![cmd.clone()],
                 tools: vec![KitToolDef {
                     name: "ping".to_string(),
                     description: "Ping".to_string(),
@@ -351,7 +365,23 @@ mod tests {
                 workspace: None,
             },
             kit_dir: PathBuf::from("/tmp"),
-            command: vec!["definitely-missing-kit-binary".to_string()],
+            command: vec![cmd],
         }
     }
+}
+
+/// Check if a command binary exists — supports both absolute paths and PATH lookup.
+fn command_binary_exists(binary: &str) -> bool {
+    let path = std::path::Path::new(binary);
+    // Absolute or relative path with separator → check directly
+    if binary.contains(std::path::MAIN_SEPARATOR) || binary.contains('/') {
+        return path.exists();
+    }
+    // Bare command name → search PATH
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .any(|dir| dir.join(binary).is_file())
+        })
+        .unwrap_or(false)
 }
