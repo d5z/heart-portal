@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error, debug, trace};
 
 use crate::config::PortalConfig;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, PORTAL_VERSION};
@@ -69,6 +69,8 @@ enum Commands {
 enum KitCommands {
     /// List installed kits
     List,
+    /// Show kit pre-flight status
+    Status,
 }
 
 #[tokio::main]
@@ -110,11 +112,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(Commands::Kit {
-        command: KitCommands::List,
-    }) = &command
-    {
-        return list_installed_kits(&config).await;
+    if let Some(Commands::Kit { command }) = &command {
+        return match command {
+            KitCommands::List => list_installed_kits(&config).await,
+            KitCommands::Status => show_kit_status(&config).await,
+        };
     }
 
     if config.portal_mcp_token.is_none() {
@@ -301,6 +303,42 @@ async fn list_installed_kits(config: &PortalConfig) -> Result<()> {
         println!(
             "{}\t{}\t{}\t{} tool(s)",
             status.name, status.version, status.status, status.tools
+        );
+    }
+
+    Ok(())
+}
+
+async fn show_kit_status(config: &PortalConfig) -> Result<()> {
+    if !config.kits_enabled {
+        println!("Kits disabled");
+        return Ok(());
+    }
+
+    let kits_dir = kits::loader::kits_dir(config);
+    let kits = kits::loader::load_kits_from_dir(&kits_dir)?;
+    if kits.is_empty() {
+        println!("No kits installed in {}", kits_dir.display());
+        return Ok(());
+    }
+
+    println!(
+        "{:<16} {:<8} {:<6} {:<11} {}",
+        "Kit", "Version", "Tools", "Status", "Command"
+    );
+    for kit in kits {
+        let status = if kits::loader::command_binary_exists(&kit.command) {
+            "not-started"
+        } else {
+            "unhealthy"
+        };
+        println!(
+            "{:<16} {:<8} {:<6} {:<11} {}",
+            &kit.manifest.name,
+            &kit.manifest.version,
+            kit.manifest.tools.len(),
+            status,
+            kits::loader::format_command(&kit.command)
         );
     }
 
@@ -592,7 +630,11 @@ async fn handle_request(
             match result {
                 Ok(value) => {
                     let is_error = value.get("isError").and_then(|v| v.as_bool()).unwrap_or_else(|| {
-                        debug!("Missing or invalid isError field in tool result, assuming success");
+                        if value.get("content").is_none() {
+                            warn!("Tool '{}' returned a malformed result with no content and no valid isError field; assuming success", tool_name);
+                        } else {
+                            trace!("Missing or invalid isError field in tool result, assuming success");
+                        }
                         false
                     });
                     if is_error {
@@ -609,15 +651,15 @@ async fn handle_request(
                 }
                 Err(e) => {
                     warn!("⚡ {} → fail: {} ({:?})", tool_name, e, elapsed);
+                    let message = format!("Tool error: {}", e);
                     JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
                         id,
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -1,
-                            message: format!("Tool error: {}", e),
-                            data: None,
-                        }),
+                        result: Some(serde_json::json!({
+                            "content": [{"type": "text", "text": message}],
+                            "isError": true
+                        })),
+                        error: None,
                     }
                 }
             }

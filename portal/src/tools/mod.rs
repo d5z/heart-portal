@@ -102,7 +102,7 @@ impl ToolHost {
         let mut tools = self.list_builtin_tools();
         let custom = self.custom.list_tools().await;
         tools.extend(custom);
-        let kit_tools = self.kits.list_tools().await;
+        let kit_tools = self.kits.list_healthy_tools().await;
         tools.extend(kit_tools);
         tools
     }
