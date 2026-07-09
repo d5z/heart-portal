@@ -1,6 +1,6 @@
 [package]
 name = "heart-portal"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 description = "Portal — Being's gateway to the world. Lightweight MCP server with built-in tools."
 
