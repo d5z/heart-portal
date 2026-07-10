@@ -3,6 +3,7 @@
 
 mod exec;
 mod file;
+mod oauth;
 mod process;
 mod screenshot;
 mod search;
@@ -301,6 +302,19 @@ impl ToolHost {
             });
         }
 
+        tools.push(ToolInfo {
+            name: "portal_oauth_authorize".to_string(),
+            description: "Start OAuth Authorization Code + PKCE flow. Opens browser for user authorization and returns tokens.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "provider": { "type": "string", "enum": ["openai"], "description": "OAuth provider" },
+                    "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120)", "default": 120 }
+                },
+                "required": ["provider"]
+            }),
+        });
+
         // Always include tools_reload
         tools.push(ToolInfo {
             name: "portal_tools_reload".to_string(),
@@ -355,6 +369,7 @@ impl ToolHost {
             "portal_search" => search::search(&self.config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
             "portal_web_search" => web_search::search(arguments).await,
+            "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
             _ => anyhow::bail!("Unknown tool: {}", tool_name),
         }
