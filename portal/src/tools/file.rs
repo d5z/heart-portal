@@ -118,6 +118,30 @@ fn image_mime_type(ext: &str) -> Option<&'static str> {
 /// Max image file size for base64 encoding (10MB — screenshots can be 4-6MB).
 const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Unescape common backslash sequences. `\n` always becomes LF (0x0a), never CRLF.
+fn unescape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('\\') => result.push('\\'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     let path_str = arguments.get("path")
         .and_then(|v| v.as_str())
@@ -188,26 +212,129 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
 
-    let content = arguments.get("content")
+    // 可选参数
+    let append = arguments.get("append")
+        .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true")))
+        .unwrap_or(false);
+    
+    let encoding = arguments.get("encoding")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
+        .unwrap_or("utf8");
 
-    if content.len() > config.security.max_file_size {
-        anyhow::bail!("Content too large: {} bytes (max: {})", content.len(), config.security.max_file_size);
+    let escape = arguments.get("escape")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    
+    let source = arguments.get("source")
+        .and_then(|v| v.as_str());
+
+    // 验证 encoding 参数
+    if encoding != "utf8" && encoding != "base64" && encoding != "escaped" {
+        anyhow::bail!("Invalid encoding '{}'. Must be 'utf8', 'base64', or 'escaped'", encoding);
+    }
+
+    // 获取要写入的内容
+    let (content_bytes, source_info) = if let Some(source_path) = source {
+        // 从 source 文件读取内容
+        let source_resolved = resolve_path_logical(config, source_path)?;
+        debug!("file_write: reading from source {}", source_resolved.display());
+        
+        let bytes = tokio::fs::read(&source_resolved).await
+            .map_err(|e| anyhow::anyhow!("Failed to read source {}: {}", source_resolved.display(), e))?;
+        
+        (bytes, Some(source_resolved))
+    } else {
+        // 从 content 参数获取内容
+        let content_str = arguments.get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument (required when no 'source' provided)"))?;
+
+        let bytes = match encoding {
+            "utf8" => {
+                let text = if escape { unescape(content_str) } else { content_str.to_string() };
+                text.into_bytes()
+            }
+            "escaped" => {
+                unescape(content_str).into_bytes()
+            }
+            "base64" => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(content_str)
+                    .map_err(|e| anyhow::anyhow!("Invalid base64 content: {}", e))?
+            },
+            _ => unreachable!() // 已在上面验证过
+        };
+        
+        (bytes, None)
+    };
+
+    // 检查文件大小限制
+    if content_bytes.len() > config.security.max_file_size {
+        anyhow::bail!("Content too large: {} bytes (max: {})", content_bytes.len(), config.security.max_file_size);
     }
 
     let path = resolve_write_path(config, path_str)?;
-    debug!("file_write: {} ({} bytes)", path.display(), content.len());
+    debug!("file_write: {} ({} bytes), append={}, encoding={}, escape={}", 
+           path.display(), content_bytes.len(), append, encoding, escape);
 
+    // 创建父目录
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    tokio::fs::write(&path, content).await
-        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    // 写入文件
+    if append {
+        use tokio::fs::OpenOptions;
+        use tokio::io::AsyncWriteExt;
+        
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open {} for append: {}", path.display(), e))?;
+        
+        file.write_all(&content_bytes).await
+            .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
+    } else {
+        tokio::fs::write(&path, &content_bytes).await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    }
+
+    // 生成返回信息
+    let message = if let Some(source_path) = source_info {
+        if append {
+            // 获取文件总大小用于显示
+            let total_size = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            format!("Appended {} bytes from {} to {} (total: {} bytes)", 
+                   content_bytes.len(), source_path.display(), path.display(), total_size)
+        } else {
+            format!("Copied {} bytes from {} to {}", 
+                   content_bytes.len(), source_path.display(), path.display())
+        }
+    } else {
+        if append {
+            // 获取文件总大小用于显示
+            let total_size = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let encoding_info = match encoding { "base64" => " (decoded from base64)", "escaped" => " (escape sequences expanded)", _ => "" };
+            format!("Appended {} bytes{} to {} (total: {} bytes)", 
+                   content_bytes.len(), encoding_info, path.display(), total_size)
+        } else {
+            let encoding_info = match encoding { "base64" => " (decoded from base64)", "escaped" => " (escape sequences expanded)", _ => "" };
+            format!("Written {} bytes{} to {}", 
+                   content_bytes.len(), encoding_info, path.display())
+        }
+    };
 
     Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": format!("Written {} bytes to {}", content.len(), path.display()) }]
+        "content": [{ "type": "text", "text": message }]
     }))
 }
 
@@ -374,6 +501,292 @@ mod tests {
             "{}",
             err
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // 新增测试用例
+    #[tokio::test]
+    async fn test_write_with_content() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024; // 1MB
+
+        let args = serde_json::json!({
+            "path": "test.txt",
+            "content": "Hello, World!"
+        });
+
+        let result = write(&config, args).await.unwrap();
+        let content = std::fs::read_to_string(tmp.join("test.txt")).unwrap();
+        assert_eq!(content, "Hello, World!");
+        
+        let response = result.get("content").unwrap().as_array().unwrap();
+        let text = response[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("Written 13 bytes"));
+        
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_with_append() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-append-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024; // 1MB
+
+        // 第一次写入
+        let args1 = serde_json::json!({
+            "path": "append_test.txt",
+            "content": "First line\n"
+        });
+        write(&config, args1).await.unwrap();
+
+        // 第二次追加
+        let args2 = serde_json::json!({
+            "path": "append_test.txt",
+            "content": "Second line\n",
+            "append": true
+        });
+        let result = write(&config, args2).await.unwrap();
+        
+        let content = std::fs::read_to_string(tmp.join("append_test.txt")).unwrap();
+        assert_eq!(content, "First line\nSecond line\n");
+        
+        let response = result.get("content").unwrap().as_array().unwrap();
+        let text = response[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("Appended 12 bytes"));
+        assert!(text.contains("total:") && text.contains("bytes"));
+        
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_with_base64_encoding() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-base64-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024; // 1MB
+
+        // "Hello, World!" 的 base64 编码
+        let args = serde_json::json!({
+            "path": "base64_test.txt",
+            "content": "SGVsbG8sIFdvcmxkIQ==",
+            "encoding": "base64"
+        });
+
+        let result = write(&config, args).await.unwrap();
+        let content = std::fs::read_to_string(tmp.join("base64_test.txt")).unwrap();
+        assert_eq!(content, "Hello, World!");
+        
+        let response = result.get("content").unwrap().as_array().unwrap();
+        let text = response[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("Written 13 bytes"));
+        assert!(text.contains("decoded from base64"));
+        
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_with_source() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-source-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024; // 1MB
+
+        // 创建源文件
+        let source_content = "Content from source file";
+        std::fs::write(tmp.join("source.txt"), source_content).unwrap();
+
+        let args = serde_json::json!({
+            "path": "destination.txt",
+            "source": "source.txt"
+        });
+
+        let result = write(&config, args).await.unwrap();
+        let content = std::fs::read_to_string(tmp.join("destination.txt")).unwrap();
+        assert_eq!(content, source_content);
+        
+        let response = result.get("content").unwrap().as_array().unwrap();
+        let text = response[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("Copied 24 bytes from"));
+        assert!(text.contains("source.txt"));
+        assert!(text.contains("destination.txt"));
+        
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_with_source_and_append() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-source-append-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024; // 1MB
+
+        // 创建目标文件
+        std::fs::write(tmp.join("target.txt"), "Initial content\n").unwrap();
+        
+        // 创建源文件
+        std::fs::write(tmp.join("source.txt"), "Appended content").unwrap();
+
+        let args = serde_json::json!({
+            "path": "target.txt",
+            "source": "source.txt",
+            "append": true
+        });
+
+        let result = write(&config, args).await.unwrap();
+        let content = std::fs::read_to_string(tmp.join("target.txt")).unwrap();
+        assert_eq!(content, "Initial content\nAppended content");
+        
+        let response = result.get("content").unwrap().as_array().unwrap();
+        let text = response[0].get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("Appended 16 bytes from"));
+        // 更健壮的测试 - 检查总字节数，但更宽容
+        assert!(text.contains("total:") && text.contains("bytes"));
+        
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_unescape_sequences() {
+        assert_eq!(unescape(r"line1\nline2"), "line1\nline2");
+        assert_eq!(unescape(r"col1\tcol2"), "col1\tcol2");
+        assert_eq!(unescape(r"path\\to\\file"), "path\\to\\file");
+        assert_eq!(unescape(r"hello\xworld"), r"hello\xworld");
+        assert_eq!(unescape(r"trailing\"), "trailing\\");
+        assert_eq!(unescape(r"a\rb"), "a\rb");
+        // Ensure \n is LF (0x0a), not CRLF
+        assert_eq!(unescape(r"\n").as_bytes(), &[0x0a]);
+    }
+
+    #[tokio::test]
+    async fn test_write_escape_default_literal() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-escape-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024;
+
+        let args = serde_json::json!({
+            "path": "literal.txt",
+            "content": "line1\\nline2"
+        });
+        write(&config, args).await.unwrap();
+
+        let bytes = std::fs::read(tmp.join("literal.txt")).unwrap();
+        assert!(bytes.contains(&0x5c), "should contain literal backslash");
+        assert!(bytes.windows(2).any(|w| w == [0x5c, 0x6e]), "should contain 5c 6e");
+        assert!(!bytes.contains(&0x0a), "should not contain real newline");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_escape_true() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-escape-true-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024;
+
+        // newline
+        write(&config, serde_json::json!({
+            "path": "nl.txt",
+            "content": "line1\\nline2",
+            "escape": true
+        })).await.unwrap();
+        let bytes = std::fs::read(tmp.join("nl.txt")).unwrap();
+        assert_eq!(bytes, b"line1\nline2");
+        assert!(bytes.contains(&0x0a));
+
+        // tab
+        write(&config, serde_json::json!({
+            "path": "tab.txt",
+            "content": "col1\\tcol2",
+            "escape": true
+        })).await.unwrap();
+        assert_eq!(std::fs::read(tmp.join("tab.txt")).unwrap(), b"col1\tcol2");
+
+        // double backslash → single
+        write(&config, serde_json::json!({
+            "path": "bs.txt",
+            "content": "path\\\\to\\\\file",
+            "escape": true
+        })).await.unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.join("bs.txt")).unwrap(), "path\\to\\file");
+
+        // unknown sequence preserved
+        write(&config, serde_json::json!({
+            "path": "unk.txt",
+            "content": "hello\\xworld",
+            "escape": true
+        })).await.unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.join("unk.txt")).unwrap(), "hello\\xworld");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_escape_ignored_for_base64() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-escape-b64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024;
+
+        // base64 of "Hello" — escape=true must not alter the base64 string before decode
+        let args = serde_json::json!({
+            "path": "b64.txt",
+            "content": "SGVsbG8=",
+            "encoding": "base64",
+            "escape": true
+        });
+        write(&config, args).await.unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.join("b64.txt")).unwrap(), "Hello");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_write_missing_content_and_source() {
+        let tmp = std::env::temp_dir().join(format!("portal-write-error-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        
+        let mut config = test_config();
+        config.security.workspace_root = tmp.clone();
+        config.security.max_file_size = 1024 * 1024; // 1MB
+
+        let args = serde_json::json!({
+            "path": "test.txt"
+        });
+
+        let result = write(&config, args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Missing 'content' argument"));
+        
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -224,15 +224,32 @@ impl ToolHost {
                     "type": "object",
                     "properties": {
                         "path": {
-                            "type": "string",
-                            "description": "File path (relative to workspace root)"
+                            "type": "string", 
+                            "description": "Target file path. Use real newlines in content for multi-line files."
                         },
                         "content": {
                             "type": "string",
-                            "description": "Content to write"
+                            "description": "Content to write. For files > 2KB, prefer source parameter instead."
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Read content from this file path instead of content parameter. Best for large files: first generate with portal_exec, then copy here."
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": "true = append to file, false = overwrite (default: false)"
+                        },
+                        "encoding": {
+                            "type": "string",
+                            "enum": ["utf8", "base64", "escaped"],
+                            "description": "Content encoding. utf8 = raw, base64 = decode, escaped = expand \n \t \r \\\\ sequences (default: utf8)"
+                        },
+                        "escape": {
+                            "type": "boolean",
+                            "description": "If true, unescape \\n \\t \\r \\\\ sequences before writing. Useful for multi-line scripts. Default: false."
                         }
                     },
-                    "required": ["path", "content"]
+                    "required": ["path"]
                 }),
             });
 
