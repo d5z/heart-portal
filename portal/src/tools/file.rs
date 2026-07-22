@@ -193,14 +193,37 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
 
     // Truncate large responses to avoid flooding the being's context
     const MAX_RESPONSE_CHARS: usize = 100_000; // 100KB
-    let (text, truncated) = if content.len() > MAX_RESPONSE_CHARS {
-        (
-            format!("{}...\n\n(truncated: showing {}/{} bytes. Use portal_exec with head/tail for specific sections.)",
-                &content[..MAX_RESPONSE_CHARS], MAX_RESPONSE_CHARS, content.len()),
-            true
-        )
+
+    // Line-based partial read
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    let offset = arguments.get("offset")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+        .map(|v| v as usize)
+        .unwrap_or(0); // 0-based line number
+
+    let limit = arguments.get("limit")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+        .map(|v| v as usize);
+
+    let (text, truncated) = if offset > 0 || limit.is_some() {
+        let start = offset.min(total_lines);
+        let end = limit.map(|l| (start + l).min(total_lines)).unwrap_or(total_lines);
+        let slice = lines[start..end].join("\n");
+        let header = format!("[lines {}-{} of {}]\n", start + 1, end, total_lines);
+        (format!("{}{}", header, slice), start > 0 || end < total_lines)
     } else {
-        (content, false)
+        // Existing truncation logic for full read
+        if content.len() > MAX_RESPONSE_CHARS {
+            (
+                format!("{}...\n\n(truncated: showing {}/{} bytes. Use offset/limit to read specific sections.)",
+                    &content[..MAX_RESPONSE_CHARS], MAX_RESPONSE_CHARS, content.len()),
+                true
+            )
+        } else {
+            (content, false)
+        }
     };
 
     Ok(serde_json::json!({
@@ -394,41 +417,6 @@ pub async fn edit(config: &PortalConfig, arguments: Value) -> Result<Value> {
         format!("Replaced {} occurrence(s) in {} ({} bytes)", replaced, path.display(), new_content.len())
     };
 
-    Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": msg }]
-    }))
-}
-
-pub async fn append(config: &PortalConfig, arguments: Value) -> Result<Value> {
-    let path_str = arguments.get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
-
-    let content_raw = arguments.get("content")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
-
-    let content = unescape_backslash_sequences(content_raw);
-
-    let path = resolve_write_path(config, path_str)?;
-    debug!("file_append: {}", path.display());
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to open {} for append: {}", path.display(), e))?;
-    file.write_all(content.as_bytes()).await
-        .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
-
-    let total = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
-    let msg = format!("Appended {} bytes to {} (total: {} bytes)", content.len(), path.display(), total);
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": msg }]
     }))

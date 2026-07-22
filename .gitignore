@@ -4,3 +4,5 @@ Cargo.lock
 dist/
 .DS_Store
 SIGNING.md
+/heart-portal
+*_SPEC.md

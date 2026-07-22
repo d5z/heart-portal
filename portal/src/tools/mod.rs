@@ -205,13 +205,21 @@ impl ToolHost {
         if self.config.tools.file {
             tools.push(ToolInfo {
                 name: "portal_file_read".to_string(),
-                description: "Read a file's contents".to_string(),
+                description: "Read file contents. Returns text for text files, base64 for images. For large files, use offset (0-based line number) and limit to read specific sections instead of portal_exec head/tail.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "File path (relative to workspace root)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Start reading from this line number (0-based, default: 0). Use with limit for large files."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return. Omit to read all remaining lines from offset."
                         }
                     },
                     "required": ["path"]
@@ -220,7 +228,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_write".to_string(),
-                description: "Write content to a file. Preferred over portal_exec for any file writing. No shell escaping issues. Supports append mode, base64 encoding for binary files, and raw mode to skip escape processing.".to_string(),
+                description: "Write content to a file (creates parent dirs automatically). THE preferred way to write files — no shell escaping issues.\n\nModes:\n- Default: overwrite file with content\n- append=true: add to end of existing file\n- encoding=\"base64\": decode base64 content before writing (for binary files)\n- raw=true: skip escape sequence processing (write \\n as literal backslash-n)".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -230,7 +238,7 @@ impl ToolHost {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Content to write. Use real newlines in the JSON string value."
+                            "description": "File content. Use real newlines — they pass through correctly. No need for \\n or base64 workarounds for text files."
                         },
                         "append": {
                             "type": "boolean",
@@ -251,7 +259,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_edit".to_string(),
-                description: "Replace exact text in a file. Precise search-and-replace with no shell escaping issues. Shows surrounding context with line numbers after replacement.".to_string(),
+                description: "Find and replace exact text in a file. Safer than sed — no shell escaping issues. Shows line-numbered context after replacement.\n\nBehavior:\n- Single match: replaces it, shows surrounding context\n- Multiple matches with count=1 (default): errors asking for more specific text\n- count=-1: replace ALL occurrences".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -277,27 +285,8 @@ impl ToolHost {
             });
 
             tools.push(ToolInfo {
-                name: "portal_file_append".to_string(),
-                description: "Append content to end of a file (creates if not exists). Returns total file size after append.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path (relative to workspace root)"
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Content to append"
-                        }
-                    },
-                    "required": ["path", "content"]
-                }),
-            });
-
-            tools.push(ToolInfo {
                 name: "portal_file_list".to_string(),
-                description: "List files in a directory".to_string(),
+                description: "List files and directories. Returns JSON array with name, size, is_dir, modified (unix timestamp) for each entry.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -419,7 +408,6 @@ impl ToolHost {
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
             "portal_file_edit" => file::edit(&self.config, arguments).await,
-            "portal_file_append" => file::append(&self.config, arguments).await,
             "portal_screenshot" => {
                 if !self.config.tools.screenshot {
                     anyhow::bail!("portal_screenshot is disabled in configuration");
