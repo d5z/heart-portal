@@ -103,6 +103,32 @@ pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Resul
     Ok(cur)
 }
 
+/// Convert literal backslash escape sequences to their byte values.
+/// Compensates for upstream DSL parsers that consume backslashes during JSON serialization.
+pub(crate) fn unescape_backslash_sequences(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('\\') => result.push('\\'),
+                Some('0') => result.push('\0'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Image extensions → MIME type mapping.
 fn image_mime_type(ext: &str) -> Option<&'static str> {
     match ext.to_lowercase().as_str() {
@@ -188,26 +214,70 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
 
-    let content = arguments.get("content")
+    let raw_content = arguments.get("content")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
 
-    if content.len() > config.security.max_file_size {
-        anyhow::bail!("Content too large: {} bytes (max: {})", content.len(), config.security.max_file_size);
+    let raw = arguments.get("raw")
+        .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(|s| s.parse::<bool>().ok())))
+        .unwrap_or(false);
+
+    let append = arguments.get("append")
+        .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(|s| s.parse::<bool>().ok())))
+        .unwrap_or(false);
+
+    let encoding = arguments.get("encoding")
+        .and_then(|v| v.as_str())
+        .unwrap_or("utf8");
+
+    // Decode content based on encoding
+    let bytes: Vec<u8> = match encoding {
+        "base64" => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(raw_content)
+                .map_err(|e| anyhow::anyhow!("Invalid base64 content: {}", e))?
+        }
+        _ => {
+            let text = if raw {
+                raw_content.to_string()
+            } else {
+                unescape_backslash_sequences(raw_content)
+            };
+            text.into_bytes()
+        }
+    };
+
+    if bytes.len() > config.security.max_file_size {
+        anyhow::bail!("Content too large: {} bytes (max: {})", bytes.len(), config.security.max_file_size);
     }
 
     let path = resolve_write_path(config, path_str)?;
-    debug!("file_write: {} ({} bytes)", path.display(), content.len());
+    let mode_label = if append { "append" } else { "write" };
+    debug!("file_{}: {} ({} bytes, raw={}, encoding={})", mode_label, path.display(), bytes.len(), raw, encoding);
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    tokio::fs::write(&path, content).await
-        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    if append {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open {} for append: {}", path.display(), e))?;
+        file.write_all(&bytes).await
+            .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
+    } else {
+        tokio::fs::write(&path, &bytes).await
+            .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+    }
 
+    let verb = if append { "Appended" } else { "Written" };
     Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": format!("Written {} bytes to {}", content.len(), path.display()) }]
+        "content": [{ "type": "text", "text": format!("{} {} bytes to {}", verb, bytes.len(), path.display()) }]
     }))
 }
 
@@ -257,6 +327,110 @@ pub async fn list(config: &PortalConfig, arguments: Value) -> Result<Value> {
     let text = serde_json::to_string(&entries)?;
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }]
+    }))
+}
+
+pub async fn edit(config: &PortalConfig, arguments: Value) -> Result<Value> {
+    let path_str = arguments.get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+
+    let old_text_raw = arguments.get("old_text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'old_text' argument"))?;
+
+    let new_text_raw = arguments.get("new_text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'new_text' argument"))?;
+
+    let old_text = unescape_backslash_sequences(old_text_raw);
+    let new_text = unescape_backslash_sequences(new_text_raw);
+
+    let max_replacements = arguments.get("count")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
+        .unwrap_or(1);
+
+    let path = resolve_existing_path(config, path_str)?;
+    debug!("file_edit: {} (count={})", path.display(), max_replacements);
+
+    let content = tokio::fs::read_to_string(&path).await
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+
+    let match_count = content.matches(old_text.as_str()).count();
+    if match_count == 0 {
+        anyhow::bail!("text not found in file");
+    }
+
+    let (new_content, replaced) = if max_replacements < 0 {
+        (content.replace(old_text.as_str(), new_text.as_str()), match_count)
+    } else {
+        let n = max_replacements as usize;
+        if n == 1 && match_count > 1 {
+            anyhow::bail!("multiple matches found — be more specific ({} occurrences). Use count=-1 for all.", match_count);
+        }
+        (content.replacen(old_text.as_str(), new_text.as_str(), n), n.min(match_count))
+    };
+
+    tokio::fs::write(&path, new_content.as_bytes()).await
+        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
+
+    let msg = if replaced == 1 {
+        let pos = new_content.find(new_text.as_str()).unwrap_or(0);
+        let start_line = new_content[..pos].lines().count();
+        let new_lines = new_text.lines().count().max(1);
+        let affected_lines = old_text.lines().count().max(1);
+        let end_line = start_line + new_lines.max(affected_lines) - 1;
+        let result_lines: Vec<&str> = new_content.lines().collect();
+        let ctx_start = if start_line > 3 { start_line - 3 } else { 1 };
+        let ctx_end = (end_line + 3).min(result_lines.len());
+        let context: String = result_lines[ctx_start.saturating_sub(1)..ctx_end]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:4}| {}", ctx_start + i, l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Replaced in {} (lines {}-{})\n{}", path.display(), start_line, end_line, context)
+    } else {
+        format!("Replaced {} occurrence(s) in {} ({} bytes)", replaced, path.display(), new_content.len())
+    };
+
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": msg }]
+    }))
+}
+
+pub async fn append(config: &PortalConfig, arguments: Value) -> Result<Value> {
+    let path_str = arguments.get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+
+    let content_raw = arguments.get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
+
+    let content = unescape_backslash_sequences(content_raw);
+
+    let path = resolve_write_path(config, path_str)?;
+    debug!("file_append: {}", path.display());
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to open {} for append: {}", path.display(), e))?;
+    file.write_all(content.as_bytes()).await
+        .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
+
+    let total = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+    let msg = format!("Appended {} bytes to {} (total: {} bytes)", content.len(), path.display(), total);
+    Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": msg }]
     }))
 }
 
@@ -375,5 +549,48 @@ mod tests {
             err
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_newline() {
+        assert_eq!(unescape_backslash_sequences("hello\\nworld"), "hello\nworld");
+    }
+
+    #[test]
+    fn test_tab() {
+        assert_eq!(unescape_backslash_sequences("col1\\tcol2"), "col1\tcol2");
+    }
+
+    #[test]
+    fn test_carriage_return() {
+        assert_eq!(unescape_backslash_sequences("line\\rend"), "line\rend");
+    }
+
+    #[test]
+    fn test_literal_backslash() {
+        assert_eq!(unescape_backslash_sequences("path\\\\file"), "path\\file");
+    }
+
+    #[test]
+    fn test_unknown_sequence_preserved() {
+        assert_eq!(unescape_backslash_sequences("test\\xvalue"), "test\\xvalue");
+    }
+
+    #[test]
+    fn test_no_escapes() {
+        assert_eq!(unescape_backslash_sequences("plain text 123"), "plain text 123");
+    }
+
+    #[test]
+    fn test_trailing_backslash() {
+        assert_eq!(unescape_backslash_sequences("end\\"), "end\\");
+    }
+
+    #[test]
+    fn test_mixed() {
+        assert_eq!(
+            unescape_backslash_sequences("line1\\nline2\\ttab\\\\slash"),
+            "line1\nline2\ttab\\slash"
+        );
     }
 }
