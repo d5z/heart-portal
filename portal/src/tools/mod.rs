@@ -219,7 +219,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_write".to_string(),
-                description: "Write content to a file".to_string(),
+                description: "Write content to a file. Preferred over portal_exec for any file writing. No shell escaping issues. Supports append mode, base64 encoding for binary files, and raw mode to skip escape processing.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -229,7 +229,65 @@ impl ToolHost {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Content to write"
+                            "description": "Content to write. Use real newlines in the JSON string value."
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": "If true, append to file instead of overwriting (default: false)"
+                        },
+                        "encoding": {
+                            "type": "string",
+                            "description": "Content encoding: utf8 (default) or base64 (decode before writing, for binary files)"
+                        },
+                        "raw": {
+                            "type": "boolean",
+                            "description": "If true, write content exactly as-is without processing escape sequences (default: false)"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }),
+            });
+
+            tools.push(ToolInfo {
+                name: "portal_file_edit".to_string(),
+                description: "Replace exact text in a file. Precise search-and-replace with no shell escaping issues. Shows surrounding context with line numbers after replacement.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path (relative to workspace root)"
+                        },
+                        "old_text": {
+                            "type": "string",
+                            "description": "Exact text to find (multi-line supported with real newlines)"
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "How many occurrences to replace (default: 1). Use -1 for all. If 1 and multiple matches found, will error asking for more context."
+                        }
+                    },
+                    "required": ["path", "old_text", "new_text"]
+                }),
+            });
+
+            tools.push(ToolInfo {
+                name: "portal_file_append".to_string(),
+                description: "Append content to end of a file (creates if not exists). Returns total file size after append.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path (relative to workspace root)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Content to append"
                         }
                     },
                     "required": ["path", "content"]
@@ -346,6 +404,8 @@ impl ToolHost {
             "portal_file_read" => file::read(&self.config, arguments).await,
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
+            "portal_file_edit" => file::edit(&self.config, arguments).await,
+            "portal_file_append" => file::append(&self.config, arguments).await,
             "portal_screenshot" => {
                 if !self.config.tools.screenshot {
                     anyhow::bail!("portal_screenshot is disabled in configuration");
