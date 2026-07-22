@@ -3,3 +3,5 @@ Cargo.lock
 *.bak
 dist/
 .DS_Store
+/heart-portal
+*_SPEC.md
