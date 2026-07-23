@@ -22,7 +22,7 @@ use crate::tools::ToolHost;
 /// on platforms (Windows) where network devices may kill idle TCP.
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 /// If no Pong is received within this window, reconnect (D-077).
-const HEARTBEAT_TIMEOUT_SECS: u64 = 60;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 
 /// Build relay handshake JSON (`portal_name` identifies this Portal instance; D-077).
 pub(crate) fn relay_handshake_json(being_id: &str, loom_token: &str, portal_name: &str) -> serde_json::Value {
@@ -129,8 +129,12 @@ async fn run_one_session(
         let default_port = if parsed.scheme() == "wss" { 443 } else { 80 };
         let port = parsed.port_or_known_default().unwrap_or(default_port);
         let addr = format!("{host}:{port}");
-        let tcp = tokio::net::TcpStream::connect(&addr)
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::net::TcpStream::connect(&addr),
+        )
             .await
+            .with_context(|| format!("TCP connect to relay {addr} timed out (15s)"))?
             .with_context(|| format!("TCP connect to relay {addr}"))?;
         // TCP keepalive: 15s idle + 5s probe interval (survives NAT/firewall idle timeouts)
         let sock_ref = socket2::SockRef::from(&tcp);
@@ -139,8 +143,12 @@ async fn run_one_session(
             .with_interval(Duration::from_secs(5));
         let _ = sock_ref.set_tcp_keepalive(&keepalive);
         let _ = sock_ref.set_nodelay(true);
-        let (ws, _) = tokio_tungstenite::client_async_tls(relay_url, tcp)
+        let (ws, _) = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio_tungstenite::client_async_tls(relay_url, tcp),
+        )
             .await
+            .with_context(|| format!("TLS/WS handshake to relay {relay_url} timed out (15s)"))?
             .with_context(|| format!("WebSocket connect to relay {relay_url}"))?;
         ws
     };
