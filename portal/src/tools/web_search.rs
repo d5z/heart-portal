@@ -159,7 +159,7 @@ pub async fn search(arguments: Value) -> Result<Value> {
 
     let count = arguments
         .get("count")
-        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+        .and_then(super::value_as_u64)
         .filter(|&n| n > 0)
         .map(|n| (n as u8).clamp(1, 10))
         .unwrap_or(5);

@@ -93,7 +93,7 @@ pub async fn fetch(arguments: Value) -> Result<Value> {
     }
 
     let max_chars = arguments.get("max_chars")
-        .and_then(|v| v.as_u64())
+        .and_then(super::value_as_u64)
         .unwrap_or(50_000) as usize;
 
     debug!("web_fetch: {} (max_chars: {})", url, max_chars);

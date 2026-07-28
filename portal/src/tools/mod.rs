@@ -398,3 +398,19 @@ impl ToolHost {
         }
     }
 }
+
+// ── HF-7: coerce string tool args to native types ──────────────────
+
+/// Extract bool from a JSON value, accepting both native bool and string "true"/"false".
+pub(crate) fn value_as_bool(v: &Value) -> Option<bool> {
+    v.as_bool().or_else(|| v.as_str().and_then(|s| match s {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }))
+}
+
+/// Extract u64 from a JSON value, accepting both native number and string digits.
+pub(crate) fn value_as_u64(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}

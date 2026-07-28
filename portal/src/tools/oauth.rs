@@ -89,7 +89,7 @@ pub async fn authorize(arguments: Value) -> Result<Value> {
 
     let timeout_secs = arguments
         .get("timeout_secs")
-        .and_then(|v| v.as_u64())
+        .and_then(super::value_as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     if timeout_secs == 0 {
         anyhow::bail!("'timeout_secs' must be greater than 0");

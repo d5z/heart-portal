@@ -47,10 +47,10 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' for poll"))?;
-            let offset = arguments.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let offset = arguments.get("offset").and_then(super::value_as_u64).unwrap_or(0);
             let timeout_ms = arguments
                 .get("timeout_ms")
-                .and_then(|v| v.as_u64())
+                .and_then(super::value_as_u64)
                 .unwrap_or(5000);
             let r = process_manager
                 .poll(session_id, offset, timeout_ms)
@@ -76,8 +76,8 @@ pub async fn handle(process_manager: &Arc<ProcessManager>, arguments: Value) -> 
                 .get("session_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' for log"))?;
-            let offset = arguments.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-            let limit = arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(64 * 1024);
+            let offset = arguments.get("offset").and_then(super::value_as_u64).unwrap_or(0);
+            let limit = arguments.get("limit").and_then(super::value_as_u64).unwrap_or(64 * 1024);
             let r = process_manager.log(session_id, offset, limit).await?;
             let text = String::from_utf8_lossy(&r.output);
             Ok(serde_json::json!({

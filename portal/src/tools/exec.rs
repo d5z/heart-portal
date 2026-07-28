@@ -27,7 +27,7 @@ pub async fn execute(
 
     let timeout_secs = arguments
         .get("timeout_secs")
-        .and_then(|v| v.as_u64())
+        .and_then(super::value_as_u64)
         .unwrap_or_else(|| {
             debug!("Missing timeout_secs argument, using default 30 seconds");
             30
@@ -36,7 +36,7 @@ pub async fn execute(
 
     let background = arguments
         .get("background")
-        .and_then(|v| v.as_bool())
+        .and_then(super::value_as_bool)
         .unwrap_or_else(|| {
             debug!("Missing background argument, using synchronous execution");
             false

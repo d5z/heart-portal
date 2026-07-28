@@ -18,7 +18,7 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
 
     let max_matches = arguments
         .get("max_matches")
-        .and_then(|v| v.as_u64())
+        .and_then(super::value_as_u64)
         .unwrap_or(200)
         .min(2000) as usize;
 

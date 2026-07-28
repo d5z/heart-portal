@@ -40,8 +40,7 @@ pub async fn capture(config: &PortalConfig, arguments: Value) -> Result<Value> {
 
     let display_idx = match arguments.get("display") {
         Some(value) => Some(
-            value
-                .as_u64()
+            super::value_as_u64(value)
                 .ok_or_else(|| anyhow::anyhow!("'display' must be a non-negative integer"))?,
         ),
         None => None,
