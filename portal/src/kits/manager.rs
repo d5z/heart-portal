@@ -95,10 +95,11 @@ impl KitManager {
     }
 
     pub async fn list_healthy_tools(&self) -> Vec<ToolInfo> {
-        let kits = self.kits.lock().await;
+        let mut kits = self.kits.lock().await;
         let mut tools = Vec::new();
 
-        for state in kits.values() {
+        for state in kits.values_mut() {
+            recover_if_cooled_down(state);
             if state.unhealthy {
                 continue;
             }
@@ -339,7 +340,8 @@ async fn drop_connection(state: &mut KitState) {
 
 /// Shut down a shared connection handle. Requires unique ownership to obtain
 /// the `&mut` needed by `McpConnection::shutdown`; if a concurrent caller still
-/// holds the handle, cleanup is deferred until the final reference is dropped.
+/// holds the handle, spawn a background task that waits for the in-flight call
+/// to finish and then performs cleanup (preventing child process leaks).
 async fn shutdown_arc(connection: Arc<McpConnection>, kit_name: &str) {
     match Arc::try_unwrap(connection) {
         Ok(mut connection) => {
@@ -347,11 +349,46 @@ async fn shutdown_arc(connection: Arc<McpConnection>, kit_name: &str) {
                 warn!("Failed to shut down kit '{}' connection: {}", kit_name, err);
             }
         }
-        Err(_) => {
+        Err(arc) => {
+            // An in-flight call_tool still holds a clone. Spawn a background
+            // task that polls until the other reference is dropped, then shuts
+            // down the connection cleanly. This prevents child process leaks.
+            let name = kit_name.to_string();
             warn!(
-                "Kit '{}' connection still in use by an in-flight call; deferring shutdown",
-                kit_name
+                "Kit '{}' connection in use (refs={}); spawning cleanup task",
+                name,
+                Arc::strong_count(&arc)
             );
+            tokio::spawn(async move {
+                // Wait up to 60s for the in-flight call to complete.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    if Arc::strong_count(&arc) <= 1 {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(
+                            "Kit '{}' cleanup timed out; dropping Arc (process may leak)",
+                            name
+                        );
+                        drop(arc);
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                match Arc::try_unwrap(arc) {
+                    Ok(mut conn) => {
+                        if let Err(err) = conn.shutdown().await {
+                            warn!("Kit '{}' deferred shutdown failed: {}", name, err);
+                        } else {
+                            info!("Kit '{}' deferred shutdown succeeded", name);
+                        }
+                    }
+                    Err(_) => {
+                        warn!("Kit '{}' deferred shutdown: still not unique; dropping", name);
+                    }
+                }
+            });
         }
     }
 }
