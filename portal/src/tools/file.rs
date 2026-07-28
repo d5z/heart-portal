@@ -241,7 +241,7 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
 
-    let raw = arguments.get("raw")
+    let unescape = arguments.get("unescape")
         .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(|s| s.parse::<bool>().ok())))
         .unwrap_or(false);
 
@@ -262,10 +262,10 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
                 .map_err(|e| anyhow::anyhow!("Invalid base64 content: {}", e))?
         }
         _ => {
-            let text = if raw {
-                raw_content.to_string()
-            } else {
+            let text = if unescape {
                 unescape_backslash_sequences(raw_content)
+            } else {
+                raw_content.to_string()
             };
             text.into_bytes()
         }
@@ -277,7 +277,7 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
 
     let path = resolve_write_path(config, path_str)?;
     let mode_label = if append { "append" } else { "write" };
-    debug!("file_{}: {} ({} bytes, raw={}, encoding={})", mode_label, path.display(), bytes.len(), raw, encoding);
+    debug!("file_{}: {} ({} bytes, unescape={}, encoding={})", mode_label, path.display(), bytes.len(), unescape, encoding);
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -366,8 +366,12 @@ pub async fn edit(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'new_text' argument"))?;
 
-    let old_text = unescape_backslash_sequences(old_text_raw);
-    let new_text = unescape_backslash_sequences(new_text_raw);
+    let unescape = arguments.get("unescape")
+        .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(|s| s.parse::<bool>().ok())))
+        .unwrap_or(false);
+
+    let old_text = if unescape { unescape_backslash_sequences(old_text_raw) } else { old_text_raw.to_string() };
+    let new_text = if unescape { unescape_backslash_sequences(new_text_raw) } else { new_text_raw.to_string() };
 
     let max_replacements = arguments.get("count")
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))

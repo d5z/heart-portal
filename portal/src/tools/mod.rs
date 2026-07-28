@@ -228,7 +228,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_write".to_string(),
-                description: "Write content to a file (creates parent dirs automatically). THE preferred way to write files — no shell escaping issues.\n\nModes:\n- Default: overwrite file with content\n- append=true: add to end of existing file\n- encoding=\"base64\": decode base64 content before writing (for binary files)\n- raw=true: skip escape sequence processing (write \\n as literal backslash-n)".to_string(),
+                description: "Write content to a file (creates parent dirs automatically). THE preferred way to write files — no shell escaping issues.\n\nModes:\n- Default: overwrite file with content\n- append=true: add to end of existing file\n- encoding=\"base64\": decode base64 content before writing (for binary files)\n- unescape=true: process escape sequences (\\n to newline, \\t to tab). Default: content written as-is".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -248,9 +248,9 @@ impl ToolHost {
                             "type": "string",
                             "description": "Content encoding: utf8 (default) or base64 (decode before writing, for binary files)"
                         },
-                        "raw": {
+                        "unescape": {
                             "type": "boolean",
-                            "description": "If true, write content exactly as-is without processing escape sequences (default: false)"
+                            "description": "If true, process escape sequences (\n→newline, \t→tab). Default: false (content written as-is)."
                         }
                     },
                     "required": ["path", "content"]
@@ -278,6 +278,10 @@ impl ToolHost {
                         "count": {
                             "type": "integer",
                             "description": "How many occurrences to replace (default: 1). Use -1 for all. If 1 and multiple matches found, will error asking for more context."
+                        },
+                        "unescape": {
+                            "type": "boolean",
+                            "description": "If true, process escape sequences in old_text/new_text (\n→newline, \t→tab). Default: false (match/replace as-is)."
                         }
                     },
                     "required": ["path", "old_text", "new_text"]
