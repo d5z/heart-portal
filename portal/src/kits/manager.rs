@@ -114,8 +114,9 @@ impl KitManager {
         let kits = self.kits.lock().await;
         for state in kits.values() {
             for tool in &state.kit.manifest.tools {
-                let routed_name = format!("{}_{}", state.kit.manifest.name, tool.name);
-                if routed_name == tool_name {
+                let routed_name = format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name);
+                let normalized_query = tool_name.replace('-', "_");
+                if routed_name == normalized_query {
                     return Some((state.kit.manifest.name.clone(), tool.name.clone()));
                 }
             }
@@ -127,36 +128,44 @@ impl KitManager {
         &self,
         kit_name: &str,
         tool_name: &str,
-        arguments: Value,
+        mut arguments: Value,
     ) -> Result<Value> {
         // Phase 1: hold the manager lock only long enough to validate the
         // request, (re)establish the connection, and clone the connection
         // handle. The lock is released before the actual MCP call so a slow
         // kit cannot block calls to other kits.
-        let connection = {
+        let (connection, params) = {
             let mut kits = self.kits.lock().await;
             let state = kits
                 .get_mut(kit_name)
                 .ok_or_else(|| anyhow::anyhow!("Unknown kit: {}", kit_name))?;
 
-            if !state
+            let params = state
                 .kit
                 .manifest
                 .tools
                 .iter()
-                .any(|tool| tool.name == tool_name)
-            {
-                anyhow::bail!("Unknown tool '{}' for kit '{}'", tool_name, kit_name);
-            }
+                .find(|tool| tool.name == tool_name)
+                .map(|tool| tool.params.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unknown tool '{}' for kit '{}'", tool_name, kit_name)
+                })?;
 
             ensure_connection(state).await?;
 
-            state
+            let connection = state
                 .connection
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Kit '{}' process is not running", kit_name))?
-                .clone()
+                .clone();
+
+            (connection, params)
         };
+
+        // Heart's act DSL passes all parameter values as JSON strings; coerce
+        // them to the types declared in the kit tool's JSON Schema before the
+        // MCP call so kit-side validation does not reject e.g. limit="3".
+        coerce_kit_arguments(&mut arguments, &params);
 
         // Phase 2: perform the MCP call WITHOUT holding the manager lock.
         let result = connection.call_tool(tool_name, arguments).await;
@@ -371,10 +380,15 @@ fn recover_if_cooled_down(state: &mut KitState) {
     }
 }
 
+/// Normalize kit name for tool routing: replace hyphens with underscores.
+fn kit_slug(name: &str) -> String {
+    name.replace('-', "_")
+}
+
 fn push_kit_tools(state: &KitState, tools: &mut Vec<ToolInfo>) {
     for tool in &state.kit.manifest.tools {
         tools.push(ToolInfo {
-            name: format!("{}_{}", state.kit.manifest.name, tool.name),
+            name: format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name),
             description: tool.description.clone(),
             input_schema: tool.params.clone(),
         });
@@ -450,11 +464,86 @@ fn status_text(state: &KitState) -> &'static str {
     }
 }
 
+/// Best-effort coercion of string-typed act-DSL arguments to the types
+/// declared in a kit tool's JSON Schema `properties`. Parse failures leave
+/// the original value so the kit can report the real validation error.
+fn coerce_kit_arguments(arguments: &mut Value, schema: &Value) {
+    let Some(args_obj) = arguments.as_object_mut() else {
+        return;
+    };
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return;
+    };
+
+    for (key, prop_schema) in properties {
+        let Some(value) = args_obj.get_mut(key) else {
+            continue;
+        };
+        let Some(type_str) = prop_schema.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Value::String(s) = value else {
+            continue;
+        };
+
+        let coerced = match type_str {
+            "integer" => s.parse::<i64>().ok().map(Value::from),
+            "number" => s.parse::<f64>().ok().map(Value::from),
+            "boolean" => match s.as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            "array" => serde_json::from_str::<Value>(s)
+                .ok()
+                .filter(|v| v.is_array()),
+            _ => None,
+        };
+
+        if let Some(new_val) = coerced {
+            *value = new_val;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kits::manifest::{KitManifest, KitToolDef};
     use std::path::PathBuf;
+
+    #[test]
+    fn kit_slug_normalizes_hyphens() {
+        assert_eq!(kit_slug("agent-reach"), "agent_reach");
+        assert_eq!(kit_slug("cua-driver"), "cua_driver");
+        assert_eq!(kit_slug("cursor"), "cursor");
+        assert_eq!(kit_slug("a-b-c"), "a_b_c");
+    }
+
+    #[tokio::test]
+    async fn resolve_tool_normalizes_kit_hyphens() {
+        let manager = KitManager::new(vec![loaded_kit("my-kit", None)]);
+        // Should resolve with underscored form
+        let result = manager.resolve_tool("my_kit_ping").await;
+        assert!(result.is_some(), "should resolve my_kit_ping");
+        let (kit_name, tool_name) = result.unwrap();
+        assert_eq!(kit_name, "my-kit", "should return original kit name for internal lookup");
+        assert_eq!(tool_name, "ping");
+        // Should also resolve with hyphenated form (backward compat)
+        let result2 = manager.resolve_tool("my-kit_ping").await;
+        assert!(result2.is_some(), "should resolve my-kit_ping (hyphen form)");
+        let (kit_name2, tool_name2) = result2.unwrap();
+        assert_eq!(kit_name2, "my-kit");
+        assert_eq!(tool_name2, "ping");
+    }
+
+    #[tokio::test]
+    async fn list_tools_uses_normalized_names() {
+        let manager = KitManager::new(vec![loaded_kit("my-kit", None)]);
+        let tools = manager.list_tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "my_kit_ping", "exposed tool name should use underscores");
+    }
 
     #[tokio::test]
     async fn list_healthy_tools_skips_unhealthy_kits() {
@@ -548,6 +637,119 @@ mod tests {
             Some("healthy"),
             "existing kit env vars must be preserved"
         );
+    }
+
+    #[test]
+    fn coerce_string_to_integer() {
+        let mut args = serde_json::json!({"limit": "42"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], 42);
+    }
+
+    #[test]
+    fn coerce_string_to_number() {
+        let mut args = serde_json::json!({"ratio": "3.14"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ratio": {"type": "number"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["ratio"], 3.14);
+    }
+
+    #[test]
+    fn coerce_string_to_boolean() {
+        let mut args = serde_json::json!({"flag": "true", "other": "false"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "flag": {"type": "boolean"},
+                "other": {"type": "boolean"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["flag"], true);
+        assert_eq!(args["other"], false);
+    }
+
+    #[test]
+    fn coerce_leaves_unparseable_string_as_is() {
+        let mut args = serde_json::json!({"limit": "not-a-number", "flag": "yes"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "flag": {"type": "boolean"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], "not-a-number");
+        assert_eq!(args["flag"], "yes");
+    }
+
+    #[test]
+    fn coerce_passes_native_values_through() {
+        let mut args = serde_json::json!({"limit": 7, "flag": false, "ratio": 1.5});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "flag": {"type": "boolean"},
+                "ratio": {"type": "number"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], 7);
+        assert_eq!(args["flag"], false);
+        assert_eq!(args["ratio"], 1.5);
+    }
+
+    #[test]
+    fn coerce_ignores_args_missing_from_schema() {
+        let mut args = serde_json::json!({"limit": "3", "extra": "keep"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["limit"], 3);
+        assert_eq!(args["extra"], "keep");
+    }
+
+    #[test]
+    fn coerce_handles_empty_or_null_schema() {
+        let mut args = serde_json::json!({"limit": "3"});
+        coerce_kit_arguments(&mut args, &Value::Null);
+        assert_eq!(args["limit"], "3");
+
+        coerce_kit_arguments(&mut args, &serde_json::json!({}));
+        assert_eq!(args["limit"], "3");
+
+        coerce_kit_arguments(&mut args, &serde_json::json!({"type": "object"}));
+        assert_eq!(args["limit"], "3");
+    }
+
+    #[test]
+    fn coerce_string_to_array() {
+        let mut args = serde_json::json!({"tags": "[\"a\",\"b\"]"});
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array"}
+            }
+        });
+        coerce_kit_arguments(&mut args, &schema);
+        assert_eq!(args["tags"], serde_json::json!(["a", "b"]));
     }
 
     fn kit_state(kit: LoadedKit) -> KitState {
