@@ -151,6 +151,10 @@ async fn main() -> Result<()> {
         Err(e) => warn!("Failed to load custom tools: {}", e),
     }
 
+    // Pre-spawn eager kits (manifest.eager == true) so the first call has
+    // no cold-start latency. Failures are logged, not fatal.
+    tool_host.warmup_kits().await;
+
     let tool_list = tool_host.list_tools().await;
     info!("Portal tools: {}", tool_list.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
 
