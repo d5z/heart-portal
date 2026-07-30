@@ -205,13 +205,21 @@ impl ToolHost {
         if self.config.tools.file {
             tools.push(ToolInfo {
                 name: "portal_file_read".to_string(),
-                description: "Read a file's contents".to_string(),
+                description: "Read file contents. Returns text for text files, base64 for images. For large files, use offset (0-based line number) and limit to read specific sections instead of portal_exec head/tail.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "File path (relative to workspace root)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Start reading from this line number (0-based, default: 0). Use with limit for large files."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return. Omit to read all remaining lines from offset."
                         }
                     },
                     "required": ["path"]
@@ -220,7 +228,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_write".to_string(),
-                description: "Write content to a file".to_string(),
+                description: "Write content to a file (creates parent dirs automatically). THE preferred way to write files — no shell escaping issues.\n\nModes:\n- Default: overwrite file with content\n- append=true: add to end of existing file\n- encoding=\"base64\": decode base64 content before writing (for binary files)\n- unescape=true: process escape sequences (\\n to newline, \\t to tab). Default: content written as-is".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -230,7 +238,19 @@ impl ToolHost {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Content to write"
+                            "description": "File content. Use real newlines — they pass through correctly. No need for \\n or base64 workarounds for text files."
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": "If true, append to file instead of overwriting (default: false)"
+                        },
+                        "encoding": {
+                            "type": "string",
+                            "description": "Content encoding: utf8 (default) or base64 (decode before writing, for binary files)"
+                        },
+                        "unescape": {
+                            "type": "boolean",
+                            "description": "If true, process escape sequences (\n→newline, \t→tab). Default: false (content written as-is)."
                         }
                     },
                     "required": ["path", "content"]
@@ -238,8 +258,39 @@ impl ToolHost {
             });
 
             tools.push(ToolInfo {
+                name: "portal_file_edit".to_string(),
+                description: "Find and replace exact text in a file. Safer than sed — no shell escaping issues. Shows line-numbered context after replacement.\n\nBehavior:\n- Single match: replaces it, shows surrounding context\n- Multiple matches with count=1 (default): errors asking for more specific text\n- count=-1: replace ALL occurrences".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path (relative to workspace root)"
+                        },
+                        "old_text": {
+                            "type": "string",
+                            "description": "Exact text to find (multi-line supported with real newlines)"
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "How many occurrences to replace (default: 1). Use -1 for all. If 1 and multiple matches found, will error asking for more context."
+                        },
+                        "unescape": {
+                            "type": "boolean",
+                            "description": "If true, process escape sequences in old_text/new_text (\n→newline, \t→tab). Default: false (match/replace as-is)."
+                        }
+                    },
+                    "required": ["path", "old_text", "new_text"]
+                }),
+            });
+
+            tools.push(ToolInfo {
                 name: "portal_file_list".to_string(),
-                description: "List files in a directory".to_string(),
+                description: "List files and directories. Returns JSON array with name, size, is_dir, modified (unix timestamp) for each entry.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -360,6 +411,7 @@ impl ToolHost {
             "portal_file_read" => file::read(&self.config, arguments).await,
             "portal_file_write" => file::write(&self.config, arguments).await,
             "portal_file_list" => file::list(&self.config, arguments).await,
+            "portal_file_edit" => file::edit(&self.config, arguments).await,
             "portal_screenshot" => {
                 if !self.config.tools.screenshot {
                     anyhow::bail!("portal_screenshot is disabled in configuration");
