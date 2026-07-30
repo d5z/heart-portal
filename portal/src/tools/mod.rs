@@ -81,6 +81,12 @@ impl ToolHost {
         self.custom.load(&self.config.security.workspace_root).await
     }
 
+    /// Pre-spawn eager kits (manifest.eager == true) so the first call has
+    /// no cold-start latency. Failures are logged, not fatal.
+    pub async fn warmup_kits(&self) {
+        self.kits.warmup().await
+    }
+
     /// Reload custom tools and signal for reconnection
     pub async fn reload_custom_tools(&self) -> Result<(usize, Vec<String>)> {
         // Shutdown existing custom MCP servers

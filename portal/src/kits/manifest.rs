@@ -14,6 +14,8 @@ pub struct KitManifest {
     pub tools: Vec<KitToolDef>,
     pub permissions: Option<Vec<String>>,
     pub workspace: Option<bool>,
+    /// When true, Portal pre-spawns this kit's MCP process at startup.
+    pub eager: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +63,28 @@ mod tests {
         assert_eq!(manifest.tools[0].name, "see");
         assert_eq!(manifest.tools[0].params["type"], "object");
         assert_eq!(manifest.workspace, Some(true));
+        assert!(manifest.eager.is_none());
+    }
+
+    #[test]
+    fn parses_manifest_with_eager_true() {
+        let manifest: KitManifest = serde_json::from_str(
+            r#"{
+                "name": "hand",
+                "version": "0.1.0",
+                "command": ["python3", "-m", "hand.mcp_server"],
+                "tools": [{
+                    "name": "see",
+                    "description": "Describe the screen",
+                    "params": {"type": "object"}
+                }],
+                "eager": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.name, "hand");
+        assert_eq!(manifest.eager, Some(true));
     }
 
     #[test]
@@ -82,6 +106,7 @@ mod tests {
         assert_eq!(manifest.name, "notes");
         assert!(manifest.description.is_none());
         assert!(manifest.platform.is_none());
+        assert!(manifest.eager.is_none());
         assert_eq!(manifest.tools.len(), 1);
     }
 }

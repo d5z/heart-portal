@@ -15,6 +15,7 @@ use super::loader::{format_command, LoadedKit};
 
 const MAX_FAILURES: u8 = 3;
 const SPAWN_TIMEOUT_SECS: u64 = 10;
+const WARMUP_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone)]
 pub struct KitManager {
@@ -154,6 +155,43 @@ impl KitManager {
         }
     }
 
+    /// Pre-spawn kits marked `eager: true` so the first tool call has no
+    /// cold-start latency. Failures are logged and non-fatal.
+    pub async fn warmup(&self) {
+        // Phase 1: collect eager, healthy kit names (release lock afterwards).
+        let eager_names: Vec<String> = {
+            let kits = self.kits.lock().await;
+            kits.iter()
+                .filter(|(_, state)| state.kit.manifest.eager == Some(true) && !state.unhealthy)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+
+        if eager_names.is_empty() {
+            return;
+        }
+
+        info!("Warming up {} eager kit(s)", eager_names.len());
+
+        // Phase 2: spawn each kit one at a time, releasing the lock between attempts
+        // so other callers are not blocked for the full warmup window.
+        for name in eager_names {
+            let mut kits = self.kits.lock().await;
+            let Some(state) = kits.get_mut(&name) else {
+                continue;
+            };
+            // Double-check eligibility under the lock.
+            if state.kit.manifest.eager != Some(true) || state.unhealthy {
+                continue;
+            }
+
+            match ensure_connection_with_timeout(state, WARMUP_TIMEOUT_SECS).await {
+                Ok(()) => info!("Warmed up eager kit '{}'", name),
+                Err(err) => warn!("Failed to warm up eager kit '{}': {}", name, err),
+            }
+        }
+    }
+
     pub async fn shutdown(&self) {
         let mut kits = self.kits.lock().await;
         for (name, state) in kits.iter_mut() {
@@ -180,6 +218,10 @@ impl KitManager {
 }
 
 async fn ensure_connection(state: &mut KitState) -> Result<()> {
+    ensure_connection_with_timeout(state, SPAWN_TIMEOUT_SECS).await
+}
+
+async fn ensure_connection_with_timeout(state: &mut KitState, timeout_secs: u64) -> Result<()> {
     if state.unhealthy {
         anyhow::bail!(
             "Kit '{}' is unhealthy. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
@@ -226,7 +268,7 @@ async fn ensure_connection(state: &mut KitState) -> Result<()> {
     };
 
     match timeout(
-        Duration::from_secs(SPAWN_TIMEOUT_SECS),
+        Duration::from_secs(timeout_secs),
         McpConnection::spawn(config),
     )
     .await
@@ -251,7 +293,7 @@ async fn ensure_connection(state: &mut KitState) -> Result<()> {
             let message = format!(
                 "Kit '{}' failed to start: timed out after {} seconds. Command: {}. Check that the command exists and the MCP server implements the stdio protocol.",
                 kit_name,
-                SPAWN_TIMEOUT_SECS,
+                timeout_secs,
                 command_text
             );
             warn!("{}", message);
@@ -330,7 +372,7 @@ mod tests {
     async fn list_healthy_tools_skips_unhealthy_kits() {
         // "broken" kit has a missing binary → pre-marked unhealthy by KitManager::new()
         // "healthy" kit uses /bin/echo → not pre-marked
-        let manager = KitManager::new(vec![loaded_kit("healthy"), loaded_kit("broken")]);
+        let manager = KitManager::new(vec![loaded_kit("healthy", None), loaded_kit("broken", None)]);
 
         let all_tools = manager.list_tools().await;
         let healthy_tools = manager.list_healthy_tools().await;
@@ -340,7 +382,27 @@ mod tests {
         assert_eq!(healthy_tools[0].name, "healthy_ping");
     }
 
-    fn loaded_kit(name: &str) -> LoadedKit {
+    #[tokio::test]
+    async fn warmup_skips_unhealthy_and_non_eager_kits() {
+        // eager=true healthy, eager=false healthy, eager=true but unhealthy (missing binary)
+        let manager = KitManager::new(vec![
+            loaded_kit("eager-ok", Some(true)),
+            loaded_kit("not-eager", Some(false)),
+            loaded_kit("broken", Some(true)),
+        ]);
+
+        manager.warmup().await;
+
+        // Manager remains functional after warmup (failures are non-fatal).
+        let all_tools = manager.list_tools().await;
+        let healthy_tools = manager.list_healthy_tools().await;
+        assert_eq!(all_tools.len(), 3);
+        assert_eq!(healthy_tools.len(), 2);
+        let statuses = manager.statuses().await;
+        assert_eq!(statuses.len(), 3);
+    }
+
+    fn loaded_kit(name: &str, eager: Option<bool>) -> LoadedKit {
         // Use /bin/echo as a real binary so the healthy kit isn't pre-marked unhealthy
         let cmd = if name == "broken" {
             "definitely-missing-kit-binary".to_string()
@@ -363,6 +425,7 @@ mod tests {
                 }],
                 permissions: None,
                 workspace: None,
+                eager,
             },
             kit_dir: PathBuf::from("/tmp"),
             command: vec![cmd],

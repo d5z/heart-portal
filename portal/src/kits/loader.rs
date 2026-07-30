@@ -291,6 +291,7 @@ mod tests {
             tools: vec![],
             permissions: None,
             workspace: None,
+            eager: None,
         };
 
         assert!(!platform_matches(&manifest));
@@ -320,6 +321,7 @@ mod tests {
             tools: vec![],
             permissions: None,
             workspace: None,
+            eager: None,
         };
 
         let warnings = manifest_validation_warnings(&manifest, &[]);
@@ -347,6 +349,7 @@ mod tests {
             }],
             permissions: None,
             workspace: None,
+            eager: None,
         };
 
         let warnings = manifest_validation_warnings(&manifest, &manifest.command);
