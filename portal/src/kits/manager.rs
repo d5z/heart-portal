@@ -115,7 +115,8 @@ impl KitManager {
         for state in kits.values() {
             for tool in &state.kit.manifest.tools {
                 let routed_name = format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name);
-                if routed_name == tool_name {
+                let normalized_query = tool_name.replace('-', "_");
+                if routed_name == normalized_query {
                     return Some((state.kit.manifest.name.clone(), tool.name.clone()));
                 }
             }
@@ -528,6 +529,12 @@ mod tests {
         let (kit_name, tool_name) = result.unwrap();
         assert_eq!(kit_name, "my-kit", "should return original kit name for internal lookup");
         assert_eq!(tool_name, "ping");
+        // Should also resolve with hyphenated form (backward compat)
+        let result2 = manager.resolve_tool("my-kit_ping").await;
+        assert!(result2.is_some(), "should resolve my-kit_ping (hyphen form)");
+        let (kit_name2, tool_name2) = result2.unwrap();
+        assert_eq!(kit_name2, "my-kit");
+        assert_eq!(tool_name2, "ping");
     }
 
     #[tokio::test]
