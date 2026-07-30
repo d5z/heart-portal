@@ -114,7 +114,7 @@ impl KitManager {
         let kits = self.kits.lock().await;
         for state in kits.values() {
             for tool in &state.kit.manifest.tools {
-                let routed_name = format!("{}_{}", state.kit.manifest.name, tool.name);
+                let routed_name = format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name);
                 if routed_name == tool_name {
                     return Some((state.kit.manifest.name.clone(), tool.name.clone()));
                 }
@@ -379,10 +379,15 @@ fn recover_if_cooled_down(state: &mut KitState) {
     }
 }
 
+/// Normalize kit name for tool routing: replace hyphens with underscores.
+fn kit_slug(name: &str) -> String {
+    name.replace('-', "_")
+}
+
 fn push_kit_tools(state: &KitState, tools: &mut Vec<ToolInfo>) {
     for tool in &state.kit.manifest.tools {
         tools.push(ToolInfo {
-            name: format!("{}_{}", state.kit.manifest.name, tool.name),
+            name: format!("{}_{}", kit_slug(&state.kit.manifest.name), tool.name),
             description: tool.description.clone(),
             input_schema: tool.params.clone(),
         });
@@ -505,6 +510,33 @@ mod tests {
     use super::*;
     use crate::kits::manifest::{KitManifest, KitToolDef};
     use std::path::PathBuf;
+
+    #[test]
+    fn kit_slug_normalizes_hyphens() {
+        assert_eq!(kit_slug("agent-reach"), "agent_reach");
+        assert_eq!(kit_slug("cua-driver"), "cua_driver");
+        assert_eq!(kit_slug("cursor"), "cursor");
+        assert_eq!(kit_slug("a-b-c"), "a_b_c");
+    }
+
+    #[tokio::test]
+    async fn resolve_tool_normalizes_kit_hyphens() {
+        let manager = KitManager::new(vec![loaded_kit("my-kit", None)]);
+        // Should resolve with underscored form
+        let result = manager.resolve_tool("my_kit_ping").await;
+        assert!(result.is_some(), "should resolve my_kit_ping");
+        let (kit_name, tool_name) = result.unwrap();
+        assert_eq!(kit_name, "my-kit", "should return original kit name for internal lookup");
+        assert_eq!(tool_name, "ping");
+    }
+
+    #[tokio::test]
+    async fn list_tools_uses_normalized_names() {
+        let manager = KitManager::new(vec![loaded_kit("my-kit", None)]);
+        let tools = manager.list_tools().await;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "my_kit_ping", "exposed tool name should use underscores");
+    }
 
     #[tokio::test]
     async fn list_healthy_tools_skips_unhealthy_kits() {
