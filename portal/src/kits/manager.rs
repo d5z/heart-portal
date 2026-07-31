@@ -39,7 +39,7 @@ struct KitState {
     /// When the most recent failure occurred; used to gate self-healing after
     /// `RECOVERY_COOLDOWN_SECS`.
     last_failure_at: Option<Instant>,
-    /// Calls since last heartbeat report
+    /// Calls since last `portal_kit_usage` drain
     unsent_calls: u64,
 }
 
@@ -340,82 +340,18 @@ impl KitManager {
         }
     }
 
-    /// Periodically report incremental kit call counts to Grove.
-    pub fn start_heartbeat_task(
-        &self,
-        grove_url: String,
-        grove_token: String,
-    ) -> tokio::task::JoinHandle<()> {
-        let kits = self.kits.clone();
-        tokio::spawn(async move {
-            let client = reqwest::Client::new();
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                flush_heartbeats_inner(&kits, &client, &grove_url, &grove_token).await;
-            }
-        })
-    }
-
-    /// Flush remaining unsent call counts once (e.g. on graceful shutdown).
-    pub async fn flush_heartbeats(&self, grove_url: &str, grove_token: &str) {
-        let client = reqwest::Client::new();
-        flush_heartbeats_inner(&self.kits, &client, grove_url, grove_token).await;
-    }
-}
-
-async fn flush_heartbeats_inner(
-    kits: &Arc<Mutex<BTreeMap<String, KitState>>>,
-    client: &reqwest::Client,
-    grove_url: &str,
-    grove_token: &str,
-) {
-    let pending: Vec<(String, u64)> = {
-        let mut kits = kits.lock().await;
-        let mut pending = Vec::new();
+    /// Drain accumulated call counts per kit since the last drain, resetting
+    /// counters to zero. Only kits with count > 0 are included.
+    pub async fn drain_usage_counts(&self) -> HashMap<String, u64> {
+        let mut result = HashMap::new();
+        let mut kits = self.kits.lock().await;
         for (name, state) in kits.iter_mut() {
-            if state.unsent_calls > 0 {
-                let count = state.unsent_calls;
-                state.unsent_calls = 0;
-                pending.push((name.clone(), count));
+            let count = std::mem::take(&mut state.unsent_calls);
+            if count > 0 {
+                result.insert(name.clone(), count);
             }
         }
-        pending
-    };
-
-    for (kit_name, calls) in pending {
-        let url = format!(
-            "{}/api/grove/{}/heartbeat?token={}",
-            grove_url, kit_name, grove_token
-        );
-        let result = client
-            .post(&url)
-            .json(&serde_json::json!({ "calls": calls }))
-            .send()
-            .await;
-
-        let ok = match result {
-            Ok(resp) if resp.status().is_success() => true,
-            Ok(resp) => {
-                warn!(
-                    "Grove heartbeat for kit '{}' failed: HTTP {}",
-                    kit_name,
-                    resp.status()
-                );
-                false
-            }
-            Err(err) => {
-                warn!("Grove heartbeat for kit '{}' failed: {}", kit_name, err);
-                false
-            }
-        };
-
-        if !ok {
-            let mut kits = kits.lock().await;
-            if let Some(state) = kits.get_mut(&kit_name) {
-                state.unsent_calls = state.unsent_calls.saturating_add(calls);
-            }
-        }
+        result
     }
 }
 

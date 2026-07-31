@@ -65,9 +65,6 @@ impl ToolHost {
     }
 
     pub async fn kill_all_managed_processes(&self) {
-        if let (Some(url), Some(token)) = (&self.config.grove.url, &self.config.grove.token) {
-            self.kits.flush_heartbeats(url, token).await;
-        }
         self.process_manager.kill_all().await;
         self.kits.shutdown().await;
     }
@@ -88,15 +85,6 @@ impl ToolHost {
     /// no cold-start latency. Failures are logged, not fatal.
     pub async fn warmup_kits(&self) {
         self.kits.warmup().await
-    }
-
-    /// Start Grove heartbeat reporter for kit call counts.
-    pub fn start_grove_heartbeat(
-        &self,
-        grove_url: String,
-        grove_token: String,
-    ) -> tokio::task::JoinHandle<()> {
-        self.kits.start_heartbeat_task(grove_url, grove_token)
     }
 
     /// Periodically re-scan the kits directory and refresh manifests in place.
@@ -411,6 +399,18 @@ impl ToolHost {
             }),
         });
 
+        if self.config.kits_enabled {
+            tools.push(ToolInfo {
+                name: "portal_kit_usage".to_string(),
+                description: "Returns accumulated call counts per kit since last drain, then resets counters to zero".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            });
+        }
+
         tools
     }
 
@@ -457,6 +457,13 @@ impl ToolHost {
             "portal_web_search" => web_search::search(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
+            "portal_kit_usage" => {
+                let counts = self.kits.drain_usage_counts().await;
+                let text = serde_json::to_string(&counts)?;
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": text}]
+                }))
+            }
             _ => anyhow::bail!("Unknown tool: {}", tool_name),
         }
     }
