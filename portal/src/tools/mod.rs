@@ -65,6 +65,9 @@ impl ToolHost {
     }
 
     pub async fn kill_all_managed_processes(&self) {
+        if let (Some(url), Some(token)) = (&self.config.grove.url, &self.config.grove.token) {
+            self.kits.flush_heartbeats(url, token).await;
+        }
         self.process_manager.kill_all().await;
         self.kits.shutdown().await;
     }
@@ -85,6 +88,31 @@ impl ToolHost {
     /// no cold-start latency. Failures are logged, not fatal.
     pub async fn warmup_kits(&self) {
         self.kits.warmup().await
+    }
+
+    /// Start Grove heartbeat reporter for kit call counts.
+    pub fn start_grove_heartbeat(
+        &self,
+        grove_url: String,
+        grove_token: String,
+    ) -> tokio::task::JoinHandle<()> {
+        self.kits.start_heartbeat_task(grove_url, grove_token)
+    }
+
+    /// Periodically re-scan the kits directory and refresh manifests in place.
+    pub fn start_kit_refresh_task(&self) -> tokio::task::JoinHandle<()> {
+        let kits = self.kits.clone();
+        let kits_dir = loader::kits_dir(&self.config);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match loader::load_kits_from_dir(&kits_dir) {
+                    Ok(fresh) => kits.refresh_kits(fresh).await,
+                    Err(err) => warn!("Failed to scan kits directory for refresh: {}", err),
+                }
+            }
+        })
     }
 
     /// Reload custom tools and signal for reconnection

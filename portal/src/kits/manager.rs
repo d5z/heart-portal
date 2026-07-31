@@ -39,6 +39,8 @@ struct KitState {
     /// When the most recent failure occurred; used to gate self-healing after
     /// `RECOVERY_COOLDOWN_SECS`.
     last_failure_at: Option<Instant>,
+    /// Calls since last heartbeat report
+    unsent_calls: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +77,7 @@ impl KitManager {
                     failure_count: 0,
                     unhealthy: pre_unhealthy,
                     last_failure_at: None,
+                    unsent_calls: 0,
                 },
             );
         }
@@ -182,6 +185,7 @@ impl KitManager {
         match result {
             Ok(value) => {
                 state.failure_count = 0;
+                state.unsent_calls += 1;
                 Ok(value)
             }
             Err(err) => {
@@ -264,6 +268,154 @@ impl KitManager {
                 status: status_text(state).to_string(),
             })
             .collect()
+    }
+
+    /// Reconcile in-memory kit state with a freshly scanned kit list.
+    /// Existing connections are dropped (not shut down) so the next tool call
+    /// re-spawns with the updated manifest; `unsent_calls` is preserved.
+    pub async fn refresh_kits(&self, fresh: Vec<LoadedKit>) {
+        let mut kits = self.kits.lock().await;
+        let mut seen = std::collections::HashSet::new();
+
+        for kit in fresh {
+            let name = kit.manifest.name.clone();
+            seen.insert(name.clone());
+
+            if let Some(state) = kits.get_mut(&name) {
+                let old_json = serde_json::to_string(&state.kit.manifest).unwrap_or_default();
+                let new_json = serde_json::to_string(&kit.manifest).unwrap_or_default();
+                if old_json != new_json {
+                    let old_version = state.kit.manifest.version.clone();
+                    let new_version = kit.manifest.version.clone();
+                    state.kit.manifest = kit.manifest;
+                    state.kit.command = kit.command;
+                    state.kit.kit_dir = kit.kit_dir;
+                    // Drop the handle only — do not shut down the process.
+                    state.connection = None;
+                    state.failure_count = 0;
+                    state.unhealthy = false;
+                    state.last_failure_at = None;
+                    info!(
+                        "Kit '{}' manifest refreshed (v{} → v{})",
+                        name, old_version, new_version
+                    );
+                }
+            } else {
+                let version = kit.manifest.version.clone();
+                let pre_unhealthy = kit.command.is_empty()
+                    || (!kit.command[0].is_empty() && !command_binary_exists(&kit.command[0]));
+                if pre_unhealthy {
+                    warn!(
+                        "Kit '{}' pre-marked unhealthy: command binary not found: {}",
+                        name,
+                        kit.command.first().map(|s| s.as_str()).unwrap_or("<empty>")
+                    );
+                }
+                kits.insert(
+                    name.clone(),
+                    KitState {
+                        kit,
+                        connection: None,
+                        failure_count: 0,
+                        unhealthy: pre_unhealthy,
+                        last_failure_at: None,
+                        unsent_calls: 0,
+                    },
+                );
+                info!("Kit '{}' discovered (v{})", name, version);
+            }
+        }
+
+        let to_remove: Vec<String> = kits
+            .keys()
+            .filter(|name| !seen.contains(*name))
+            .cloned()
+            .collect();
+        for name in to_remove {
+            if let Some(mut state) = kits.remove(&name) {
+                // Drop the handle only — do not shut down the process.
+                state.connection = None;
+                info!("Kit '{}' removed", name);
+            }
+        }
+    }
+
+    /// Periodically report incremental kit call counts to Grove.
+    pub fn start_heartbeat_task(
+        &self,
+        grove_url: String,
+        grove_token: String,
+    ) -> tokio::task::JoinHandle<()> {
+        let kits = self.kits.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                flush_heartbeats_inner(&kits, &client, &grove_url, &grove_token).await;
+            }
+        })
+    }
+
+    /// Flush remaining unsent call counts once (e.g. on graceful shutdown).
+    pub async fn flush_heartbeats(&self, grove_url: &str, grove_token: &str) {
+        let client = reqwest::Client::new();
+        flush_heartbeats_inner(&self.kits, &client, grove_url, grove_token).await;
+    }
+}
+
+async fn flush_heartbeats_inner(
+    kits: &Arc<Mutex<BTreeMap<String, KitState>>>,
+    client: &reqwest::Client,
+    grove_url: &str,
+    grove_token: &str,
+) {
+    let pending: Vec<(String, u64)> = {
+        let mut kits = kits.lock().await;
+        let mut pending = Vec::new();
+        for (name, state) in kits.iter_mut() {
+            if state.unsent_calls > 0 {
+                let count = state.unsent_calls;
+                state.unsent_calls = 0;
+                pending.push((name.clone(), count));
+            }
+        }
+        pending
+    };
+
+    for (kit_name, calls) in pending {
+        let url = format!(
+            "{}/api/grove/{}/heartbeat?token={}",
+            grove_url, kit_name, grove_token
+        );
+        let result = client
+            .post(&url)
+            .json(&serde_json::json!({ "calls": calls }))
+            .send()
+            .await;
+
+        let ok = match result {
+            Ok(resp) if resp.status().is_success() => true,
+            Ok(resp) => {
+                warn!(
+                    "Grove heartbeat for kit '{}' failed: HTTP {}",
+                    kit_name,
+                    resp.status()
+                );
+                false
+            }
+            Err(err) => {
+                warn!("Grove heartbeat for kit '{}' failed: {}", kit_name, err);
+                false
+            }
+        };
+
+        if !ok {
+            let mut kits = kits.lock().await;
+            if let Some(state) = kits.get_mut(&kit_name) {
+                state.unsent_calls = state.unsent_calls.saturating_add(calls);
+            }
+        }
     }
 }
 
@@ -759,6 +911,7 @@ mod tests {
             failure_count: 0,
             unhealthy: false,
             last_failure_at: None,
+            unsent_calls: 0,
         }
     }
 

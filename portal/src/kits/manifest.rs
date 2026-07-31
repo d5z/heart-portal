@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Deserialize from a kit's manifest.json.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KitManifest {
     pub name: String,
     pub version: String,
@@ -18,7 +18,7 @@ pub struct KitManifest {
     pub eager: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KitToolDef {
     pub name: String,
     pub description: String,

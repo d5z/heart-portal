@@ -135,6 +135,16 @@ async fn main() -> Result<()> {
     // Initialize tool host (built-in + custom)
     let tool_host = ToolHost::new(&config);
 
+    if let (Some(grove_url), Some(grove_token)) = (&config.grove.url, &config.grove.token) {
+        tool_host.start_grove_heartbeat(grove_url.clone(), grove_token.clone());
+        info!("Grove heartbeat reporter started → {}", grove_url);
+    }
+
+    if config.kits_enabled {
+        tool_host.start_kit_refresh_task();
+        info!("Kit manifest hot-reload started (every 60s)");
+    }
+
     let cleanup_host = tool_host.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));

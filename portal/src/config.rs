@@ -63,6 +63,16 @@ struct RawConfig {
     /// Enable kit discovery and tool proxying.
     #[serde(default)]
     kits_enabled: Option<bool>,
+
+    /// Grove (beings.town) heartbeat reporting.
+    #[serde(default)]
+    grove: Option<GroveRaw>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GroveRaw {
+    url: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +106,16 @@ pub struct PortalConfig {
     pub portal_mcp_token: Option<String>,
     pub kits_dir: Option<String>,
     pub kits_enabled: bool,
+    pub grove: GroveConfig,
+}
+
+/// Grove server heartbeat configuration.
+#[derive(Debug, Clone, Default)]
+pub struct GroveConfig {
+    /// Grove server URL, e.g. "https://beings.town"
+    pub url: Option<String>,
+    /// Bearer token for grove API auth (fallback when not behind trusted Caddy)
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +170,7 @@ impl Default for PortalConfig {
             portal_mcp_token: None,
             kits_dir: Some(default_kits_dir()),
             kits_enabled: true,
+            grove: GroveConfig::default(),
         }
     }
 }
@@ -212,8 +233,15 @@ impl PortalConfig {
             http_port: raw.cowork.as_ref().and_then(|c| c.http_port).unwrap_or(port + 1),
         };
 
+        let name = raw.name.unwrap_or_else(|| "portal".to_string());
+        let grove_raw = raw.grove.unwrap_or_default();
+        let grove = GroveConfig {
+            url: grove_raw.url.filter(|s| !s.trim().is_empty()),
+            token: grove_raw.token.filter(|s| !s.trim().is_empty()),
+        };
+
         Ok(PortalConfig {
-            name: raw.name.unwrap_or_else(|| "portal".to_string()),
+            name,
             bind_host: host,
             bind_port: port,
             tools: raw.tools.unwrap_or_default(),
@@ -225,6 +253,7 @@ impl PortalConfig {
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| Some(default_kits_dir())),
             kits_enabled: raw.kits_enabled.unwrap_or(true),
+            grove,
         })
     }
 }
