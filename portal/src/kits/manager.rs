@@ -39,6 +39,8 @@ struct KitState {
     /// When the most recent failure occurred; used to gate self-healing after
     /// `RECOVERY_COOLDOWN_SECS`.
     last_failure_at: Option<Instant>,
+    /// Calls since last `portal_kit_usage` drain
+    unsent_calls: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +77,7 @@ impl KitManager {
                     failure_count: 0,
                     unhealthy: pre_unhealthy,
                     last_failure_at: None,
+                    unsent_calls: 0,
                 },
             );
         }
@@ -175,22 +178,30 @@ impl KitManager {
 
         // Phase 3: re-acquire the lock only to update health bookkeeping.
         let mut kits = self.kits.lock().await;
-        let state = kits
-            .get_mut(kit_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown kit: {}", kit_name))?;
-
-        match result {
-            Ok(value) => {
-                state.failure_count = 0;
-                Ok(value)
+        match kits.get_mut(kit_name) {
+            Some(state) => {
+                match result {
+                    Ok(value) => {
+                        state.failure_count = 0;
+                        state.unsent_calls += 1;
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        warn!("Kit '{}' tool '{}' failed: {}", kit_name, tool_name, err);
+                        drop_connection(state).await;
+                        record_failure(state);
+                        Err(err).with_context(|| {
+                            format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
+                        })
+                    }
+                }
             }
-            Err(err) => {
-                warn!("Kit '{}' tool '{}' failed: {}", kit_name, tool_name, err);
-                drop_connection(state).await;
-                record_failure(state);
-                Err(err).with_context(|| {
-                    format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
-                })
+            None => {
+                warn!(
+                    "Kit '{}' was removed during call_tool; returning Phase 2 result as-is",
+                    kit_name
+                );
+                result.with_context(|| format!("Kit '{}' removed during call", kit_name))
             }
         }
     }
@@ -264,6 +275,94 @@ impl KitManager {
                 status: status_text(state).to_string(),
             })
             .collect()
+    }
+
+    /// Reconcile in-memory kit state with a freshly scanned kit list.
+    /// Existing connections are shut down so the next tool call re-spawns
+    /// with the updated manifest; `unsent_calls` is preserved.
+    pub async fn refresh_kits(&self, fresh: Vec<LoadedKit>) {
+        let mut kits = self.kits.lock().await;
+        let mut seen = std::collections::HashSet::new();
+
+        for kit in fresh {
+            let name = kit.manifest.name.clone();
+            if !seen.insert(name.clone()) {
+                warn!(
+                    "Kit '{}' appears multiple times in manifest list, skipping duplicate",
+                    name
+                );
+                continue;
+            }
+
+            if let Some(state) = kits.get_mut(&name) {
+                let old_json = serde_json::to_string(&state.kit.manifest).unwrap_or_default();
+                let new_json = serde_json::to_string(&kit.manifest).unwrap_or_default();
+                if old_json != new_json {
+                    let old_version = state.kit.manifest.version.clone();
+                    let new_version = kit.manifest.version.clone();
+                    state.kit.manifest = kit.manifest;
+                    state.kit.command = kit.command;
+                    state.kit.kit_dir = kit.kit_dir;
+                    drop_connection(state).await;
+                    state.failure_count = 0;
+                    state.unhealthy = false;
+                    state.last_failure_at = None;
+                    info!(
+                        "Kit '{}' manifest refreshed (v{} → v{})",
+                        name, old_version, new_version
+                    );
+                }
+            } else {
+                let version = kit.manifest.version.clone();
+                let pre_unhealthy = kit.command.is_empty()
+                    || (!kit.command[0].is_empty() && !command_binary_exists(&kit.command[0]));
+                if pre_unhealthy {
+                    warn!(
+                        "Kit '{}' pre-marked unhealthy: command binary not found: {}",
+                        name,
+                        kit.command.first().map(|s| s.as_str()).unwrap_or("<empty>")
+                    );
+                }
+                kits.insert(
+                    name.clone(),
+                    KitState {
+                        kit,
+                        connection: None,
+                        failure_count: 0,
+                        unhealthy: pre_unhealthy,
+                        last_failure_at: None,
+                        unsent_calls: 0,
+                    },
+                );
+                info!("Kit '{}' discovered (v{})", name, version);
+            }
+        }
+
+        let to_remove: Vec<String> = kits
+            .keys()
+            .filter(|name| !seen.contains(*name))
+            .cloned()
+            .collect();
+        for name in to_remove {
+            if let Some(mut state) = kits.remove(&name) {
+                drop_connection(&mut state).await;
+                info!("Kit '{}' removed", name);
+            }
+        }
+    }
+
+    /// Drain accumulated call counts per kit since the last drain, resetting
+    /// counters to zero. Only kits with count > 0 are included.
+    pub async fn drain_usage_counts(&self) -> HashMap<String, u64> {
+        let mut result = HashMap::new();
+        let mut kits = self.kits.lock().await;
+        for (name, state) in kits.iter_mut() {
+            let count = std::mem::take(&mut state.unsent_calls);
+            if count > 0 {
+                result.insert(name.clone(), count);
+            }
+        }
+        result
     }
 }
 
@@ -759,6 +858,7 @@ mod tests {
             failure_count: 0,
             unhealthy: false,
             last_failure_at: None,
+            unsent_calls: 0,
         }
     }
 

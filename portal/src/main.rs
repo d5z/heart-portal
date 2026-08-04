@@ -135,6 +135,11 @@ async fn main() -> Result<()> {
     // Initialize tool host (built-in + custom)
     let tool_host = ToolHost::new(&config);
 
+    if config.kits_enabled {
+        tool_host.start_kit_refresh_task();
+        info!("Kit manifest hot-reload started (every 60s)");
+    }
+
     let cleanup_host = tool_host.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));

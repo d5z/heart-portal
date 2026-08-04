@@ -212,8 +212,10 @@ impl PortalConfig {
             http_port: raw.cowork.as_ref().and_then(|c| c.http_port).unwrap_or(port + 1),
         };
 
+        let name = raw.name.unwrap_or_else(|| "portal".to_string());
+
         Ok(PortalConfig {
-            name: raw.name.unwrap_or_else(|| "portal".to_string()),
+            name,
             bind_host: host,
             bind_port: port,
             tools: raw.tools.unwrap_or_default(),

@@ -87,6 +87,22 @@ impl ToolHost {
         self.kits.warmup().await
     }
 
+    /// Periodically re-scan the kits directory and refresh manifests in place.
+    pub fn start_kit_refresh_task(&self) -> tokio::task::JoinHandle<()> {
+        let kits = self.kits.clone();
+        let kits_dir = loader::kits_dir(&self.config);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match loader::load_kits_from_dir(&kits_dir) {
+                    Ok(fresh) => kits.refresh_kits(fresh).await,
+                    Err(err) => warn!("Failed to scan kits directory for refresh: {}", err),
+                }
+            }
+        })
+    }
+
     /// Reload custom tools and signal for reconnection
     pub async fn reload_custom_tools(&self) -> Result<(usize, Vec<String>)> {
         // Shutdown existing custom MCP servers
@@ -383,6 +399,18 @@ impl ToolHost {
             }),
         });
 
+        if self.config.kits_enabled {
+            tools.push(ToolInfo {
+                name: "portal_kit_usage".to_string(),
+                description: "Returns accumulated call counts per kit since last drain, then resets counters to zero".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            });
+        }
+
         tools
     }
 
@@ -429,6 +457,13 @@ impl ToolHost {
             "portal_web_search" => web_search::search(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
+            "portal_kit_usage" => {
+                let counts = self.kits.drain_usage_counts().await;
+                let text = serde_json::to_string(&counts)?;
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": text}]
+                }))
+            }
             _ => anyhow::bail!("Unknown tool: {}", tool_name),
         }
     }
