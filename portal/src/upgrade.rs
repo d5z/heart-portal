@@ -200,14 +200,24 @@ fn stop_running_portal(install_dir: &Path) {
 }
 
 #[cfg(target_os = "macos")]
-fn unlock_gatekeeper(path: &Path) {
+pub fn unlock_gatekeeper(path: &Path) {
+    // Remove ALL extended attributes — including com.apple.provenance
+    // which macOS adds to files transferred via scp/AirDrop/download.
+    // Without this, macOS sends SIGKILL (-9) on exec.
     let _ = std::process::Command::new("xattr")
         .args(["-cr", &path.to_string_lossy()])
+        .status();
+
+    // Ad-hoc re-sign: the linker signature from the build machine may be
+    // invalidated by transfer.  A fresh ad-hoc signature lets Gatekeeper
+    // and the hardened-runtime check pass without a Developer ID.
+    let _ = std::process::Command::new("codesign")
+        .args(["-s", "-", "--force", "--deep", &path.to_string_lossy()])
         .status();
 }
 
 #[cfg(not(target_os = "macos"))]
-fn unlock_gatekeeper(_path: &Path) {}
+pub fn unlock_gatekeeper(_path: &Path) {}
 
 fn restart_portal(install_dir: &Path) -> Result<()> {
     #[cfg(unix)]

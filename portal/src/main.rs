@@ -92,6 +92,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // macOS: ensure our own binary is clear of quarantine/provenance xattrs
+    // that would cause SIGKILL on next launchd restart.
+    if let Ok(exe) = std::env::current_exe() {
+        upgrade::unlock_gatekeeper(&exe);
+    }
+
     let connect_link = cli.connect;
     let config_path = cli
         .config
