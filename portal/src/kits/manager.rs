@@ -178,23 +178,30 @@ impl KitManager {
 
         // Phase 3: re-acquire the lock only to update health bookkeeping.
         let mut kits = self.kits.lock().await;
-        let state = kits
-            .get_mut(kit_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown kit: {}", kit_name))?;
-
-        match result {
-            Ok(value) => {
-                state.failure_count = 0;
-                state.unsent_calls += 1;
-                Ok(value)
+        match kits.get_mut(kit_name) {
+            Some(state) => {
+                match result {
+                    Ok(value) => {
+                        state.failure_count = 0;
+                        state.unsent_calls += 1;
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        warn!("Kit '{}' tool '{}' failed: {}", kit_name, tool_name, err);
+                        drop_connection(state).await;
+                        record_failure(state);
+                        Err(err).with_context(|| {
+                            format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
+                        })
+                    }
+                }
             }
-            Err(err) => {
-                warn!("Kit '{}' tool '{}' failed: {}", kit_name, tool_name, err);
-                drop_connection(state).await;
-                record_failure(state);
-                Err(err).with_context(|| {
-                    format!("Failed to call kit '{}' tool '{}'", kit_name, tool_name)
-                })
+            None => {
+                warn!(
+                    "Kit '{}' was removed during call_tool; returning Phase 2 result as-is",
+                    kit_name
+                );
+                result.with_context(|| format!("Kit '{}' removed during call", kit_name))
             }
         }
     }
@@ -271,15 +278,21 @@ impl KitManager {
     }
 
     /// Reconcile in-memory kit state with a freshly scanned kit list.
-    /// Existing connections are dropped (not shut down) so the next tool call
-    /// re-spawns with the updated manifest; `unsent_calls` is preserved.
+    /// Existing connections are shut down so the next tool call re-spawns
+    /// with the updated manifest; `unsent_calls` is preserved.
     pub async fn refresh_kits(&self, fresh: Vec<LoadedKit>) {
         let mut kits = self.kits.lock().await;
         let mut seen = std::collections::HashSet::new();
 
         for kit in fresh {
             let name = kit.manifest.name.clone();
-            seen.insert(name.clone());
+            if !seen.insert(name.clone()) {
+                warn!(
+                    "Kit '{}' appears multiple times in manifest list, skipping duplicate",
+                    name
+                );
+                continue;
+            }
 
             if let Some(state) = kits.get_mut(&name) {
                 let old_json = serde_json::to_string(&state.kit.manifest).unwrap_or_default();
@@ -290,8 +303,7 @@ impl KitManager {
                     state.kit.manifest = kit.manifest;
                     state.kit.command = kit.command;
                     state.kit.kit_dir = kit.kit_dir;
-                    // Drop the handle only — do not shut down the process.
-                    state.connection = None;
+                    drop_connection(state).await;
                     state.failure_count = 0;
                     state.unhealthy = false;
                     state.last_failure_at = None;
@@ -333,8 +345,7 @@ impl KitManager {
             .collect();
         for name in to_remove {
             if let Some(mut state) = kits.remove(&name) {
-                // Drop the handle only — do not shut down the process.
-                state.connection = None;
+                drop_connection(&mut state).await;
                 info!("Kit '{}' removed", name);
             }
         }
