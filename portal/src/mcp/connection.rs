@@ -4,12 +4,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse, McpToolInfo};
+
+/// Default timeout for MCP handshake and metadata requests (initialize, tools/list).
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for tool calls — tools may run for minutes (code review, web fetch, etc.).
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Configuration for a stdio MCP server process.
 #[derive(Debug, Clone)]
@@ -168,7 +174,12 @@ impl McpConnection {
         pending.clear();
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let request = JsonRpcRequest::new(method, params, &self.next_id);
         let request_id = request
             .id
@@ -210,15 +221,23 @@ impl McpConnection {
             }
         }
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .with_context(|| {
+        let response = match tokio::time::timeout(timeout, rx).await {
+            Ok(result) => result.with_context(|| {
                 format!(
-                    "Timeout waiting for response from MCP server '{}'",
+                    "Response channel closed for MCP server '{}'",
                     self.config.name
                 )
-            })?
-            .with_context(|| format!("Response channel closed for MCP server '{}'", self.config.name))?;
+            })?,
+            Err(_) => {
+                // Clean up pending request on timeout
+                self.responses.lock().await.remove(&request_id);
+                anyhow::bail!(
+                    "Timeout ({}s) waiting for response from MCP server '{}'",
+                    timeout.as_secs(),
+                    self.config.name
+                );
+            }
+        };
 
         if let Some(error) = response.error {
             anyhow::bail!(
@@ -235,6 +254,11 @@ impl McpConnection {
                 self.config.name
             )
         })
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, DEFAULT_RPC_TIMEOUT)
+            .await
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -327,12 +351,13 @@ impl McpConnection {
         );
 
         let result = self
-            .request(
+            .request_with_timeout(
                 "tools/call",
                 serde_json::json!({
                     "name": tool_name,
                     "arguments": arguments
                 }),
+                TOOL_CALL_TIMEOUT,
             )
             .await?;
 
