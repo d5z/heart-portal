@@ -22,7 +22,7 @@ use crate::tools::ToolHost;
 /// on platforms (Windows) where network devices may kill idle TCP.
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 /// If no Pong is received within this window, reconnect (D-077).
-const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 
 /// Build relay handshake JSON (`portal_name` identifies this Portal instance; D-077).
 pub(crate) fn relay_handshake_json(being_id: &str, loom_token: &str, portal_name: &str) -> serde_json::Value {
@@ -185,6 +185,7 @@ async fn run_one_session(
     let last_pong_ping = std::sync::Arc::clone(&last_pong);
     let ws_to_bridge = tokio::spawn(async move {
         while let Some(msg) = ws_read.next().await {
+            *last_pong_ping.lock().await = Instant::now();
             match msg {
                 Ok(Message::Text(t)) => {
                     let mut data = t.as_bytes().to_vec();
@@ -201,9 +202,7 @@ async fn run_one_session(
                         break;
                     }
                 }
-                Ok(Message::Pong(_)) => {
-                    *last_pong_ping.lock().await = Instant::now();
-                }
+                Ok(Message::Pong(_)) => {}
                 Ok(Message::Close(_)) => break,
                 Ok(_) => {}
                 Err(_) => break,
