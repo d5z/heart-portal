@@ -167,11 +167,23 @@ impl Default for ToolsConfig {
     }
 }
 
+/// Default workspace root, platform-aware.
+/// On Windows, /workspace does not exist; default to %USERPROFILE%\workspace.
+fn default_workspace() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(home).join("workspace");
+        }
+    }
+    PathBuf::from("/workspace")
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             exec_allowlist: vec![],
-            workspace_root: PathBuf::from("/workspace"),
+            workspace_root: default_workspace(),
             max_file_size: 10 * 1024 * 1024,
         }
     }
@@ -195,7 +207,7 @@ impl PortalConfig {
         // Resolve workspace: flat `workspace` > security.workspace_root > default
         let workspace = raw.workspace
             .or_else(|| raw.security.as_ref().and_then(|s| s.workspace_root.clone()))
-            .unwrap_or_else(|| PathBuf::from("/workspace"));
+            .unwrap_or_else(default_workspace);
 
         let security = SecurityConfig {
             exec_allowlist: raw.security.as_ref()
