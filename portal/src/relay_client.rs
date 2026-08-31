@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{info, warn};
@@ -21,8 +22,15 @@ use crate::tools::ToolHost;
 /// Reduced from 30s to 15s in v0.7.1 to shrink the no-activity window
 /// on platforms (Windows) where network devices may kill idle TCP.
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
-/// If no Pong is received within this window, reconnect (D-077).
+/// If no relay frame is received within this window, reconnect (D-077).
 const HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+
+#[derive(Deserialize)]
+struct HandshakeResponse {
+    ok: bool,
+    #[serde(default)]
+    relay_keepalive: Option<String>,
+}
 
 /// Build relay handshake JSON (`portal_name` identifies this Portal instance; D-077).
 pub(crate) fn relay_handshake_json(being_id: &str, loom_token: &str, portal_name: &str) -> serde_json::Value {
@@ -78,7 +86,7 @@ fn derive_relay_url(_loom_link: &str, host: &str) -> String {
     format!("{scheme}://{host}/_relay")
 }
 
-/// Run connect mode with automatic reconnect (exponential backoff, max 60s).
+/// Run connect mode with automatic reconnect (exponential backoff, 2s..30s + jitter).
 pub async fn connect_and_serve(
     loom_link: &str,
     tool_host: &ToolHost,
@@ -97,21 +105,81 @@ pub async fn connect_and_serve(
         relay_url, being_id, portal_name, host
     );
 
-    let mut backoff = Duration::from_secs(5);
+    let mut backoff = Duration::from_secs(BACKOFF_MIN_SECS);
     loop {
+        let session_start = Instant::now();
         match run_one_session(&relay_url, &being_id, &token, tool_host, portal_name).await {
             Ok(()) => {
-                backoff = Duration::from_secs(5);
+                backoff = Duration::from_secs(BACKOFF_MIN_SECS);
                 info!("relay session ended cleanly; reconnecting in {:?}", backoff);
             }
             Err(e) => {
-                warn!("relay session error: {e:#}; retry in {:?}", backoff);
+                // Ratchet fix: `run_one_session` almost always ends in Err
+                // (heartbeat timeout = bail!), so resetting only on Ok left
+                // long-lived Portals stuck at the max backoff forever. A
+                // session that survived past HEALTHY_SESSION_SECS proves the
+                // link itself was fine — treat it as a normal session end.
+                if session_start.elapsed() > Duration::from_secs(HEALTHY_SESSION_SECS) {
+                    backoff = Duration::from_secs(BACKOFF_MIN_SECS);
+                    info!(
+                        "relay session ran {}s before error, resetting backoff: {e:#}",
+                        session_start.elapsed().as_secs()
+                    );
+                } else {
+                    warn!(
+                        "relay session error after {}s: {e:#}; retry in {:?}",
+                        session_start.elapsed().as_secs(),
+                        backoff
+                    );
+                }
             }
         }
-        tokio::time::sleep(backoff).await;
-        let next_secs = (backoff.as_secs().saturating_mul(2)).min(60).max(5);
-        backoff = Duration::from_secs(next_secs);
+        tokio::time::sleep(Duration::from_millis(backoff_sleep_ms(backoff, jitter_ratio())))
+            .await;
+        backoff = next_backoff(backoff);
     }
+}
+
+/// Reconnect backoff floor (also the reset value).
+const BACKOFF_MIN_SECS: u64 = 2;
+/// Reconnect backoff ceiling.
+const BACKOFF_MAX_SECS: u64 = 30;
+/// A session living longer than this counts as healthy: its error is a normal
+/// session end (heartbeat timeout), not a connect failure, so backoff resets.
+const HEALTHY_SESSION_SECS: u64 = 60;
+/// Never sleep less than this between reconnects (protects the relay from a
+/// hot reconnect loop when backoff is at its floor and jitter is negative).
+const BACKOFF_FLOOR_MS: u64 = 1000;
+
+/// Pseudo-random jitter ratio in `[-0.3, 0.3)`, derived from the clock so no
+/// RNG dependency is needed. Spreads reconnects when many Portals restart together.
+fn jitter_ratio() -> f64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut h);
+    // 0.0..1.0 → -0.3..0.3
+    ((h.finish() % 10_000) as f64 / 10_000.0) * 0.6 - 0.3
+}
+
+/// Apply `ratio` jitter to `backoff`, clamped to [`BACKOFF_FLOOR_MS`].
+fn backoff_sleep_ms(backoff: Duration, ratio: f64) -> u64 {
+    let base = backoff.as_millis() as f64;
+    let jittered = base + base * ratio;
+    if jittered < BACKOFF_FLOOR_MS as f64 {
+        BACKOFF_FLOOR_MS
+    } else {
+        jittered as u64
+    }
+}
+
+/// Double the backoff, clamped to `[BACKOFF_MIN_SECS, BACKOFF_MAX_SECS]`.
+fn next_backoff(backoff: Duration) -> Duration {
+    let secs = backoff
+        .as_secs()
+        .saturating_mul(2)
+        .clamp(BACKOFF_MIN_SECS, BACKOFF_MAX_SECS);
+    Duration::from_secs(secs)
 }
 
 async fn run_one_session(
@@ -165,10 +233,13 @@ async fn run_one_session(
         Err(_) => anyhow::bail!("handshake response timeout"),
     };
 
-    let v: serde_json::Value = serde_json::from_str(resp.as_str()).context("relay handshake JSON")?;
-    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+    let handshake_resp: HandshakeResponse =
+        serde_json::from_str(resp.as_str()).context("relay handshake JSON")?;
+    if !handshake_resp.ok {
         anyhow::bail!("relay rejected handshake: {}", resp.as_str());
     }
+    let supports_text_keepalive =
+        handshake_resp.relay_keepalive.as_deref() == Some("text-v1");
 
     info!("Portal relay handshake OK — starting MCP server on WebSocket bridge");
 
@@ -176,18 +247,22 @@ async fn run_one_session(
 
     let (ws_write, mut ws_read) = ws.split();
     let ws_write = std::sync::Arc::new(Mutex::new(ws_write));
-    let last_pong = std::sync::Arc::new(Mutex::new(Instant::now()));
+    let last_seen = std::sync::Arc::new(Mutex::new(Instant::now()));
 
     let (bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
     let mut bridge_reader = tokio::io::BufReader::new(bridge_read);
 
-    let ws_write_ping = std::sync::Arc::clone(&ws_write);
-    let last_pong_ping = std::sync::Arc::clone(&last_pong);
+    let ws_write_inbound = std::sync::Arc::clone(&ws_write);
+    let last_seen_inbound = std::sync::Arc::clone(&last_seen);
     let ws_to_bridge = tokio::spawn(async move {
         while let Some(msg) = ws_read.next().await {
-            *last_pong_ping.lock().await = Instant::now();
+            *last_seen_inbound.lock().await = Instant::now();
             match msg {
                 Ok(Message::Text(t)) => {
+                    // The liveness timestamp is updated above; never leak the ACK into MCP.
+                    if t.starts_with("{\"type\":\"keepalive_ack\"") {
+                        continue;
+                    }
                     let mut data = t.as_bytes().to_vec();
                     data.push(b'\n');
                     if tokio::io::AsyncWriteExt::write_all(&mut bridge_write, &data).await.is_err() {
@@ -197,7 +272,7 @@ async fn run_one_session(
                 Ok(Message::Ping(_)) => {
                     // tokio-tungstenite may auto-reply when using unsplit stream; we split,
                     // so reply explicitly (D-077).
-                    let mut w = ws_write_ping.lock().await;
+                    let mut w = ws_write_inbound.lock().await;
                     if w.send(Message::Pong(vec![])).await.is_err() {
                         break;
                     }
@@ -230,7 +305,7 @@ async fn run_one_session(
     });
 
     let ws_write_hb = std::sync::Arc::clone(&ws_write);
-    let last_pong_hb = std::sync::Arc::clone(&last_pong);
+    let last_seen_hb = std::sync::Arc::clone(&last_seen);
     let mut heartbeat = tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -238,20 +313,25 @@ async fn run_one_session(
         loop {
             interval.tick().await;
             {
-                let lp = *last_pong_hb.lock().await;
-                if Instant::now().saturating_duration_since(lp)
+                let last_seen = *last_seen_hb.lock().await;
+                if Instant::now().saturating_duration_since(last_seen)
                     > Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)
                 {
                     let _ = ws_write_hb.lock().await.close().await;
                     anyhow::bail!(
-                        "no WebSocket Pong within {}s (D-077)",
+                        "no relay heartbeat response within {}s (D-077)",
                         HEARTBEAT_TIMEOUT_SECS
                     );
                 }
             }
             let mut w = ws_write_hb.lock().await;
-            if let Err(e) = w.send(Message::Ping(vec![])).await {
-                anyhow::bail!("failed to send WebSocket Ping (D-077): {e}");
+            let heartbeat_message = if supports_text_keepalive {
+                Message::Text("{\"type\":\"keepalive\"}".into())
+            } else {
+                Message::Ping(b"hp".to_vec())
+            };
+            if let Err(e) = w.send(heartbeat_message).await {
+                anyhow::bail!("failed to send relay heartbeat (D-077): {e}");
             }
         }
     });
@@ -364,5 +444,61 @@ mod tests {
         assert_eq!(v["being_id"], "being1");
         assert_eq!(v["loom_token"], "tok");
         assert_eq!(v["portal_name"], "my-laptop");
+    }
+
+    #[test]
+    fn handshake_response_negotiates_text_keepalive() {
+        let response: HandshakeResponse = serde_json::from_str(
+            r#"{"ok":true,"being_id":"being1","relay_keepalive":"text-v1"}"#,
+        )
+        .unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.relay_keepalive.as_deref(), Some("text-v1"));
+    }
+
+    #[test]
+    fn next_backoff_doubles_and_caps() {
+        assert_eq!(next_backoff(Duration::from_secs(2)), Duration::from_secs(4));
+        assert_eq!(next_backoff(Duration::from_secs(16)), Duration::from_secs(30));
+        assert_eq!(next_backoff(Duration::from_secs(30)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn next_backoff_never_below_floor() {
+        assert_eq!(next_backoff(Duration::from_secs(0)), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn backoff_sleep_applies_jitter_within_bounds() {
+        let b = Duration::from_secs(10);
+        assert_eq!(backoff_sleep_ms(b, 0.0), 10_000);
+        assert_eq!(backoff_sleep_ms(b, 0.3), 13_000);
+        assert_eq!(backoff_sleep_ms(b, -0.3), 7_000);
+    }
+
+    #[test]
+    fn backoff_sleep_clamps_to_one_second() {
+        // 2s backoff with max negative jitter is 1.4s; a degenerate 1s backoff
+        // with negative jitter must still floor at 1s.
+        assert_eq!(backoff_sleep_ms(Duration::from_secs(2), -0.3), 1_400);
+        assert_eq!(backoff_sleep_ms(Duration::from_secs(1), -0.3), 1_000);
+    }
+
+    #[test]
+    fn jitter_ratio_stays_in_range() {
+        for _ in 0..100 {
+            let r = jitter_ratio();
+            assert!((-0.3..0.3).contains(&r), "jitter out of range: {r}");
+        }
+    }
+
+    #[test]
+    fn handshake_response_without_capability_uses_fallback() {
+        let response: HandshakeResponse =
+            serde_json::from_str(r#"{"ok":true,"being_id":"being1"}"#).unwrap();
+
+        assert!(response.ok);
+        assert_eq!(response.relay_keepalive, None);
     }
 }
