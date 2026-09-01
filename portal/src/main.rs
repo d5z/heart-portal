@@ -221,6 +221,19 @@ async fn main() -> Result<()> {
         // Relay handshake identity: --name, non-generic config name, then host name.
         let relay_portal_name =
             relay_portal_name(cli_portal_name, &config.name, default_relay_portal_name);
+
+        // Async callback: finished background sessions POST back to the being's
+        // Heart, which writes the inbox and triggers breathe_callback.
+        match relay_client::parse_loom_link(loom) {
+            Ok((host, being_id, token)) => {
+                let url = callback_url(loom, &host, &being_id);
+                tool_host
+                    .process_manager
+                    .set_callback_config(url, token, relay_portal_name.clone());
+            }
+            Err(e) => warn!("async callback disabled (invalid Loom link): {e:#}"),
+        }
+
         let tool_shutdown = tool_host.clone();
         tokio::select! {
             _ = async {
@@ -358,6 +371,21 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Derive Heart's callback endpoint from the Loom link.
+/// `https://echo.beings.town/alice/?token=…` → `https://echo.beings.town/alice/api/callback`.
+/// Scheme follows the Loom link, except localhost/127.* which is always plain http.
+fn callback_url(loom_link: &str, host: &str, being_id: &str) -> String {
+    let is_localhost = host.starts_with("localhost") || host.starts_with("127.");
+    let scheme = if is_localhost {
+        "http"
+    } else if loom_link.trim_start().starts_with("http://") {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host}/{being_id}/api/callback")
 }
 
 fn default_relay_portal_name() -> String {
@@ -779,5 +807,48 @@ mod tests {
     fn relay_portal_name_skips_empty_config_name() {
         let name = relay_portal_name(None, "", || "host".to_string());
         assert_eq!(name, "host");
+    }
+
+    #[test]
+    fn callback_url_follows_loom_scheme() {
+        assert_eq!(
+            callback_url(
+                "https://echo.beings.town/alice/?token=abc",
+                "echo.beings.town",
+                "alice"
+            ),
+            "https://echo.beings.town/alice/api/callback"
+        );
+    }
+
+    #[test]
+    fn callback_url_uses_http_for_localhost() {
+        assert_eq!(
+            callback_url("https://localhost:3100/hex/?token=abc", "localhost:3100", "hex"),
+            "http://localhost:3100/hex/api/callback"
+        );
+        assert_eq!(
+            callback_url("http://127.0.0.1:3100/hex/?token=abc", "127.0.0.1:3100", "hex"),
+            "http://127.0.0.1:3100/hex/api/callback"
+        );
+    }
+
+    #[test]
+    fn callback_url_keeps_plain_http_for_remote_http_loom() {
+        assert_eq!(
+            callback_url("http://box.local:8080/bee/?token=abc", "box.local:8080", "bee"),
+            "http://box.local:8080/bee/api/callback"
+        );
+    }
+
+    #[test]
+    fn callback_url_never_carries_the_token() {
+        let url = callback_url(
+            "https://echo.beings.town/alice/?token=supersecret",
+            "echo.beings.town",
+            "alice",
+        );
+        assert!(!url.contains("supersecret"));
+        assert!(!url.contains('?'));
     }
 }

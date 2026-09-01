@@ -137,7 +137,7 @@ impl ToolHost {
         if self.config.tools.exec {
             tools.push(ToolInfo {
                 name: "portal_exec".to_string(),
-                description: "Execute a shell command".to_string(),
+                description: "Execute a shell command. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads).".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -164,7 +164,7 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_process".to_string(),
-                description: "Manage background shell sessions: list, poll output, log, write stdin, kill. Responses include idle_s (seconds since last stdout/stderr) and total_output_bytes so you can tell silence from steady output.".to_string(),
+                description: "Manage background shell sessions: list, poll output, log, write stdin, kill. Responses include idle_s (seconds since last stdout/stderr) and total_output_bytes so you can tell silence from steady output. Background tasks notify you on their own when they finish, so polling is optional. 'kill' ends a session deliberately and suppresses that completion notification.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
