@@ -327,10 +327,11 @@ async fn deliver_callback(cfg: CallbackConfig, session_id: String, payload: serd
         if attempt > 0 {
             time::sleep(CALLBACK_BACKOFF[attempt - 1]).await;
         }
+        // Heart checks `?token=` query param, not Authorization header.
+        let url_with_token = format!("{}?token={}", cfg.url, cfg.token);
         match cfg
             .client
-            .post(&cfg.url)
-            .bearer_auth(&cfg.token)
+            .post(&url_with_token)
             .json(&payload)
             .send()
             .await
