@@ -4,6 +4,8 @@ use crate::config::PortalConfig;
 use crate::exec_policy::{configure_shell_command, shell_program, validate_exec_allowlist};
 use anyhow::Result;
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,22 +120,22 @@ impl OutputBuffer {
 
     /// Returns bytes from logical `offset` to current end, whether data was dropped before `offset`, and `total_written`.
     pub fn bytes_since(&self, offset: u64) -> (Vec<u8>, bool, u64) {
-        let start_offset = self
-            .total_written
-            .saturating_sub(self.data.len() as u64);
+        let start_offset = self.total_written.saturating_sub(self.data.len() as u64);
         let truncated = offset < start_offset;
         let from = offset.max(start_offset);
         if from >= self.total_written || self.data.is_empty() {
             return (vec![], truncated, self.total_written);
         }
         let start_idx = (from - start_offset) as usize;
-        (self.data[start_idx..].to_vec(), truncated, self.total_written)
+        (
+            self.data[start_idx..].to_vec(),
+            truncated,
+            self.total_written,
+        )
     }
 
     pub fn bytes_range(&self, offset: u64, limit: usize) -> (Vec<u8>, u64) {
-        let start_offset = self
-            .total_written
-            .saturating_sub(self.data.len() as u64);
+        let start_offset = self.total_written.saturating_sub(self.data.len() as u64);
         let from = offset.max(start_offset);
         if from >= self.total_written || self.data.is_empty() {
             return (vec![], self.total_written);
@@ -318,7 +320,7 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-/// POST the payload with `Authorization: Bearer`, retrying per PRD §3.
+/// POST the payload with the Heart token in the query string, retrying per PRD §3.
 /// Never returns an error: a lost callback is a WARN, not a Portal failure
 /// (the being can still `portal_process poll`).
 async fn deliver_callback(cfg: CallbackConfig, session_id: String, payload: serde_json::Value) {
@@ -329,13 +331,7 @@ async fn deliver_callback(cfg: CallbackConfig, session_id: String, payload: serd
         }
         // Heart checks `?token=` query param, not Authorization header.
         let url_with_token = format!("{}?token={}", cfg.url, cfg.token);
-        match cfg
-            .client
-            .post(&url_with_token)
-            .json(&payload)
-            .send()
-            .await
-        {
+        match cfg.client.post(&url_with_token).json(&payload).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -375,7 +371,7 @@ impl ProcessManager {
     }
 
     /// Enable async callbacks: finished background sessions POST their result to
-    /// `url` with `Authorization: Bearer <token>`. Called from `--connect` mode
+    /// `url` with `?token=<token>`. Called from `--connect` mode
     /// before the relay handshake. Without it, sessions exit silently.
     pub fn set_callback_config(&self, url: String, token: String, portal_name: String) {
         let client = match reqwest::Client::builder()
@@ -566,12 +562,7 @@ impl ProcessManager {
         })
     }
 
-    pub async fn poll(
-        &self,
-        session_id: &str,
-        offset: u64,
-        timeout_ms: u64,
-    ) -> Result<PollResult> {
+    pub async fn poll(&self, session_id: &str, offset: u64, timeout_ms: u64) -> Result<PollResult> {
         validate_session_id(session_id)?;
         let timeout_ms = timeout_ms.min(MAX_POLL_TIMEOUT_MS);
         let deadline = if timeout_ms > 0 {
@@ -651,9 +642,7 @@ impl ProcessManager {
             let idle_s = buf.idle_s();
             let total_out = buf.total_written();
             let (output, next_offset) = buf.bytes_range(offset, limit);
-            let start_offset = buf
-                .total_written()
-                .saturating_sub(buf.data.len() as u64);
+            let start_offset = buf.total_written().saturating_sub(buf.data.len() as u64);
             let truncated = offset < start_offset;
             (output, next_offset, truncated, idle_s, total_out)
         };
@@ -671,10 +660,7 @@ impl ProcessManager {
     pub async fn write_stdin(&self, session_id: &str, data: &[u8]) -> Result<()> {
         validate_session_id(session_id)?;
         if data.len() > MAX_STDIN_WRITE_BYTES {
-            anyhow::bail!(
-                "stdin write exceeds max {} bytes",
-                MAX_STDIN_WRITE_BYTES
-            );
+            anyhow::bail!("stdin write exceeds max {} bytes", MAX_STDIN_WRITE_BYTES);
         }
         let mut guard = self.sessions.lock().await;
         let s = guard
@@ -727,7 +713,10 @@ impl ProcessManager {
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string()])
+                .args(["/T", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
                 .await;
             time::sleep(KILL_GRACE).await;
@@ -741,7 +730,10 @@ impl ProcessManager {
             };
             if still_running {
                 let _ = Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .status()
                     .await;
             }
@@ -818,16 +810,15 @@ impl ProcessManager {
     pub async fn kill_all(&self) {
         let ids: Vec<String> = {
             let g = self.sessions.lock().await;
-            // Mark everything up front: `kill` below is sequential (5s grace each),
-            // and a session must not fire a callback while waiting its turn.
+            // Suppress callbacks before any child receives a shutdown signal.
             for s in g.values() {
                 s.killed.store(true, Ordering::SeqCst);
             }
             g.keys().cloned().collect()
         };
-        for id in ids {
-            let _ = self.kill(&id).await;
-        }
+        // Each kill has a five-second grace period. Run them together so the
+        // Portal-wide shutdown deadline does not leave later sessions alive.
+        futures_util::future::join_all(ids.iter().map(|id| self.kill(id))).await;
     }
 }
 
@@ -964,9 +955,12 @@ mod tests {
 
     // --- end-to-end delivery against a local HTTP server ---
 
+    type CallbackHit = (serde_json::Value, Option<String>, Option<String>);
+    type CallbackHits = Arc<std::sync::Mutex<Vec<CallbackHit>>>;
+
     struct TestServer {
         url: String,
-        hits: Arc<std::sync::Mutex<Vec<(serde_json::Value, Option<String>)>>>,
+        hits: CallbackHits,
     }
 
     /// Spawn a one-route axum server that records callback bodies + auth headers.
@@ -974,14 +968,14 @@ mod tests {
         use axum::extract::State;
         use axum::routing::post;
 
-        type Hits = Arc<std::sync::Mutex<Vec<(serde_json::Value, Option<String>)>>>;
-        let hits: Hits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits: CallbackHits = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let app = axum::Router::new()
             .route(
                 "/api/callback",
                 post(
-                    |State((hits, status)): State<(Hits, axum::http::StatusCode)>,
+                    |axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+                     State((hits, status)): State<(CallbackHits, axum::http::StatusCode)>,
                      headers: axum::http::HeaderMap,
                      body: String| async move {
                         let auth = headers
@@ -989,7 +983,9 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.to_string());
                         let v = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-                        hits.lock().unwrap().push((v, auth));
+                        hits.lock()
+                            .unwrap()
+                            .push((v, auth, uri.query().map(str::to_string)));
                         status
                     },
                 ),
@@ -1039,21 +1035,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(10)).await, 1);
-        let (body, auth) = server.hits.lock().unwrap()[0].clone();
+        let (body, auth, query) = server.hits.lock().unwrap()[0].clone();
 
-        assert_eq!(auth.as_deref(), Some("Bearer tok_secret"));
+        assert_eq!(auth, None);
+        assert_eq!(query.as_deref(), Some("token=tok_secret"));
         assert_eq!(body["source"], "portal");
         assert_eq!(body["task_id"], info.session_id);
         assert_eq!(body["result"]["exit_code"], 0);
         assert_eq!(body["result"]["portal_name"], "alice-laptop");
         assert_eq!(body["result"]["workdir"], ".");
         assert_eq!(body["result"]["truncated"], false);
-        assert!(
-            body["result"]["output"]
-                .as_str()
-                .unwrap()
-                .contains("portal_callback_test")
-        );
+        assert!(body["result"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("portal_callback_test"));
     }
 
     #[tokio::test]
@@ -1065,7 +1060,9 @@ mod tests {
         // Deliberately no set_callback_config — standalone mode.
 
         let config = PortalConfig::default();
-        pm.spawn(&config, "echo standalone", ".", &[]).await.unwrap();
+        pm.spawn(&config, "echo standalone", ".", &[])
+            .await
+            .unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(2)).await, 0);
     }
@@ -1079,7 +1076,10 @@ mod tests {
         pm.set_callback_config(server.url.clone(), "tok".to_string(), "p".to_string());
 
         let config = PortalConfig::default();
-        let info = pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
+        let info = pm
+            .spawn(&config, long_running_command(), ".", &[])
+            .await
+            .unwrap();
         pm.kill(&info.session_id).await.unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(2)).await, 0);
@@ -1094,10 +1094,54 @@ mod tests {
         pm.set_callback_config(server.url.clone(), "tok".to_string(), "p".to_string());
 
         let config = PortalConfig::default();
-        pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
+        pm.spawn(&config, long_running_command(), ".", &[])
+            .await
+            .unwrap();
         pm.kill_all().await;
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(2)).await, 0);
+    }
+
+    fn long_running_command() -> &'static str {
+        #[cfg(windows)]
+        {
+            "ping -n 31 127.0.0.1 >NUL"
+        }
+        #[cfg(not(windows))]
+        {
+            "exec sleep 30"
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_all_finishes_multiple_sessions_within_shutdown_deadline() {
+        let pm = ProcessManager::new();
+        let config = PortalConfig::default();
+        for _ in 0..3 {
+            pm.spawn(&config, long_running_command(), ".", &[])
+                .await
+                .unwrap();
+        }
+        let result = time::timeout(Duration::from_secs(9), pm.kill_all()).await;
+        if result.is_err() {
+            pm.kill_all().await;
+        }
+        assert!(
+            result.is_ok(),
+            "shutdown must not wait five seconds per session"
+        );
+        time::timeout(Duration::from_secs(2), async {
+            while pm
+                .list()
+                .await
+                .iter()
+                .any(|s| matches!(s.status, ProcessStatus::Running))
+            {
+                time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all managed sessions must exit");
     }
 
     #[tokio::test]

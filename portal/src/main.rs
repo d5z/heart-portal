@@ -1,30 +1,31 @@
 //! Heart Portal — Being's gateway to the world.
-//! 
+//!
 //! A lightweight MCP server with built-in tools (exec, file, web).
 //! Heart's MCP supervisor connects to Portal via TCP.
 //! Portal can run on Town Home, a human's laptop, or anywhere.
 
 mod config;
+mod cowork;
 mod exec_policy;
-mod process_manager;
-mod tools;
 mod kits;
 mod mcp;
+mod process_manager;
 mod protocol;
-mod cowork;
 mod relay_client;
+mod single_instance;
+mod tools;
 mod upgrade;
 
-use std::path::PathBuf;
-use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
-use tracing::{info, warn, error, debug, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::config::PortalConfig;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, PORTAL_VERSION};
+use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, PORTAL_VERSION};
 use crate::tools::ToolHost;
 
 #[derive(Parser)]
@@ -84,11 +85,12 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,heart_portal=debug".parse().unwrap_or_else(|e| {
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,heart_portal=debug".parse().unwrap_or_else(|e| {
                     eprintln!("Failed to parse default log filter: {}", e);
                     tracing_subscriber::EnvFilter::new("info")
-                }))
+                })
+            }),
         )
         .init();
 
@@ -98,13 +100,19 @@ async fn main() -> Result<()> {
         upgrade::unlock_gatekeeper(&exe);
     }
 
-    let connect_link = cli.connect;
+    // Supervisors can provide the Loom link through the environment so the
+    // credential is not exposed in the OS process command line.
+    let connect_link = cli.connect.or_else(|| {
+        std::env::var("PORTAL_CONNECT_LINK")
+            .ok()
+            .filter(|link| !link.trim().is_empty())
+    });
     let config_path = cli
         .config
         .or(cli.config_positional)
         .unwrap_or_else(|| "portal.toml".to_string());
     let cli_portal_name = cli.name;
-    
+
     let mut config = if PathBuf::from(&config_path).exists() {
         PortalConfig::load(&config_path)?
     } else {
@@ -125,6 +133,22 @@ async fn main() -> Result<()> {
         };
     }
 
+    // Prevent stale/duplicate Windows Portal processes from competing for the
+    // same relay connection and ejecting one another. Management subcommands
+    // above remain usable while a Portal instance is running.
+    // Key the Windows mutex by relay host + Being rather than by the whole
+    // Loom URL. Rotating a token must not allow a second local instance to
+    // bypass the duplicate-process guard.
+    let instance_identity = match connect_link.as_deref() {
+        Some(link) => {
+            let (host, being_id, _) = relay_client::parse_loom_link(link)?;
+            format!("{host}/{being_id}")
+        }
+        None => format!("standalone/{}:{}", config.bind_host, config.bind_port),
+    };
+    let _single_instance =
+        single_instance::acquire(Some(&instance_identity)).map_err(|e| anyhow::anyhow!(e))?;
+
     if config.portal_mcp_token.is_none() {
         warn!("PORTAL_MCP_TOKEN is not set — MCP TCP connections are unauthenticated (set token for public deployments)");
     }
@@ -135,7 +159,10 @@ async fn main() -> Result<()> {
             config.name, config.cowork.http_port
         );
     } else {
-        info!("Portal '{}' starting on {}:{}", config.name, config.bind_host, config.bind_port);
+        info!(
+            "Portal '{}' starting on {}:{}",
+            config.name, config.bind_host, config.bind_port
+        );
     }
 
     // Initialize tool host (built-in + custom)
@@ -167,7 +194,14 @@ async fn main() -> Result<()> {
     tool_host.warmup_kits().await;
 
     let tool_list = tool_host.list_tools().await;
-    info!("Portal tools: {}", tool_list.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+    info!(
+        "Portal tools: {}",
+        tool_list
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     // Cowork HTTP server (replaces old health endpoint)
     if config.cowork.enabled {
@@ -180,10 +214,10 @@ async fn main() -> Result<()> {
         let cowork_config = config.clone();
         let workspace = config.security.workspace_root.clone();
         let (file_tx, _) = tokio::sync::broadcast::channel::<cowork::FileEvent>(256);
-        
+
         // Start file watcher
         cowork::start_file_watcher(workspace.clone(), file_tx.clone());
-        
+
         let state = cowork::CoworkState {
             config: cowork_config.clone(),
             workspace,
@@ -193,7 +227,7 @@ async fn main() -> Result<()> {
         let http_port = cowork_config.cowork.http_port;
         let http_addr = format!("{}:{}", cowork_config.bind_host, http_port);
         info!("Cowork HTTP server starting on {}", http_addr);
-        
+
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(&http_addr).await {
                 Ok(listener) => {
@@ -227,19 +261,26 @@ async fn main() -> Result<()> {
         match relay_client::parse_loom_link(loom) {
             Ok((host, being_id, token)) => {
                 let url = callback_url(loom, &host, &being_id);
-                tool_host
-                    .process_manager
-                    .set_callback_config(url, token, relay_portal_name.clone());
+                tool_host.process_manager.set_callback_config(
+                    url,
+                    token,
+                    relay_portal_name.clone(),
+                );
             }
             Err(e) => warn!("async callback disabled (invalid Loom link): {e:#}"),
         }
 
         let tool_shutdown = tool_host.clone();
+        let restart_waiter = tool_host.clone();
         tokio::select! {
             _ = async {
                 let _ = tokio::signal::ctrl_c().await;
             } => {
                 info!("Portal shutting down (Ctrl+C)");
+                tool_shutdown.kill_all_managed_processes().await;
+            }
+            _ = restart_waiter.wait_for_restart() => {
+                info!("Portal restarting after a controlled tool request");
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = relay_client::connect_and_serve(loom, &tool_host, &relay_portal_name) => {}
@@ -259,6 +300,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
     let shutdown_cleanup = tool_host.clone();
+    let restart_waiter = tool_host.clone();
     tokio::spawn({
         let shutdown_tx = shutdown_tx.clone();
         async move {
@@ -267,6 +309,9 @@ async fn main() -> Result<()> {
                     let _ = r;
                 }
                 _ = wait_sigterm() => {}
+                _ = restart_waiter.wait_for_restart() => {
+                    info!("Portal restarting after a controlled tool request");
+                }
             }
             info!("Portal shutting down");
             let _ = shutdown_tx.send(());
@@ -351,8 +396,8 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
     }
 
     println!(
-        "{:<16} {:<8} {:<6} {:<11} {}",
-        "Kit", "Version", "Tools", "Status", "Command"
+        "{:<16} {:<8} {:<6} {:<11} Command",
+        "Kit", "Version", "Tools", "Status"
     );
     for kit in kits {
         let status = if kits::loader::command_binary_exists(&kit.command) {
@@ -362,8 +407,8 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
         };
         println!(
             "{:<16} {:<8} {:<6} {:<11} {}",
-            &kit.manifest.name,
-            &kit.manifest.version,
+            kit.manifest.name,
+            kit.manifest.version,
             kit.manifest.tools.len(),
             status,
             kits::loader::format_command(&kit.command)
@@ -378,9 +423,7 @@ async fn show_kit_status(config: &PortalConfig) -> Result<()> {
 /// Scheme follows the Loom link, except localhost/127.* which is always plain http.
 fn callback_url(loom_link: &str, host: &str, being_id: &str) -> String {
     let is_localhost = host.starts_with("localhost") || host.starts_with("127.");
-    let scheme = if is_localhost {
-        "http"
-    } else if loom_link.trim_start().starts_with("http://") {
+    let scheme = if is_localhost || loom_link.trim_start().starts_with("http://") {
         "http"
     } else {
         "https"
@@ -419,7 +462,10 @@ async fn wait_sigterm() {
             s.recv().await;
         }
         Err(e) => {
-            warn!("Failed to install SIGTERM handler: {}; falling back to Ctrl+C", e);
+            warn!(
+                "Failed to install SIGTERM handler: {}; falling back to Ctrl+C",
+                e
+            );
             let _ = tokio::signal::ctrl_c().await;
         }
     }
@@ -432,7 +478,10 @@ async fn wait_sigterm() {
             s.recv().await;
         }
         Err(e) => {
-            warn!("Failed to install CTRL_BREAK handler: {}; falling back to Ctrl+C", e);
+            warn!(
+                "Failed to install CTRL_BREAK handler: {}; falling back to Ctrl+C",
+                e
+            );
             let _ = tokio::signal::ctrl_c().await;
         }
     }
@@ -490,10 +539,13 @@ where
                 }
             };
 
-            let method = value.get("method").and_then(|v| v.as_str()).unwrap_or_else(|| {
-                debug!("Missing or invalid 'method' field in JSON-RPC request");
-                ""
-            });
+            let method = value
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    debug!("Missing or invalid 'method' field in JSON-RPC request");
+                    ""
+                });
             let id = value.get("id").cloned();
             if method != "auth" {
                 let error_resp = JsonRpcResponse {
@@ -587,10 +639,20 @@ where
 
         let response = handle_request(&request, tool_host, portal_name).await;
         send_response(&mut writer, &response).await?;
+        if request.method == "tools/call"
+            && request.params.get("name").and_then(|v| v.as_str()) == Some("portal_restart")
+        {
+            tool_host.restart_after_response();
+        }
 
         // After tool reload, send MCP notification instead of closing connection
-        if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {
-            tool_host.needs_reconnect.store(false, std::sync::atomic::Ordering::SeqCst);
+        if tool_host
+            .needs_reconnect
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tool_host
+                .needs_reconnect
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             info!("🔄 Sending notifications/tools/list_changed after tools reload");
             let notification = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -614,32 +676,35 @@ async fn handle_request(
     let id = request.id;
 
     match request.method.as_str() {
-        "initialize" => {
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": { "listChanged": false }
-                    },
-                    "serverInfo": {
-                        "name": format!("heart-portal-{}", portal_name),
-                        "version": PORTAL_VERSION
-                    }
-                })),
-                error: None,
-            }
-        }
+        "initialize" => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": { "listChanged": false }
+                },
+                "serverInfo": {
+                    "name": format!("heart-portal-{}", portal_name),
+                    "version": PORTAL_VERSION
+                }
+            })),
+            error: None,
+        },
 
         "tools/list" => {
-            let tools: Vec<serde_json::Value> = tool_host.list_tools().await.iter().map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema
+            let tools: Vec<serde_json::Value> = tool_host
+                .list_tools()
+                .await
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema
+                    })
                 })
-            }).collect();
+                .collect();
 
             JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
@@ -650,17 +715,23 @@ async fn handle_request(
         }
 
         "tools/call" => {
-            let tool_name = request.params.get("name")
+            let tool_name = request
+                .params
+                .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_else(|| {
                     debug!("Missing or invalid tool name in tools/call request");
                     ""
                 });
-            let arguments = request.params.get("arguments")
+            let arguments = request
+                .params
+                .get("arguments")
                 .cloned()
-                .and_then(|v| if v.is_object() { Some(v) } else { None })
+                .filter(|v| v.is_object())
                 .unwrap_or_else(|| {
-                    debug!("Missing or invalid arguments in tools/call request, using empty object");
+                    debug!(
+                        "Missing or invalid arguments in tools/call request, using empty object"
+                    );
                     serde_json::json!({})
                 });
 
@@ -708,27 +779,23 @@ async fn handle_request(
             }
         }
 
-        "ping" => {
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(serde_json::json!({})),
-                error: None,
-            }
-        }
+        "ping" => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(serde_json::json!({})),
+            error: None,
+        },
 
-        _ => {
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32601,
-                    message: format!("Method not found: {}", request.method),
-                    data: None,
-                }),
-            }
-        }
+        _ => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32601,
+                message: format!("Method not found: {}", request.method),
+                data: None,
+            }),
+        },
     }
 }
 
@@ -745,10 +812,14 @@ async fn run_health_server(portal_name: &str, port: u16) -> Result<()> {
             use tokio::io::AsyncReadExt;
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
-            let body = format!("{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}", name, PORTAL_VERSION);
+            let body = format!(
+                "{{\"status\":\"ok\",\"name\":\"{}\",\"version\":\"{}\"}}",
+                name, PORTAL_VERSION
+            );
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(), body
+                body.len(),
+                body
             );
             let _ = stream.write_all(response.as_bytes()).await;
         });
@@ -824,11 +895,19 @@ mod tests {
     #[test]
     fn callback_url_uses_http_for_localhost() {
         assert_eq!(
-            callback_url("https://localhost:3100/hex/?token=abc", "localhost:3100", "hex"),
+            callback_url(
+                "https://localhost:3100/hex/?token=abc",
+                "localhost:3100",
+                "hex"
+            ),
             "http://localhost:3100/hex/api/callback"
         );
         assert_eq!(
-            callback_url("http://127.0.0.1:3100/hex/?token=abc", "127.0.0.1:3100", "hex"),
+            callback_url(
+                "http://127.0.0.1:3100/hex/?token=abc",
+                "127.0.0.1:3100",
+                "hex"
+            ),
             "http://127.0.0.1:3100/hex/api/callback"
         );
     }
@@ -836,7 +915,11 @@ mod tests {
     #[test]
     fn callback_url_keeps_plain_http_for_remote_http_loom() {
         assert_eq!(
-            callback_url("http://box.local:8080/bee/?token=abc", "box.local:8080", "bee"),
+            callback_url(
+                "http://box.local:8080/bee/?token=abc",
+                "box.local:8080",
+                "bee"
+            ),
             "http://box.local:8080/bee/api/callback"
         );
     }

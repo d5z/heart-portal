@@ -17,9 +17,9 @@
 //! workspace_root = "/workspace"
 //! ```
 
+use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
-use anyhow::Result;
 
 /// Raw config as parsed from TOML (supports both flat and nested fields)
 #[derive(Debug, Deserialize)]
@@ -193,23 +193,32 @@ impl PortalConfig {
         };
 
         // Resolve workspace: flat `workspace` > security.workspace_root > default
-        let workspace = raw.workspace
+        let workspace = raw
+            .workspace
             .or_else(|| raw.security.as_ref().and_then(|s| s.workspace_root.clone()))
             .unwrap_or_else(|| PathBuf::from("/workspace"));
 
         let security = SecurityConfig {
-            exec_allowlist: raw.security.as_ref()
+            exec_allowlist: raw
+                .security
+                .as_ref()
                 .and_then(|s| s.exec_allowlist.clone())
                 .unwrap_or_default(),
             workspace_root: workspace,
-            max_file_size: raw.security.as_ref()
+            max_file_size: raw
+                .security
+                .as_ref()
                 .and_then(|s| s.max_file_size)
                 .unwrap_or(10 * 1024 * 1024),
         };
 
         let cowork = CoworkConfig {
             enabled: raw.cowork.as_ref().and_then(|c| c.enabled).unwrap_or(true),
-            http_port: raw.cowork.as_ref().and_then(|c| c.http_port).unwrap_or(port + 1),
+            http_port: raw
+                .cowork
+                .as_ref()
+                .and_then(|c| c.http_port)
+                .unwrap_or(port + 1),
         };
 
         let name = raw.name.unwrap_or_else(|| "portal".to_string());
@@ -234,19 +243,27 @@ impl PortalConfig {
 /// Parse "host:port" or just ":port" or "port"
 fn parse_bind(bind: &str) -> Result<(String, u16)> {
     if let Some((host, port_str)) = bind.rsplit_once(':') {
-        let port: u16 = port_str.parse()
+        let port: u16 = port_str
+            .parse()
             .map_err(|_| anyhow::anyhow!("Invalid port in bind '{}': '{}'", bind, port_str))?;
-        let host = if host.is_empty() { "0.0.0.0".to_string() } else { host.to_string() };
+        let host = if host.is_empty() {
+            "0.0.0.0".to_string()
+        } else {
+            host.to_string()
+        };
         Ok((host, port))
     } else {
         // Just a port number
-        let port: u16 = bind.parse()
+        let port: u16 = bind
+            .parse()
             .map_err(|_| anyhow::anyhow!("Invalid bind address: '{}'", bind))?;
         Ok(("0.0.0.0".to_string(), port))
     }
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 fn default_kits_dir() -> String {
     "~/.heart-portal/kits/".to_string()
@@ -282,14 +299,18 @@ exec = true
 file = true
 web_fetch = false
 "#;
-        let raw: RawConfig = toml::from_str(toml).unwrap();
-        let content = std::fs::write("/tmp/test-portal.toml", toml).unwrap();
-        let config = PortalConfig::load("/tmp/test-portal.toml").unwrap();
+        let path = std::env::temp_dir().join("heart-portal-flat-config-test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
         assert_eq!(config.name, "vale");
         assert_eq!(config.bind_host, "0.0.0.0");
         assert_eq!(config.bind_port, 9100);
-        assert_eq!(config.security.workspace_root, PathBuf::from("/workspace/vale"));
-        assert_eq!(config.tools.web_fetch, false);
+        assert_eq!(
+            config.security.workspace_root,
+            PathBuf::from("/workspace/vale")
+        );
+        assert!(!config.tools.web_fetch);
         assert_eq!(config.kits_dir.as_deref(), Some("~/.heart-portal/kits/"));
         assert!(config.kits_enabled);
     }
@@ -301,8 +322,10 @@ name = "vale"
 kits_dir = "/tmp/portal-kits"
 kits_enabled = false
 "#;
-        std::fs::write("/tmp/test-portal-kits.toml", toml).unwrap();
-        let config = PortalConfig::load("/tmp/test-portal-kits.toml").unwrap();
+        let path = std::env::temp_dir().join("heart-portal-kits-config-test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
         assert_eq!(config.kits_dir.as_deref(), Some("/tmp/portal-kits"));
         assert!(!config.kits_enabled);
     }

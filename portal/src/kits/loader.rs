@@ -51,11 +51,7 @@ pub fn load_kits_from_dir(kits_dir: &Path) -> Result<Vec<LoadedKit>> {
             Ok(Some(kit)) => kits.push(kit),
             Ok(None) => {}
             Err(err) => {
-                warn!(
-                    "Skipping kit manifest {}: {}",
-                    manifest_path.display(),
-                    err
-                );
+                warn!("Skipping kit manifest {}: {}", manifest_path.display(), err);
             }
         }
     }
@@ -130,13 +126,28 @@ fn resolve_command(kit_dir: &Path, command: &[String]) -> Vec<String> {
     let first = Path::new(&resolved[0]);
 
     if first.is_absolute() {
+        if let Some(program) = find_binary_at(first) {
+            resolved[0] = program.to_string_lossy().into_owned();
+        }
         return resolved;
     }
 
     let candidate = kit_dir.join(first);
     let has_path_separator = resolved[0].contains('/') || resolved[0].contains('\\');
-    if has_path_separator || candidate.exists() {
+    if let Some(program) = find_binary_at(&candidate) {
+        resolved[0] = program.to_string_lossy().into_owned();
+        return resolved;
+    }
+    if has_path_separator {
         resolved[0] = candidate.to_string_lossy().to_string();
+        return resolved;
+    }
+
+    #[cfg(windows)]
+    if !has_path_separator {
+        if let Some(program) = find_binary_on_path(&resolved[0]) {
+            resolved[0] = program.to_string_lossy().to_string();
+        }
     }
 
     resolved
@@ -198,17 +209,42 @@ pub(crate) fn format_command(command: &[String]) -> String {
 fn binary_exists(binary: &str) -> bool {
     let path = Path::new(binary);
     if path.is_absolute() || binary.contains('/') || binary.contains('\\') {
-        return path.exists();
+        return find_binary_at(path).is_some();
     }
 
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(binary);
-                candidate.exists()
-            })
-        })
-        .unwrap_or(false)
+    find_binary_on_path(binary).is_some()
+}
+
+fn find_binary_on_path(binary: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        if let Some(program) = find_binary_at(&dir.join(binary)) {
+            return Some(program);
+        }
+    }
+    None
+}
+
+fn find_binary_at(path: &Path) -> Option<PathBuf> {
+    // npm installs both a POSIX `codex` shim and `codex.cmd`. On Windows,
+    // selecting the extensionless file first fails with Win32 error 193.
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        for ext in std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|ext| !ext.is_empty())
+        {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(ext);
+            let candidate = PathBuf::from(candidate);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+    path.is_file().then(|| path.to_path_buf())
 }
 
 fn kit_label(name: &str) -> String {
@@ -242,6 +278,7 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+#[allow(clippy::unnecessary_lazy_evaluations)]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -299,13 +336,36 @@ mod tests {
 
     #[test]
     fn resolves_relative_command_from_kit_dir() {
-        let command = resolve_command(
-            Path::new("/tmp/heart-kit"),
-            &["bin/server".to_string(), "--stdio".to_string()],
-        );
+        let kit_dir = Path::new("heart-kit");
+        let command = resolve_command(kit_dir, &["bin/server".to_string(), "--stdio".to_string()]);
 
-        assert_eq!(command[0], "/tmp/heart-kit/bin/server");
+        assert_eq!(PathBuf::from(&command[0]), kit_dir.join("bin/server"));
         assert_eq!(command[1], "--stdio");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_windows_npm_shim_before_posix_script() {
+        let dir = std::env::temp_dir().join(format!("portal kit {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        for program in [
+            "codex".to_string(),
+            "./codex".to_string(),
+            dir.join("codex").to_string_lossy().into_owned(),
+        ] {
+            let command = resolve_command(&dir, &[program, "mcp-server".into()]);
+            assert_eq!(
+                PathBuf::from(&command[0]).canonicalize().unwrap(),
+                dir.join("codex.cmd").canonicalize().unwrap()
+            );
+            assert!(command_binary_exists(&command));
+            assert_eq!(command[1], "mcp-server");
+        }
+        std::fs::remove_file(dir.join("codex.cmd")).unwrap();
+        assert!(find_binary_at(&dir.join("codex")).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -327,9 +387,15 @@ mod tests {
         let warnings = manifest_validation_warnings(&manifest, &[]);
 
         assert_eq!(warnings.len(), 3);
-        assert!(warnings.iter().any(|warning| warning.contains("invalid name")));
-        assert!(warnings.iter().any(|warning| warning.contains("command is empty")));
-        assert!(warnings.iter().any(|warning| warning.contains("no tools defined")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("invalid name")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("command is empty")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("no tools defined")));
     }
 
     #[test]
