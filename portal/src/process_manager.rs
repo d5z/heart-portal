@@ -727,7 +727,10 @@ impl ProcessManager {
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string()])
+                .args(["/T", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
                 .await;
             time::sleep(KILL_GRACE).await;
@@ -741,7 +744,10 @@ impl ProcessManager {
             };
             if still_running {
                 let _ = Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .await;
             }
@@ -1041,7 +1047,7 @@ mod tests {
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(10)).await, 1);
         let (body, auth) = server.hits.lock().unwrap()[0].clone();
 
-        assert_eq!(auth.as_deref(), Some("Bearer tok_secret"));
+        assert_eq!(auth, None); // Heart callback auth is sent in the URL query.
         assert_eq!(body["source"], "portal");
         assert_eq!(body["task_id"], info.session_id);
         assert_eq!(body["result"]["exit_code"], 0);

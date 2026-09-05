@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::mcp::{McpConnection, McpServerConfig};
 use crate::tools::ToolInfo;
 
-use super::loader::{format_command, LoadedKit};
+use super::loader::{command_binary_exists, format_command, LoadedKit};
 
 const MAX_FAILURES: u8 = 3;
 const SPAWN_TIMEOUT_SECS: u64 = 30;
@@ -21,6 +21,7 @@ const RECOVERY_COOLDOWN_SECS: u64 = 60;
 /// Directories prepended to a kit process's PATH so kits can find common
 /// toolchains (e.g. Homebrew-installed node/python) even when launched from a
 /// launchd/systemd context with a minimal PATH.
+#[cfg(unix)]
 const KIT_EXTRA_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 const WARMUP_TIMEOUT_SECS: u64 = 10;
 
@@ -60,8 +61,7 @@ impl KitManager {
                 warn!("Duplicate kit name '{}'; keeping the last manifest loaded", name);
             }
             // Pre-mark unhealthy if command binary is missing or empty
-            let pre_unhealthy = kit.command.is_empty()
-                || (!kit.command[0].is_empty() && !command_binary_exists(&kit.command[0]));
+            let pre_unhealthy = !command_binary_exists(&kit.command);
             if pre_unhealthy {
                 warn!(
                     "Kit '{}' pre-marked unhealthy: command binary not found: {}",
@@ -104,6 +104,21 @@ impl KitManager {
 
         for state in kits.values_mut() {
             recover_if_cooled_down(state);
+
+            // A kit can exit independently while Portal and the relay stay
+            // connected. Reap the stale connection here so health/tool
+            // discovery reflects the kit's real state and gives it a bounded
+            // number of restart attempts instead of advertising a dead route.
+            let dead_connection = state
+                .connection
+                .as_ref()
+                .map(|connection| !connection.is_alive())
+                .unwrap_or(false);
+            if dead_connection {
+                drop_connection(state).await;
+                record_failure(state);
+            }
+
             if state.unhealthy {
                 continue;
             }
@@ -314,8 +329,7 @@ impl KitManager {
                 }
             } else {
                 let version = kit.manifest.version.clone();
-                let pre_unhealthy = kit.command.is_empty()
-                    || (!kit.command[0].is_empty() && !command_binary_exists(&kit.command[0]));
+                let pre_unhealthy = !command_binary_exists(&kit.command);
                 if pre_unhealthy {
                     warn!(
                         "Kit '{}' pre-marked unhealthy: command binary not found: {}",
@@ -537,13 +551,17 @@ fn kit_env(state: &KitState) -> HashMap<String, String> {
         "PORTAL_KIT_DIR".to_string(),
         state.kit.kit_dir.to_string_lossy().to_string(),
     );
-    // Kit processes may be launched from a launchd/systemd context whose PATH
-    // lacks common toolchain locations (e.g. /opt/homebrew/bin). Prepend the
-    // well-known directories to whatever PATH we inherited.
+    // On Unix, service managers often provide a minimal PATH, so prepend the
+    // common toolchain directories. On Windows, preserve the inherited PATH
+    // verbatim: its separator is `;` and command shims are resolved via
+    // PATHEXT (`codex` commonly maps to `codex.cmd`).
+    #[cfg(unix)]
     let path = match std::env::var("PATH") {
         Ok(existing) if !existing.is_empty() => format!("{}:{}", KIT_EXTRA_PATH, existing),
         _ => KIT_EXTRA_PATH.to_string(),
     };
+    #[cfg(not(unix))]
+    let path = std::env::var("PATH").unwrap_or_default();
     env.insert("PATH".to_string(), path);
     env
 }
@@ -609,7 +627,6 @@ fn coerce_kit_arguments(arguments: &mut Value, schema: &Value) {
 mod tests {
     use super::*;
     use crate::kits::manifest::{KitManifest, KitToolDef};
-    use std::path::PathBuf;
 
     #[test]
     fn kit_slug_normalizes_hyphens() {
@@ -721,16 +738,20 @@ mod tests {
         let env = kit_env(&state);
 
         let path = env.get("PATH").expect("kit_env must set PATH");
+        #[cfg(unix)]
         assert!(
             path.contains("/opt/homebrew/bin"),
             "PATH should include Homebrew's bin dir, got: {}",
             path
         );
+        #[cfg(unix)]
         assert!(
             path.contains("/usr/bin"),
             "PATH should include /usr/bin, got: {}",
             path
         );
+        #[cfg(windows)]
+        assert_eq!(path, &std::env::var("PATH").unwrap_or_default());
         assert_eq!(
             env.get("PORTAL_KIT_NAME").map(String::as_str),
             Some("healthy"),
@@ -863,13 +884,20 @@ mod tests {
     }
 
     fn loaded_kit(name: &str, eager: Option<bool>) -> LoadedKit {
-        // Use /bin/echo as a real binary so the healthy kit isn't pre-marked unhealthy
-        let cmd = if name == "broken" {
-            "definitely-missing-kit-binary"
+        // Use a short-lived real command so healthy kits work on every test OS.
+        let argv = if name == "broken" {
+            vec!["definitely-missing-kit-binary"]
         } else {
-            "/bin/echo"
+            #[cfg(windows)]
+            {
+                vec!["cmd.exe", "/D", "/C", "echo"]
+            }
+            #[cfg(not(windows))]
+            {
+                vec!["/bin/echo"]
+            }
         };
-        loaded_kit_argv(name, vec![cmd], eager)
+        loaded_kit_argv(name, argv, eager)
     }
 
     fn loaded_kit_argv(name: &str, argv: Vec<&str>, eager: Option<bool>) -> LoadedKit {
@@ -892,24 +920,8 @@ mod tests {
                 workspace: None,
                 eager,
             },
-            kit_dir: PathBuf::from("/tmp"),
+            kit_dir: std::env::temp_dir(),
             command,
         }
     }
-}
-
-/// Check if a command binary exists — supports both absolute paths and PATH lookup.
-fn command_binary_exists(binary: &str) -> bool {
-    let path = std::path::Path::new(binary);
-    // Absolute or relative path with separator → check directly
-    if binary.contains(std::path::MAIN_SEPARATOR) || binary.contains('/') {
-        return path.exists();
-    }
-    // Bare command name → search PATH
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths)
-                .any(|dir| dir.join(binary).is_file())
-        })
-        .unwrap_or(false)
 }

@@ -4,3 +4,10 @@ Cargo.lock
 dist/
 .DS_Store
 SIGNING.md
+portal.toml
+.portal-connection.url
+.portal-name
+.portal-task-name
+portal-runtime.log
+portal-runtime.err.log
+/workspace/

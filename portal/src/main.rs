@@ -13,6 +13,7 @@ mod mcp;
 mod protocol;
 mod cowork;
 mod relay_client;
+mod single_instance;
 mod upgrade;
 
 use std::path::PathBuf;
@@ -98,7 +99,13 @@ async fn main() -> Result<()> {
         upgrade::unlock_gatekeeper(&exe);
     }
 
-    let connect_link = cli.connect;
+    // Supervisors can provide the Loom link through the environment so the
+    // credential is not exposed in the OS process command line.
+    let connect_link = cli.connect.or_else(|| {
+        std::env::var("PORTAL_CONNECT_LINK")
+            .ok()
+            .filter(|link| !link.trim().is_empty())
+    });
     let config_path = cli
         .config
         .or(cli.config_positional)
@@ -124,6 +131,22 @@ async fn main() -> Result<()> {
             KitCommands::Status => show_kit_status(&config).await,
         };
     }
+
+    // Prevent stale/duplicate Windows Portal processes from competing for the
+    // same relay connection and ejecting one another. Management subcommands
+    // above remain usable while a Portal instance is running.
+    // Key the Windows mutex by relay host + Being rather than by the whole
+    // Loom URL. Rotating a token must not allow a second local instance to
+    // bypass the duplicate-process guard.
+    let instance_identity = match connect_link.as_deref() {
+        Some(link) => {
+            let (host, being_id, _) = relay_client::parse_loom_link(link)?;
+            format!("{}/{being_id}", host.to_ascii_lowercase())
+        }
+        None => format!("standalone/{}:{}", config.bind_host, config.bind_port),
+    };
+    let _single_instance =
+        single_instance::acquire(Some(&instance_identity)).map_err(|e| anyhow::anyhow!(e))?;
 
     if config.portal_mcp_token.is_none() {
         warn!("PORTAL_MCP_TOKEN is not set — MCP TCP connections are unauthenticated (set token for public deployments)");
@@ -235,11 +258,16 @@ async fn main() -> Result<()> {
         }
 
         let tool_shutdown = tool_host.clone();
+        let restart_waiter = tool_host.clone();
         tokio::select! {
             _ = async {
                 let _ = tokio::signal::ctrl_c().await;
             } => {
                 info!("Portal shutting down (Ctrl+C)");
+                tool_shutdown.kill_all_managed_processes().await;
+            }
+            _ = restart_waiter.wait_for_restart() => {
+                info!("Portal restarting after a controlled tool request");
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = relay_client::connect_and_serve(loom, &tool_host, &relay_portal_name) => {}
@@ -259,6 +287,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut shutdown_rx = shutdown_tx.subscribe();
     let shutdown_cleanup = tool_host.clone();
+    let restart_waiter = tool_host.clone();
     tokio::spawn({
         let shutdown_tx = shutdown_tx.clone();
         async move {
@@ -267,6 +296,9 @@ async fn main() -> Result<()> {
                     let _ = r;
                 }
                 _ = wait_sigterm() => {}
+                _ = restart_waiter.wait_for_restart() => {
+                    info!("Portal restarting after a controlled tool request");
+                }
             }
             info!("Portal shutting down");
             let _ = shutdown_tx.send(());
@@ -587,6 +619,11 @@ where
 
         let response = handle_request(&request, tool_host, portal_name).await;
         send_response(&mut writer, &response).await?;
+        if request.method == "tools/call"
+            && request.params.get("name").and_then(|v| v.as_str()) == Some("portal_restart")
+        {
+            tool_host.restart_after_response();
+        }
 
         // After tool reload, send MCP notification instead of closing connection
         if tool_host.needs_reconnect.load(std::sync::atomic::Ordering::SeqCst) {

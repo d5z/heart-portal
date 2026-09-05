@@ -97,13 +97,17 @@ pub(crate) fn configure_shell_command(
     // Use raw_arg to pass the command string unquoted so cmd /C sees it verbatim.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.raw_arg("/C").raw_arg(command).current_dir(workdir);
+        cmd.raw_arg("/D /C").raw_arg(command).current_dir(workdir);
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW for foreground/background exec
     }
     #[cfg(not(windows))]
     {
         cmd.arg(shell_arg_flag()).arg(command).current_dir(workdir);
     }
+
+    // These describe the supervised Portal, not arbitrary commands it launches.
+    cmd.env_remove("HEART_PORTAL_SUPERVISED")
+        .env_remove("PORTAL_CONNECT_LINK");
 
     if std::env::var_os("HOME").is_none() {
         let home = std::env::var("HOME").ok().unwrap_or_else(|| {

@@ -38,6 +38,10 @@ pub struct ToolHost {
     pub process_manager: Arc<ProcessManager>,
     /// Set to true after reload — signals connection handler to close TCP
     pub needs_reconnect: Arc<AtomicBool>,
+    /// A controlled restart requested through the built-in portal_restart tool.
+    restart_requested: Arc<AtomicBool>,
+    restart_notify: Arc<tokio::sync::Notify>,
+    restart_supported: bool,
 }
 
 impl ToolHost {
@@ -61,12 +65,33 @@ impl ToolHost {
             kits: KitManager::new(loaded_kits),
             process_manager: Arc::new(ProcessManager::new()),
             needs_reconnect: Arc::new(AtomicBool::new(false)),
+            restart_requested: Arc::new(AtomicBool::new(false)),
+            restart_notify: Arc::new(tokio::sync::Notify::new()),
+            restart_supported: std::env::var("HEART_PORTAL_SUPERVISED")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
+    /// Wait until a tool caller has requested a controlled Portal restart.
+    pub async fn wait_for_restart(&self) {
+        self.restart_notify.notified().await;
+    }
+
     pub async fn kill_all_managed_processes(&self) {
-        self.process_manager.kill_all().await;
-        self.kits.shutdown().await;
+        let cleanup = async {
+            tokio::join!(
+                self.process_manager.kill_all(),
+                self.kits.shutdown(),
+                self.custom.shutdown(),
+            );
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), cleanup)
+            .await
+            .is_err()
+        {
+            warn!("Portal shutdown cleanup timed out; exiting so the supervisor can restart it");
+        }
     }
 
     pub async fn cleanup_background_sessions(&self) {
@@ -399,6 +424,18 @@ impl ToolHost {
             }),
         });
 
+        if self.restart_supported {
+            tools.push(ToolInfo {
+                name: "portal_restart".to_string(),
+                description: "Gracefully exit Portal after returning a response so its OS supervisor can restart it with the same name and load updated kits. Use this instead of taskkill or starting another supervisor.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            });
+        }
+
         if self.config.kits_enabled {
             tools.push(ToolInfo {
                 name: "portal_kit_usage".to_string(),
@@ -457,6 +494,7 @@ impl ToolHost {
             "portal_web_search" => web_search::search(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             "portal_tools_reload" => self.handle_tools_reload().await,
+            "portal_restart" => self.handle_restart().await,
             "portal_kit_usage" => {
                 let counts = self.kits.drain_usage_counts().await;
                 let text = serde_json::to_string(&counts)?;
@@ -465,6 +503,38 @@ impl ToolHost {
                 }))
             }
             _ => anyhow::bail!("Unknown tool: {}", tool_name),
+        }
+    }
+
+    /// Request a restart; the connection handler schedules it after flushing
+    /// the JSON-RPC response, never while it is still being constructed.
+    async fn handle_restart(&self) -> Result<Value> {
+        if !self.restart_supported {
+            anyhow::bail!(
+                "Portal restart is unavailable because no external supervisor is configured"
+            );
+        }
+        let already_scheduled = self.restart_requested.swap(true, Ordering::AcqRel);
+
+        let message = if already_scheduled {
+            "Portal restart is already scheduled."
+        } else {
+            "Portal restart scheduled. The supervisor will relaunch it with the same name and load updated kits."
+        };
+        Ok(serde_json::json!({
+            "content": [{"type": "text", "text": message}]
+        }))
+    }
+
+    pub fn restart_after_response(&self) {
+        if self.restart_requested.load(Ordering::Acquire) {
+            let restart_notify = self.restart_notify.clone();
+            tokio::spawn(async move {
+                // The MCP response is flushed. Allow the WebSocket bridge to
+                // forward it before the main loop shuts down the process.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                restart_notify.notify_one();
+            });
         }
     }
 
@@ -506,4 +576,87 @@ pub(crate) fn value_as_bool(v: &Value) -> Option<bool> {
 /// Extract u64 from a JSON value, accepting both native number and string digits.
 pub(crate) fn value_as_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn host(supervised: bool) -> ToolHost {
+        let mut host = ToolHost::new(&PortalConfig {
+            kits_enabled: false,
+            ..PortalConfig::default()
+        });
+        host.restart_supported = supervised;
+        host
+    }
+
+    #[tokio::test]
+    async fn unsupervised_portal_cannot_restart() {
+        let host = host(false);
+        assert!(!host
+            .list_builtin_tools()
+            .iter()
+            .any(|t| t.name == "portal_restart"));
+        assert!(host.handle_restart().await.is_err());
+        assert!(!host.restart_requested.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_response_and_is_not_lost_before_waiter_starts() {
+        let host = host(true);
+        assert!(host
+            .list_builtin_tools()
+            .iter()
+            .any(|t| t.name == "portal_restart"));
+        host.handle_restart().await.unwrap();
+        assert!(host.handle_restart().await.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("already"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), host.wait_for_restart())
+                .await
+                .is_err()
+        );
+        host.restart_after_response();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::timeout(Duration::from_millis(100), host.wait_for_restart())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_flushes_restart_reply_before_scheduling_exit() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let host = host(true);
+        let server_host = host.clone();
+        // The reply exceeds this capacity: flushing must wait for our read.
+        let (client, server) = tokio::io::duplex(32);
+        let handler = tokio::spawn(async move {
+            crate::handle_connection(server, &server_host, "test", None).await
+        });
+        let (reader, mut writer) = tokio::io::split(client);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"portal_restart\",\"arguments\":{}}}\n").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), host.wait_for_restart())
+                .await
+                .is_err()
+        );
+        let mut reader = BufReader::new(reader);
+        let mut reply = String::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert!(reply.get("error").is_none());
+        tokio::time::timeout(Duration::from_secs(3), host.wait_for_restart())
+            .await
+            .unwrap();
+        handler.abort();
+        let _ = handler.await;
+    }
 }

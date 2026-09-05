@@ -282,9 +282,10 @@ exec = true
 file = true
 web_fetch = false
 "#;
-        let raw: RawConfig = toml::from_str(toml).unwrap();
-        let content = std::fs::write("/tmp/test-portal.toml", toml).unwrap();
-        let config = PortalConfig::load("/tmp/test-portal.toml").unwrap();
+        let path = std::env::temp_dir().join(format!("heart-portal-flat-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, toml).unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
         assert_eq!(config.name, "vale");
         assert_eq!(config.bind_host, "0.0.0.0");
         assert_eq!(config.bind_port, 9100);
@@ -301,8 +302,10 @@ name = "vale"
 kits_dir = "/tmp/portal-kits"
 kits_enabled = false
 "#;
-        std::fs::write("/tmp/test-portal-kits.toml", toml).unwrap();
-        let config = PortalConfig::load("/tmp/test-portal-kits.toml").unwrap();
+        let path = std::env::temp_dir().join(format!("heart-portal-kits-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, toml).unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
         assert_eq!(config.kits_dir.as_deref(), Some("/tmp/portal-kits"));
         assert!(!config.kits_enabled);
     }
