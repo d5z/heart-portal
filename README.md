@@ -59,11 +59,77 @@ mv heart-portal-* heart-portal
 
 Copy `portal.example.toml` to `portal.toml` and edit the local settings.
 `portal.toml` is Git-ignored: do not commit machine-specific paths or tokens.
+Relative workspace paths are resolved from the config file's directory. Portal
+initializes that root before serving tools and stops on configuration/access
+errors. On Windows, omitting the workspace uses
+`%USERPROFILE%\.heart-portal\workspace`, rather than `/workspace`.
 
 ### 3. Run
 
 ```bash
 ./heart-portal --config portal.toml --connect "https://echo.beings.town/<being>/?token=<token>" --name "<machine-name>"
+```
+
+### macOS background recovery
+
+Build from the checkout with `cargo build --release --locked`, then install a
+per-user LaunchAgent (Python 3.9+ is required only for installation/management):
+
+```bash
+python3 scripts/portal-macos.py install --name "<original-machine-name>"
+```
+
+The installer reuses `.portal-connection.url` if present, otherwise prompts for
+the Loom connection URL without echoing it. `PORTAL_CONNECT_LINK` is also
+supported. On the first installation, use the original Portal name to retain
+its relay identity. Later installations reuse the saved name and config.
+Credentials are stored with owner-only permissions and are not placed in the
+LaunchAgent plist or Portal command line.
+
+The service starts immediately and at **user login**, without a terminal window
+or `sudo`. macOS `launchd` restarts it after crashes, signals, and successful
+`portal_restart` exits; rapid relaunches are throttled to a five-second launch
+interval (not a fixed five-second delay after each exit). The existing network
+reconnect backoff remains 2–30 seconds with jitter. Sleep suspends the service;
+it reconnects after wake. This does not keep the Mac awake or detect arbitrary
+process hangs.
+
+Portal handles termination with up to ten seconds of managed-process cleanup;
+launchd allows fifteen seconds before forcing shutdown. Runtime output goes
+directly to files, so an inherited kit log handle cannot block recovery. The
+previous launch's logs are retained as `portal-runtime.log.previous` and
+`portal-runtime.err.log.previous`. macOS also rejects a second Portal for the
+same user/relay/Being, including across checkouts and token rotations.
+
+```bash
+python3 scripts/portal-macos.py status
+python3 scripts/portal-macos.py uninstall
+# To update the binary, uninstall first, then build and install again:
+cargo build --release --locked
+python3 scripts/portal-macos.py install
+```
+
+Uninstall stops this checkout's service and preserves its config, credentials,
+and name. Installation replaces any manually running Portal from this checkout.
+It captures the current `PATH` for Node/Python and other kit commands; reinstall
+after changing runtime locations. Kits continue to use `~/.heart-portal/kits`
+or the configured `kits_dir`. No kits are installed automatically.
+
+The LaunchAgent lives in `~/Library/LaunchAgents/town.beings.heart-portal.*.plist`.
+Keep the checkout at its installed path; uninstall before moving it. macOS
+privacy permissions still apply to background execution and screen capture.
+If startup logs report access denied under Desktop/Documents, move the checkout
+to a development directory outside those protected folders and reinstall.
+Normal startup and config checks leave the executable's signature and file
+attributes unchanged. A newly built ad-hoc-signed binary can still require fresh
+macOS file permissions after an update; enable only the needed folders under
+System Settings > Privacy & Security > Files & Folders.
+
+Regression tests use a temporary checkout and a temporary real LaunchAgent;
+they never connect to a Being:
+
+```bash
+python3 scripts/tests/macos-lifecycle.tests.py
 ```
 
 ### Windows background recovery
@@ -133,6 +199,18 @@ Portal includes a built-in web UI for collaborative work. Access it at `http://l
 - **Being identity verified**: Relay authenticates both Portal and Heart-core via shared secret
 
 ## Troubleshooting
+
+On Windows, `portal_exec` preserves quotes around executable paths such as
+`"C:\Program Files\Git\usr\bin\bash.exe" -c "echo ok"`, including in background
+mode. When Git for Windows is installed, Portal adds its Unix tools as a PATH
+fallback without changing the configured shell or overriding existing commands.
+See the [tool reference](starter-kit/guides/portal-ref.md) for shell quoting,
+file `unescape` behavior, and environment/authentication troubleshooting.
+For Chinese text in Windows PowerShell, use
+`{"shell":"powershell","command":"Get-Content -LiteralPath '中文.txt'"}`;
+this selects UTF-8 output/text defaults and transports the script without code-page
+loss. `Path outside workspace` remains a boundary rejection, not a reason to
+create a different workspace or retry via shell commands.
 
 | Problem | Solution |
 |---------|----------|

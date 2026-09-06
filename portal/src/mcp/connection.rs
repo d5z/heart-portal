@@ -237,6 +237,14 @@ impl McpConnection {
 
         {
             let mut pending = self.responses.lock().await;
+            // Check under the same lock used by reader cleanup: either this
+            // request is rejected, or cleanup will see and cancel it.
+            if !self.is_alive() {
+                anyhow::bail!(
+                    "MCP server '{}': the kit process exited or closed stdout",
+                    self.config.name
+                );
+            }
             pending.insert(request_id, tx);
         }
 
@@ -515,6 +523,49 @@ async fn terminate_child(child: &mut Child, server_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_after_reader_closed_fails_without_waiting_or_writing() {
+        let (writer, mut peer) = tokio::io::duplex(4096);
+        let connection = McpConnection {
+            child: None,
+            writer: Arc::new(Mutex::new(BufWriter::new(Box::new(writer)))),
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            config: McpServerConfig {
+                name: "closed-reader".into(),
+                command: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        McpConnection::reader_task(
+            BufReader::new(&b""[..]),
+            connection.responses.clone(),
+            connection.alive.clone(),
+            "closed-reader",
+        )
+        .await
+        .unwrap();
+        // The kit may close stdout while keeping stdin open. A successful write
+        // must not make a new request wait for the normal ten-minute timeout.
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.call_tool("example", serde_json::json!({})),
+        )
+        .await
+        .expect("closed reader must fail immediately")
+        .unwrap_err();
+        assert!(error.to_string().contains("closed stdout"), "{error}");
+        assert!(connection.responses.lock().await.is_empty());
+        drop(connection);
+        let mut output = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut peer, &mut output)
+            .await
+            .unwrap();
+        assert!(output.is_empty(), "must not write to a dead connection");
+    }
 
     #[cfg(windows)]
     #[tokio::test]

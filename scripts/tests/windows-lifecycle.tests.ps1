@@ -66,6 +66,12 @@ try {
         $failed = $false
         try { & $installer -Root $testRoot -ConnectLink 'https://relay.invalid/test-being/' } catch { $failed = $true }
         Assert ($failed -and $global:PortalTestTasks.Count -eq 0) 'invalid link fails before installation'
+        $global:PortalTestFailRegistration = $true
+        $failed = $false
+        try { & $installer -Root $testRoot -ConnectLink $link -PortalName 'first-name' } catch { $failed = $true }
+        Assert $failed 'first registration failure reported'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $testRoot '.portal-connection.url'))) 'failed first registration does not save connection'
+        $global:PortalTestFailRegistration = $false
         & $installer -Root $testRoot -ConnectLink $link -PortalName 'first-name' -TaskName 'CustomPortalTask'
         Assert ((Get-Content (Join-Path $testRoot '.portal-name') -Raw) -eq 'first-name') 'explicit first name'
         Assert (Test-Path -LiteralPath (Join-Path $testRoot 'workspace')) 'first install creates workspace'
@@ -84,6 +90,11 @@ try {
         try { & $taskInstaller -Root $testRoot -PortalName 'must-not-persist' } catch { $failed = $true }
         Assert $failed 'registration failure reported'
         Assert ((Get-Content (Join-Path $testRoot '.portal-name') -Raw) -eq 'first-name') 'failed install keeps identity'
+        $savedLink = [IO.File]::ReadAllText((Join-Path $testRoot '.portal-connection.url'))
+        $failed = $false
+        try { & $installer -Root $testRoot -ConnectLink $link -PortalName 'must-not-persist' } catch { $failed = $true }
+        Assert $failed 'outer installer reports registration failure'
+        Assert ([IO.File]::ReadAllText((Join-Path $testRoot '.portal-connection.url')) -eq $savedLink) 'failed registration preserves connection'
         $global:PortalTestFailRegistration = $false
 
         & $taskInstaller -Root $testRoot -TaskName 'RenamedPortalTask'
@@ -92,6 +103,10 @@ try {
         $failed = $false
         try { & $taskInstaller -Root $testRoot -TaskName 'UnrelatedTask' } catch { $failed = $true }
         Assert $failed 'cannot overwrite unrelated task'
+        $failed = $false
+        try { & $installer -Root $testRoot -ConnectLink $link -TaskName 'UnrelatedTask' } catch { $failed = $true }
+        Assert $failed 'outer installer rejects unrelated task'
+        Assert ([IO.File]::ReadAllText((Join-Path $testRoot '.portal-connection.url')) -eq $savedLink) 'task conflict preserves connection'
         & (Join-Path $testRoot 'scripts\uninstall-portal-task.ps1') -Root $testRoot
         Assert ($global:PortalTestTasks.Count -eq 1 -and $global:PortalTestTasks.ContainsKey('UnrelatedTask')) 'uninstall only removes owned task'
         Write-Output 'PASS: install, reinstall, name/task persistence, hidden action, failed registration, rename, uninstall'

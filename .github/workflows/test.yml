@@ -1,0 +1,31 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Git for Windows fixture is available
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $git = Join-Path $env:ProgramFiles 'Git\usr\bin\ls.exe'
+          if (-not (Test-Path $git)) { throw 'Git for Windows is required for the PATH regression test.' }
+      - name: Rust tests (includes native Windows exec regressions)
+        run: cargo test --locked
+      - name: Windows supervisor lifecycle
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\tests\windows-lifecycle.tests.ps1

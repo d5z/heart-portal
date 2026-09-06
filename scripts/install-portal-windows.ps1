@@ -50,7 +50,6 @@ if (-not (Test-Path -LiteralPath $workspace)) {
 }
 
 $linkFile = Join-Path $Root '.portal-connection.url'
-Set-Content -LiteralPath $linkFile -Value $ConnectLink.Trim() -NoNewline
 
 if ([string]::IsNullOrWhiteSpace($TaskName)) {
     $TaskName = Get-PortalSavedValue $Root '.portal-task-name'
@@ -60,5 +59,5 @@ if ([string]::IsNullOrWhiteSpace($TaskName)) {
 }
 
 $install = Join-Path $PSScriptRoot 'install-portal-task.ps1'
-& $install -Root $Root -TaskName $TaskName -PortalName $PortalName
+& $install -Root $Root -TaskName $TaskName -PortalName $PortalName -ConnectLink ($ConnectLink.Trim())
 Write-Output "Connection saved to $linkFile (this file is Git-ignored)."

@@ -1,6 +1,8 @@
 # Copy this file to portal.toml and adjust only machine-local settings.
 # portal.toml is intentionally Git-ignored.
 name = "portal"
+# Relative to this config file, not the shell's current directory.
+# Windows absolute path example: workspace = 'C:\Users\you\Portal Workspace'
 workspace = "./workspace"
 bind = "127.0.0.1:9100"
 kits_enabled = true

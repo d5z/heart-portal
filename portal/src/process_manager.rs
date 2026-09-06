@@ -1,7 +1,7 @@
 //! Background process manager for portal_exec (background) + portal_process tools.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, shell_program, validate_exec_allowlist};
+use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -405,6 +405,17 @@ impl ProcessManager {
         workdir: &str,
         extra_env: &[(String, String)],
     ) -> Result<SessionInfo> {
+        self.spawn_with_shell(config, command, workdir, extra_env, ExecShell::Default).await
+    }
+
+    pub(crate) async fn spawn_with_shell(
+        &self,
+        config: &PortalConfig,
+        command: &str,
+        workdir: &str,
+        extra_env: &[(String, String)],
+        shell: ExecShell,
+    ) -> Result<SessionInfo> {
         validate_exec_allowlist(command, &config.security.exec_allowlist)?;
 
         let running = {
@@ -429,12 +440,12 @@ impl ProcessManager {
         let status = Arc::new(AsyncMutex::new(ProcessStatus::Running));
         let notify = Arc::new(Notify::new());
 
-        let mut cmd = Command::new(shell_program());
+        let mut cmd = Command::new(shell.program());
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        configure_shell_command(&mut cmd, command, config, workdir);
+        configure_shell_command(&mut cmd, command, config, workdir, shell);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }

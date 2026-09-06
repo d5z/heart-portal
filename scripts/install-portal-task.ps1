@@ -1,7 +1,8 @@
 param(
     [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [string]$TaskName = '',
-    [string]$PortalName = ''
+    [string]$PortalName = '',
+    [string]$ConnectLink = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +29,7 @@ if (-not (Test-Path -LiteralPath $portalExe)) {
     throw "Portal binary not found: $portalExe. Run 'cargo build --release --locked' first."
 }
 foreach ($required in @('portal.toml', '.portal-connection.url')) {
+    if ($required -eq '.portal-connection.url' -and -not [string]::IsNullOrWhiteSpace($ConnectLink)) { continue }
     if (-not (Test-Path -LiteralPath (Join-Path $Root $required))) { throw "Missing $required; run install-portal-windows.ps1 first." }
 }
 
@@ -49,6 +51,9 @@ if ($previousTask -and $previousTask -ne $TaskName) {
     Unregister-ScheduledTask -TaskName $previousTask -Confirm:$false
 }
 Stop-PortalCheckoutProcesses $Root
+if (-not [string]::IsNullOrWhiteSpace($ConnectLink)) {
+    Set-Content -LiteralPath (Join-Path $Root '.portal-connection.url') -Value $ConnectLink.Trim() -NoNewline
+}
 Set-Content -LiteralPath (Join-Path $Root '.portal-name') -Value $PortalName -NoNewline
 Set-Content -LiteralPath (Join-Path $Root '.portal-task-name') -Value $TaskName -NoNewline
 Start-ScheduledTask -TaskName $TaskName

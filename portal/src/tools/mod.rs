@@ -170,6 +170,11 @@ impl ToolHost {
                             "type": "string",
                             "description": "Shell command to execute"
                         },
+                        "shell": {
+                            "type": "string",
+                            "enum": ["default", "powershell"],
+                            "description": "default: cmd.exe on Windows, sh elsewhere. powershell: Windows PowerShell with UTF-8 output and text file defaults; pass PowerShell script directly. Works in foreground and background."
+                        },
                         "workdir": {
                             "type": "string",
                             "description": "Working directory (optional)"

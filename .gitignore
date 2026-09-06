@@ -8,6 +8,11 @@ portal.toml
 .portal-connection.url
 .portal-name
 .portal-task-name
+.portal-launchagent-label
 portal-runtime.log
 portal-runtime.err.log
+portal-runtime.log.previous
+portal-runtime.err.log.previous
+portal-launchagent.log
+portal-launchagent.err.log
 /workspace/

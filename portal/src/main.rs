@@ -93,12 +93,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // macOS: ensure our own binary is clear of quarantine/provenance xattrs
-    // that would cause SIGKILL on next launchd restart.
-    if let Ok(exe) = std::env::current_exe() {
-        upgrade::unlock_gatekeeper(&exe);
-    }
-
     // Supervisors can provide the Loom link through the environment so the
     // credential is not exposed in the OS process command line.
     let connect_link = cli.connect.or_else(|| {
@@ -106,6 +100,7 @@ async fn main() -> Result<()> {
             .ok()
             .filter(|link| !link.trim().is_empty())
     });
+    let explicit_config = cli.config.is_some() || cli.config_positional.is_some();
     let config_path = cli
         .config
         .or(cli.config_positional)
@@ -115,6 +110,7 @@ async fn main() -> Result<()> {
     let mut config = if PathBuf::from(&config_path).exists() {
         PortalConfig::load(&config_path)?
     } else {
+        anyhow::ensure!(!explicit_config, "Config file not found: {}", config_path);
         info!("No config file at {}, using defaults", config_path);
         PortalConfig::default()
     };
@@ -132,10 +128,10 @@ async fn main() -> Result<()> {
         };
     }
 
-    // Prevent stale/duplicate Windows Portal processes from competing for the
+    // Prevent stale/duplicate Portal processes from competing for the
     // same relay connection and ejecting one another. Management subcommands
     // above remain usable while a Portal instance is running.
-    // Key the Windows mutex by relay host + Being rather than by the whole
+    // Key the instance guard by relay host + Being rather than by the whole
     // Loom URL. Rotating a token must not allow a second local instance to
     // bypass the duplicate-process guard.
     let instance_identity = match connect_link.as_deref() {
@@ -147,6 +143,9 @@ async fn main() -> Result<()> {
     };
     let _single_instance =
         single_instance::acquire(Some(&instance_identity)).map_err(|e| anyhow::anyhow!(e))?;
+
+    config.prepare_workspace()?;
+    info!("Workspace ready: {}", config.security.workspace_root.display());
 
     if config.portal_mcp_token.is_none() {
         warn!("PORTAL_MCP_TOKEN is not set — MCP TCP connections are unauthenticated (set token for public deployments)");
@@ -264,6 +263,10 @@ async fn main() -> Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
             } => {
                 info!("Portal shutting down (Ctrl+C)");
+                tool_shutdown.kill_all_managed_processes().await;
+            }
+            _ = wait_sigterm() => {
+                info!("Portal shutting down (termination signal)");
                 tool_shutdown.kill_all_managed_processes().await;
             }
             _ = restart_waiter.wait_for_restart() => {
