@@ -1,7 +1,7 @@
 //! Exec tool — run shell commands.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, shell_program, validate_exec_allowlist};
+use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
 use crate::process_manager::ProcessManager;
 use anyhow::Result;
 use serde_json::Value;
@@ -18,6 +18,7 @@ pub async fn execute(
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
+    let shell = ExecShell::parse(arguments.get("shell"))?;
 
     let workdir = arguments
         .get("workdir")
@@ -45,9 +46,11 @@ pub async fn execute(
     validate_exec_allowlist(command, &config.security.exec_allowlist)?;
 
     if background {
-        let info = process_manager
-            .spawn(config, command, &workdir, &[])
-            .await?;
+        let info = if shell == ExecShell::Default {
+            process_manager.spawn(config, command, &workdir, &[]).await?
+        } else {
+            process_manager.spawn_with_shell(config, command, &workdir, &[], shell).await?
+        };
         return Ok(serde_json::json!({
             "content": [{
                 "type": "text",
@@ -66,8 +69,8 @@ pub async fn execute(
         command, workdir, timeout_secs
     );
 
-    let mut cmd = Command::new(shell_program());
-    configure_shell_command(&mut cmd, command, config, &workdir);
+    let mut cmd = Command::new(shell.program());
+    configure_shell_command(&mut cmd, command, config, &workdir, shell);
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),

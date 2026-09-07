@@ -44,12 +44,17 @@ impl McpConnection {
         }
 
         let mut command = tokio::process::Command::new(&config.command[0]);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
         command
             .args(&config.command[1..])
             .envs(&config.env)
+            .env_remove("HEART_PORTAL_SUPERVISED")
+            .env_remove("PORTAL_CONNECT_LINK")
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
 
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
@@ -71,6 +76,8 @@ impl McpConnection {
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to get stdout for MCP server '{}'", config.name))?;
 
+        let stderr = child.stderr.take();
+
         let responses = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let connection = Self {
@@ -84,11 +91,38 @@ impl McpConnection {
 
         let server_name = connection.config.name.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::reader_task(BufReader::new(stdout), responses, &server_name).await {
+            if let Err(e) = Self::reader_task(BufReader::new(stdout), responses, alive, &server_name).await {
                 error!("MCP server '{}' reader failed: {}", server_name, e);
             }
-            alive.store(false, Ordering::SeqCst);
         });
+
+        if let Some(stderr) = stderr {
+            let server_name = connection.config.name.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    match reader.read_until(b'\n', &mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            // Windows command shims may write using the OEM
+                            // code page rather than UTF-8. Preserve useful
+                            // diagnostics instead of aborting the stderr task.
+                            let decoded = String::from_utf8_lossy(&line);
+                            let message = decoded.trim_end();
+                            if !message.is_empty() {
+                                warn!("MCP server '{}' stderr: {}", server_name, message);
+                            }
+                        }
+                        Err(err) => {
+                            warn!("MCP server '{}' stderr read failed: {}", server_name, err);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         if let Err(e) = connection.initialize().await {
             let mut connection = connection;
@@ -101,6 +135,23 @@ impl McpConnection {
     }
 
     async fn reader_task<R>(
+        reader: BufReader<R>,
+        responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+        alive: Arc<AtomicBool>,
+        server_name: &str,
+    ) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let result = Self::read_responses(reader, responses.clone(), server_name).await;
+        // Mark dead before waking callers, on both EOF and read errors. Otherwise
+        // a broken pipe/invalid UTF-8 can leave tool calls waiting for ten minutes.
+        alive.store(false, Ordering::SeqCst);
+        Self::drop_pending(responses, server_name).await;
+        result
+    }
+
+    async fn read_responses<R>(
         mut reader: BufReader<R>,
         responses: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
         server_name: &str,
@@ -154,8 +205,6 @@ impl McpConnection {
             }
         }
 
-        Self::drop_pending(responses, server_name).await;
-
         Ok(())
     }
 
@@ -166,7 +215,7 @@ impl McpConnection {
         let mut pending = responses.lock().await;
         if !pending.is_empty() {
             warn!(
-                "MCP server '{}' reader EOF: dropping {} pending response(s)",
+                "MCP server '{}' reader closed: dropping {} pending response(s)",
                 server_name,
                 pending.len()
             );
@@ -188,6 +237,14 @@ impl McpConnection {
 
         {
             let mut pending = self.responses.lock().await;
+            // Check under the same lock used by reader cleanup: either this
+            // request is rejected, or cleanup will see and cancel it.
+            if !self.is_alive() {
+                anyhow::bail!(
+                    "MCP server '{}': the kit process exited or closed stdout",
+                    self.config.name
+                );
+            }
             pending.insert(request_id, tx);
         }
 
@@ -223,9 +280,14 @@ impl McpConnection {
 
         let response = match tokio::time::timeout(timeout, rx).await {
             Ok(result) => result.with_context(|| {
+                let state = if self.is_alive() {
+                    "response receiver was dropped"
+                } else {
+                    "the kit process exited or closed stdout"
+                };
                 format!(
-                    "Response channel closed for MCP server '{}'",
-                    self.config.name
+                    "Response channel closed for MCP server '{}': {}",
+                    self.config.name, state
                 )
             })?,
             Err(_) => {
@@ -425,7 +487,10 @@ async fn terminate_child(child: &mut Child, server_name: &str) {
 async fn terminate_child(child: &mut Child, server_name: &str) {
     if let Some(pid) = child.id() {
         match tokio::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string()])
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW, including cleanup
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .await
         {
@@ -452,5 +517,123 @@ async fn terminate_child(child: &mut Child, server_name: &str) {
     match child.kill().await {
         Ok(_) => debug!("MCP server '{}' process killed", server_name),
         Err(e) => warn!("Failed to kill MCP server '{}' process: {}", server_name, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_after_reader_closed_fails_without_waiting_or_writing() {
+        let (writer, mut peer) = tokio::io::duplex(4096);
+        let connection = McpConnection {
+            child: None,
+            writer: Arc::new(Mutex::new(BufWriter::new(Box::new(writer)))),
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            config: McpServerConfig {
+                name: "closed-reader".into(),
+                command: vec![],
+                env: HashMap::new(),
+                cwd: None,
+            },
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        McpConnection::reader_task(
+            BufReader::new(&b""[..]),
+            connection.responses.clone(),
+            connection.alive.clone(),
+            "closed-reader",
+        )
+        .await
+        .unwrap();
+        // The kit may close stdout while keeping stdin open. A successful write
+        // must not make a new request wait for the normal ten-minute timeout.
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.call_tool("example", serde_json::json!({})),
+        )
+        .await
+        .expect("closed reader must fail immediately")
+        .unwrap_err();
+        assert!(error.to_string().contains("closed stdout"), "{error}");
+        assert!(connection.responses.lock().await.is_empty());
+        drop(connection);
+        let mut output = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut peer, &mut output)
+            .await
+            .unwrap();
+        assert!(output.is_empty(), "must not write to a dead connection");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_kit_handles_spaces_and_literal_metacharacters() {
+        let dir = std::env::temp_dir().join(format!("portal kit ({})", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("kit shim.cmd");
+        std::fs::write(
+            &script,
+            concat!(
+                "@echo off\r\n",
+                "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"%~dp0server.ps1\" %*\r\n",
+            ),
+        )
+        .unwrap();
+        // A real line reader: consecutive `set /p` in cmd can consume multiple
+        // pipe lines at once, making a batch-only MCP fixture nondeterministic.
+        std::fs::write(
+            dir.join("server.ps1"),
+            r#"
+$ErrorActionPreference = 'Stop'
+while ($null -ne ($line = [Console]::ReadLine())) {
+    $request = ConvertFrom-Json -InputObject $line
+    if ($null -ne $request.id) {
+        $result = @{ argument = $args[0] }
+        $response = @{ jsonrpc = '2.0'; id = $request.id; result = $result }
+        [Console]::WriteLine((ConvertTo-Json -InputObject $response -Compress -Depth 5))
+    }
+}
+"#,
+        )
+        .unwrap();
+        let mut connection = McpConnection::spawn(McpServerConfig {
+            name: "cmd-test".into(),
+            command: vec![
+                script.to_string_lossy().into_owned(),
+                "space & value".into(),
+            ],
+            env: HashMap::new(),
+            cwd: Some(dir.clone()),
+        })
+        .await
+        .unwrap();
+        let result = connection
+            .request_with_timeout("ping", serde_json::json!({}), Duration::from_secs(5))
+            .await;
+        connection.shutdown().await.unwrap();
+        assert_eq!(result.unwrap()["argument"], "space & value");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_reader_drops_pending_on_eof_and_read_error() {
+        for input in [&b""[..], &b"\xff\n"[..]] {
+            let (sender, receiver) = oneshot::channel();
+            let responses = Arc::new(Mutex::new(HashMap::from([(1, sender)])));
+            let alive = Arc::new(AtomicBool::new(true));
+            let result = McpConnection::reader_task(
+                BufReader::new(input),
+                responses.clone(),
+                alive.clone(),
+                "test",
+            )
+            .await;
+            assert_eq!(result.is_err(), !input.is_empty());
+            assert!(!alive.load(Ordering::SeqCst));
+            assert!(responses.lock().await.is_empty());
+            assert!(receiver.await.is_err());
+        }
     }
 }

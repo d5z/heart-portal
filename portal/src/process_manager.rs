@@ -1,7 +1,7 @@
 //! Background process manager for portal_exec (background) + portal_process tools.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, shell_program, validate_exec_allowlist};
+use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -405,6 +405,17 @@ impl ProcessManager {
         workdir: &str,
         extra_env: &[(String, String)],
     ) -> Result<SessionInfo> {
+        self.spawn_with_shell(config, command, workdir, extra_env, ExecShell::Default).await
+    }
+
+    pub(crate) async fn spawn_with_shell(
+        &self,
+        config: &PortalConfig,
+        command: &str,
+        workdir: &str,
+        extra_env: &[(String, String)],
+        shell: ExecShell,
+    ) -> Result<SessionInfo> {
         validate_exec_allowlist(command, &config.security.exec_allowlist)?;
 
         let running = {
@@ -429,12 +440,12 @@ impl ProcessManager {
         let status = Arc::new(AsyncMutex::new(ProcessStatus::Running));
         let notify = Arc::new(Notify::new());
 
-        let mut cmd = Command::new(shell_program());
+        let mut cmd = Command::new(shell.program());
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        configure_shell_command(&mut cmd, command, config, workdir);
+        configure_shell_command(&mut cmd, command, config, workdir, shell);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -727,7 +738,10 @@ impl ProcessManager {
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string()])
+                .args(["/T", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status()
                 .await;
             time::sleep(KILL_GRACE).await;
@@ -741,7 +755,10 @@ impl ProcessManager {
             };
             if still_running {
                 let _ = Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .await;
             }
@@ -1041,7 +1058,7 @@ mod tests {
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(10)).await, 1);
         let (body, auth) = server.hits.lock().unwrap()[0].clone();
 
-        assert_eq!(auth.as_deref(), Some("Bearer tok_secret"));
+        assert_eq!(auth, None); // Heart callback auth is sent in the URL query.
         assert_eq!(body["source"], "portal");
         assert_eq!(body["task_id"], info.session_id);
         assert_eq!(body["result"]["exit_code"], 0);

@@ -1,0 +1,30 @@
+# Copy this file to portal.toml and adjust only machine-local settings.
+# portal.toml is intentionally Git-ignored.
+name = "portal"
+# Relative to this config file, not the shell's current directory.
+# Windows absolute path example: workspace = 'C:\Users\you\Portal Workspace'
+workspace = "./workspace"
+bind = "127.0.0.1:9100"
+kits_enabled = true
+
+# By default kits are loaded from ~/.heart-portal/kits, including
+# %USERPROFILE%/.heart-portal/kits on Windows.
+# kits_dir = "C:/Users/you/.heart-portal/kits"
+
+[cowork]
+enabled = true
+http_port = 9101
+
+[tools]
+exec = true
+file = true
+screenshot = true
+web_fetch = true
+search = true
+custom_tools_enabled = true
+
+[security]
+# An empty allowlist permits any portal_exec command. Set this list when the
+# connected Being should be restricted to specific executables.
+exec_allowlist = []
+max_file_size = 10485760
