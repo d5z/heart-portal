@@ -18,13 +18,17 @@ try {
 $Root = [string](($installed | ConvertFrom-Json).root)
 $portalExe = Get-PortalExecutable $Root
 if (-not (Test-Path -LiteralPath (Join-Path $Root 'scripts\portal-lifecycle.ps1'))) {
-    & $portalExe --export-windows-runtime (Join-Path $Root 'scripts')
+    & $portalExe --export-windows-runtime (Join-Path $Root 'scripts') | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare Portal supervision.' }
 }
 $maintenance = Enter-PortalMaintenance $Root
 try {
 $supervisor = Join-Path $Root 'scripts\portal-supervisor.ps1'
-$hiddenLauncher = Join-Path $Root 'scripts\portal-supervisor-hidden.vbs'
+$hiddenLauncher = Join-Path $Root 'scripts\portal-background-v1.exe'
+if (-not (Test-Path -LiteralPath $hiddenLauncher)) {
+    & $portalExe --export-windows-launcher $hiddenLauncher | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare the native background launcher.' }
+}
 if (-not (Test-Path -LiteralPath $supervisor)) { throw "Supervisor script not found: $supervisor" }
 if (-not (Test-Path -LiteralPath $hiddenLauncher)) { throw "Hidden launcher not found: $hiddenLauncher" }
 if (-not (Test-Path -LiteralPath (Join-Path $Root 'scripts\portal-supervisor-bootstrap.ps1'))) { throw 'Portal supervisor bootstrap is missing.' }
@@ -57,10 +61,8 @@ if ([string]::IsNullOrWhiteSpace($ConnectLink) -and -not (Test-Path -LiteralPath
 & $portalExe config init | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot initialize the user Portal configuration.' }
 
-$wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
-if (-not (Test-Path -LiteralPath $wscript)) { throw "Windows Script Host not found: $wscript" }
-$arguments = '"{0}" "{1}" "{2}"' -f $hiddenLauncher, $Root, $PortalName
-$action = New-ScheduledTaskAction -Execute $wscript -Argument $arguments -WorkingDirectory $Root
+$arguments = '-File "{0}" -Root "{1}" -PortalName "{2}"' -f (Join-Path $Root 'scripts\portal-supervisor-bootstrap.ps1'), $Root, $PortalName
+$action = New-ScheduledTaskAction -Execute $hiddenLauncher -Argument $arguments -WorkingDirectory $Root
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited

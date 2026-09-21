@@ -35,14 +35,15 @@ Its PowerShell commands prompt for the complete Being link using `Read-Host` and
 include the saved absolute config path and Portal name. Run them in another
 PowerShell window, not in the log reader or Command Prompt (`cmd.exe`).
 
-The live console uses a colored banner and window title for missing configuration,
+The optional live console uses a colored banner and window title for missing configuration,
 connecting, connected, and retrying. `.portal-connection-status.json` is published
 by the runtime and matched to its PID and launch nonce; historical log messages
 cannot mark a new process as connected. Connection telemetry is separate from
 local readiness, so a relay outage does not trigger binary upgrade rollback.
 
-In an interactive console, startup hands live log viewing to a separate PowerShell
-process in that console. The launcher EXE exits so it can still be replaced during
+Startup is silent when launched from Explorer and does not open a log window.
+Run `heart-portal.exe --logs` from an existing terminal to hand live log viewing
+to a separate PowerShell process in that terminal. The launcher EXE exits so it can still be replaced during
 an upgrade. Closing the console or pressing Ctrl+C ends only log viewing; use the
 EXE's `stop` command to stop Portal and supervision. The reader follows runtime
 restarts and hides the saved connection token. Redirected/script launches print
@@ -180,3 +181,8 @@ source version or publish a release. These clean-directory tests are not a
 fresh Windows VM test and do not prove that a future GitHub `latest` asset has
 been uploaded correctly. E2E binaries use a separate build directory and cannot
 replace the normal package output.
+
+Windows scheduled tasks use the embedded `portal-background-v1.exe` GUI launcher.
+It creates PowerShell with `CREATE_NO_WINDOW`, waits for it, and forwards its exit
+code so task ownership and restart behavior are retained without a console flash.
+Existing task actions are migrated on explicit startup; log files remain available.

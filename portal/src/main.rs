@@ -4,6 +4,8 @@
 //! Heart's MCP supervisor connects to Portal via TCP.
 //! Portal can run on Town Home, a human's laptop, or anywhere.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod bounded_file;
 mod config;
 mod connection_status;
@@ -25,6 +27,8 @@ mod upgrade;
 mod user_installation;
 #[cfg(windows)]
 mod windows_private;
+#[cfg(windows)]
+mod windows_console;
 #[cfg(windows)]
 mod windows_start;
 #[cfg(windows)]
@@ -55,6 +59,12 @@ struct Cli {
     /// Export version-matched Windows supervision code for the update worker
     #[arg(long, hide = true)]
     export_windows_runtime: Option<PathBuf>,
+    /// Export the native, console-free Windows task launcher
+    #[arg(long, hide = true)]
+    export_windows_launcher: Option<PathBuf>,
+    /// Follow Windows Portal logs in the invoking terminal after startup
+    #[arg(long)]
+    logs: bool,
     /// Legacy spelling for the upgrade subcommand
     #[arg(long = "upgrade", hide = true)]
     legacy_upgrade: bool,
@@ -145,6 +155,8 @@ enum KitCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(windows)]
+    windows_console::attach_parent();
     #[cfg(any(windows, target_os = "macos"))]
     {
         // Older updaters execute the staged candidate with --version before
@@ -169,8 +181,14 @@ async fn main() -> Result<()> {
                 })
                 | Some(Commands::Upgrade { status: true, .. })
         );
-        anyhow::ensure!(read_only && !cli.legacy_upgrade && cli.export_windows_runtime.is_none() && !cli.install_user_runtime,
+        anyhow::ensure!(read_only && !cli.legacy_upgrade && cli.export_windows_runtime.is_none() && cli.export_windows_launcher.is_none() && !cli.install_user_runtime,
             "Managed external tools cannot start, stop, upgrade or reconfigure Portal; use the host management channel");
+    }
+    if let Some(path) = &cli.export_windows_launcher {
+        #[cfg(windows)]
+        return windows_upgrade::export_launcher(path);
+        #[cfg(not(windows))]
+        anyhow::bail!("Windows launcher export is available only on Windows");
     }
     if let Some(path) = &cli.export_windows_runtime {
         #[cfg(windows)]
@@ -323,6 +341,7 @@ async fn main() -> Result<()> {
             None,
             None,
             None,
+            false,
         )
         .await;
         #[cfg(target_os = "macos")]
@@ -342,6 +361,7 @@ async fn main() -> Result<()> {
             cli.config.as_deref().or(cli.config_positional.as_deref()),
             cli.connect.as_deref(),
             cli.name.as_deref(),
+            cli.logs,
         )
         .await;
     }
