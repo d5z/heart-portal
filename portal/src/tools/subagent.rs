@@ -159,6 +159,8 @@ pub fn list_tools() -> Vec<ToolInfo> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "base_url": { "type": "string", "description": "Custom provider HTTP(S) endpoint." },
+                    "api": { "type": "string", "description": "Custom API: openai-completions, openai-responses, anthropic-messages, google-generative-ai." },
                     "provider": {
                         "type": "string",
                         "description": "LLM provider: anthropic, openrouter, openai, gemini, groq, xai"
@@ -311,6 +313,8 @@ async fn setup(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
     }
 
     let update = ModelConfigUpdate {
+        base_url: string_field(&arguments, "base_url")?,
+        api: string_field(&arguments, "api")?,
         provider: string_field(&arguments, "provider")?,
         model: string_field(&arguments, "model")?,
         api_key: string_field(&arguments, "api_key")?,

@@ -322,6 +322,8 @@ struct ModelChoice {
 /// `None` leaves a field alone; `Some("")` clears it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelConfigUpdate {
+    pub base_url: Option<String>,
+    pub api: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
@@ -343,13 +345,18 @@ impl ModelConfigUpdate {
                 Some(v) => Some(v.to_string()),
             }
         }
-        let next = SubagentModelConfig {
+        let mut next = SubagentModelConfig {
+            base_url: merge(&self.base_url, &current.base_url),
+            api: merge(&self.api, &current.api),
             provider: merge(&self.provider, &current.provider).map(|p| p.to_ascii_lowercase()),
             model: merge(&self.model, &current.model),
             thinking: merge(&self.thinking, &current.thinking).map(|t| t.to_ascii_lowercase()),
             api_key: merge(&self.api_key, &current.api_key),
         };
 
+        if self.api_key.is_none() && (next.provider != current.provider || next.base_url != current.base_url) {
+            next.api_key = None;
+        }
         if let Some(provider) = next.provider.as_deref() {
             if !SUBAGENT_PROVIDERS.contains(&provider) {
                 anyhow::bail!(
@@ -357,6 +364,14 @@ impl ModelConfigUpdate {
                     SUBAGENT_PROVIDERS.join(", ")
                 );
             }
+        }
+        if next.provider.as_deref() == Some("portal-custom") {
+            let url = next.base_url.as_deref().and_then(|s| url::Url::parse(s).ok())
+                .ok_or_else(|| anyhow::anyhow!("Custom models require an HTTP(S) base_url"))?;
+            anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                && url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none(), "Invalid custom model base_url");
+            anyhow::ensure!(matches!(next.api.as_deref(), Some("openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai")), "Unsupported custom model API");
+            anyhow::ensure!(next.model.as_deref().is_some_and(|v| !v.is_empty()), "Custom models require a model ID");
         }
         if let Some(level) = next.thinking.as_deref() {
             if !SUBAGENT_THINKING_LEVELS.contains(&level) {
@@ -724,7 +739,8 @@ impl SubagentManager {
         };
 
         let credentials_changed =
-            next.provider != current.provider || next.api_key != current.api_key;
+            next.provider != current.provider || next.api_key != current.api_key
+                || next.base_url != current.base_url || next.api != current.api;
         if credentials_changed && self.has_running_tasks().await {
             anyhow::bail!(
                 "a sub-agent task is still running; wait for it to finish (or cancel it \
@@ -795,6 +811,35 @@ impl SubagentManager {
         was_running
     }
 
+    /// Portal owns only its namespaced entry; preserve user-installed pi providers.
+    fn prepare_custom_model(&self) -> Result<()> {
+        let model = self.model();
+        if model.provider.as_deref() != Some("portal-custom") { return Ok(()); }
+        let model = ModelConfigUpdate::default().apply_to(&model)?;
+        let dir = self.daemon().agent_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("models.json");
+        let mut document: serde_json::Value = if path.exists() {
+            serde_json::from_slice(&std::fs::read(&path)?)?
+        } else { serde_json::json!({"providers": {}}) };
+        let root = document.as_object_mut().ok_or_else(|| anyhow::anyhow!("Invalid pi models.json"))?;
+        let providers = root.entry("providers").or_insert_with(|| serde_json::json!({})).as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Invalid pi providers"))?;
+        providers.insert("portal-custom".into(), serde_json::json!({
+            "baseUrl": model.base_url, "api": model.api,
+            "apiKey": "PORTAL_SUBAGENT_API_KEY",
+            "models": [{"id": model.model, "name": model.model, "reasoning": model.thinking.as_deref() != Some("off")}]
+        }));
+        let temporary = dir.join(format!("models-{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&document)?)?;
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
     // ── daemon / client ─────────────────────────────────────────────
 
     /// The transport for the next task: a connected daemon client, or the
@@ -802,6 +847,7 @@ impl SubagentManager {
     /// (re)starts the event pump when the client generation changes.
     async fn transport(self: &Arc<Self>) -> Result<Transport> {
         self.ensure_available()?;
+        self.prepare_custom_model()?;
         // `ensure_transport` would start a fresh pi daemon; during shutdown
         // that resurrects the very process we are tearing down (and outlives
         // us).
@@ -2594,12 +2640,45 @@ mod tests {
     }
 
     #[test]
+    fn custom_model_registry_and_credential_isolation() {
+        let ws = temp_workspace("custom-registry");
+        let manager = manager_for(&ws, |c| {
+            c.model.provider = Some("portal-custom".into());
+            c.model.model = Some("custom-fixture".into());
+            c.model.base_url = Some("http://127.0.0.1:12345/v1".into());
+            c.model.api = Some("openai-completions".into());
+            c.model.api_key = Some("fixture-private-key".into());
+        });
+        let path = manager.daemon().agent_dir().join("models.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"providers":{"existing":{"baseUrl":"https://example.test"}}}"#).unwrap();
+        manager.prepare_custom_model().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("fixture-private-key"));
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["providers"]["portal-custom"]["models"][0]["id"], "custom-fixture");
+        assert_eq!(json["providers"]["portal-custom"]["apiKey"], "PORTAL_SUBAGENT_API_KEY");
+        assert!(json["providers"]["existing"].is_object());
+        let changed = ModelConfigUpdate { base_url: Some("https://other.example/v1".into()), ..Default::default() }
+            .apply_to(&manager.model()).unwrap();
+        assert!(changed.api_key.is_none());
+        let unchanged = ModelConfigUpdate { model: Some("other-model".into()), ..Default::default() }
+            .apply_to(&manager.model()).unwrap();
+        assert!(unchanged.api_key.is_some());
+        for url in ["file:///tmp/model", "https://user:key@example.test/v1", "https://example.test?key=secret"] {
+            assert!(ModelConfigUpdate { base_url: Some(url.into()), ..Default::default() }.apply_to(&manager.model()).is_err());
+        }
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
     fn model_update_merges_and_validates() {
         let current = SubagentModelConfig {
             provider: Some("openai".to_string()),
             model: Some("gpt-4o".to_string()),
             thinking: Some("low".to_string()),
             api_key: Some("sk-old".to_string()),
+            ..Default::default()
         };
 
         // Partial update keeps the rest.
@@ -2676,6 +2755,7 @@ mod tests {
                 model: Some("claude-sonnet-4-5".to_string()),
                 api_key: Some("sk-ant-api03-configure-test-key".to_string()),
                 thinking: None,
+                ..Default::default()
             })
             .await
             .unwrap();

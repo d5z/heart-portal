@@ -423,11 +423,14 @@ impl PiDaemon {
                 Some("gemini" | "google") => "GEMINI_API_KEY",
                 Some("groq") => "GROQ_API_KEY",
                 Some("xai") => "XAI_API_KEY",
+                Some("portal-custom") => "PORTAL_SUBAGENT_API_KEY",
                 _ => "OPENAI_API_KEY", // sensible default
             };
             cmd.env(env_name, key);
         }
-        cmd.env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
+        cmd.env("PI_CODING_AGENT_DIR", self.agent_dir())
+            .env("PORTAL_SUBAGENT_API_KEY", self.config.api_key.as_deref().unwrap_or("portal-keyless"))
+            .env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
             .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
             // pi change P1: exit gracefully when Portal's stdin pipe closes.
             .env("PRIME_AGENT_DAEMON_EXIT_ON_STDIN_CLOSE", "1")
@@ -638,14 +641,18 @@ impl PiDaemon {
         if let Some(thinking) = task.thinking.as_deref() {
             cmd.args(["--thinking", thinking]);
         }
-        if let Some(key) = task.api_key.as_deref() {
-            cmd.args(["--api-key", key]);
+        if task.provider.as_deref() != Some("portal-custom") {
+            if let Some(key) = task.api_key.as_deref() {
+                cmd.args(["--api-key", key]);
+            }
         }
         cmd.arg(&task.prompt);
 
         cmd.env_clear();
         cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key)));
-        cmd.env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
+        cmd.env("PI_CODING_AGENT_DIR", self.agent_dir())
+            .env("PORTAL_SUBAGENT_API_KEY", task.api_key.as_deref().or(self.config.api_key.as_deref()).unwrap_or("portal-keyless"))
+            .env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
             .env("PRIME_AGENT_SESSION_DIR", self.sessions_dir())
             .env("PRIME_AGENT_HEADLESS", "1")
             .current_dir(&task.workdir)

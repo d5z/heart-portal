@@ -215,6 +215,10 @@ pub struct BudgetConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SubagentModelConfig {
     #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -232,7 +236,7 @@ pub struct SubagentModelConfig {
 
 /// Providers whose API key pi (and Portal's daemon env injection) knows how
 /// to route. `google` is pi's alias for `gemini`.
-pub const SUBAGENT_PROVIDERS: [&str; 7] = [
+pub const SUBAGENT_PROVIDERS: [&str; 8] = [
     "anthropic",
     "openrouter",
     "openai",
@@ -240,6 +244,7 @@ pub const SUBAGENT_PROVIDERS: [&str; 7] = [
     "google",
     "groq",
     "xai",
+    "portal-custom",
 ];
 
 /// Thinking levels pi accepts.
@@ -265,6 +270,8 @@ impl SubagentModelConfig {
             "configured": self.is_configured(),
             "provider": self.provider,
             "model": self.model,
+            "base_url": self.base_url,
+            "api": self.api,
             "thinking": self.thinking,
             "api_key": self.masked_api_key(),
         })
@@ -324,6 +331,8 @@ pub fn write_subagent_model(path: &std::path::Path, model: &SubagentModelConfig)
         .with_context(|| format!("[subagent.model] in {} is not a table", path.display()))?;
 
     for (key, value) in [
+        ("base_url", &model.base_url),
+        ("api", &model.api),
         ("provider", &model.provider),
         ("model", &model.model),
         ("thinking", &model.thinking),
@@ -912,6 +921,7 @@ api_key = "sk-or-v1-secret"
             model: Some("claude-sonnet-4-5".to_string()),
             thinking: None,
             api_key: Some("sk-ant-secret-value-1234567890".to_string()),
+            ..Default::default()
         };
         write_subagent_model(&path, &model).unwrap();
 
@@ -955,6 +965,7 @@ api_key = "sk-or-v1-secret"
             model: Some("deepseek/deepseek-chat".to_string()),
             thinking: Some("low".to_string()),
             api_key: None,
+            ..Default::default()
         };
         write_subagent_model(&path, &model).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();

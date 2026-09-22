@@ -88,6 +88,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Install and configure the subagent from a bounded JSON object on stdin.
+    SubagentSetup,
     /// Inspect configuration paths or copy legacy configuration into the user directory
     Config {
         #[command(subcommand)]
@@ -423,6 +425,21 @@ async fn main() -> Result<()> {
             KitCommands::List => list_installed_kits(&config).await,
             KitCommands::Status => show_kit_status(&config).await,
         };
+    }
+
+    if matches!(&command, Some(Commands::SubagentSetup)) {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::io::stdin().take(16385).read_to_end(&mut bytes).await?;
+        anyhow::ensure!(bytes.len() <= 16384, "Subagent configuration too large");
+        let args: serde_json::Value = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(args.is_object(), "Expected a configuration object");
+        // The explicit setup tool performs the one installation attempt.
+        config.subagent.auto_install = false;
+        let host = ToolHost::new_with_runtime(&config, tools::status::RuntimeStatus::capture(&config, location, config_loaded, config.name.clone(), false, runtime_started));
+        let result = host.call("portal_subagent_setup", args).await?;
+        println!("DESKTOP_SUBAGENT_RESULT={}", result);
+        return Ok(());
     }
 
     // Prevent stale/duplicate Portal processes from competing for the
