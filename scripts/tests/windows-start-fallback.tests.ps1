@@ -1,4 +1,5 @@
 # Exercise scheduler denial without changing any real task or Windows policy.
+param([string]$Binary = (Join-Path $PSScriptRoot '..\..\target\release\heart-portal.exe'))
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 . (Join-Path $repo 'scripts\portal-task-common.ps1')
@@ -17,6 +18,8 @@ try {
     foreach ($name in @('portal-lifecycle.ps1','portal-supervisor.ps1','portal-supervisor-bootstrap.ps1','portal-supervisor-hidden.vbs')) {
         Copy-Item -LiteralPath (Join-Path $repo "scripts\$name") -Destination $support
     }
+    & $Binary --export-windows-launcher (Join-Path $support 'portal-background-v1.exe') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot export the native background launcher fixture.' }
     # Imported after the shared definitions, these replace only this helper's
     # scheduler calls. No machine policy or scheduled task is modified.
     Add-Content -LiteralPath (Join-Path $stage 'portal-task-common.ps1') -Value @'

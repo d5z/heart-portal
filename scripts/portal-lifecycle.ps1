@@ -253,8 +253,20 @@ function Ensure-PortalBootstrap([string]$Root, $Runtime, [string]$Payload) {
         [IO.File]::Copy((Join-Path $Payload 'portal-supervisor-bootstrap.ps1'), $bootstrap)
     }
     $info = [Diagnostics.ProcessStartInfo]::new()
-    $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-PortalArgument $bootstrap) + ' -Root ' + (ConvertTo-PortalArgument $Root)
+    $launcher = Join-Path $Root 'scripts\portal-background-v1.exe'
+    $sourceLauncher = Join-Path $Payload 'portal-background-v1.exe'
+    if (-not (Test-Path -LiteralPath $launcher) -and (Test-Path -LiteralPath $sourceLauncher)) {
+        [IO.File]::Copy($sourceLauncher, $launcher)
+    }
+    if (Test-Path -LiteralPath $launcher) {
+        $info.FileName = $launcher
+        $info.Arguments = '-File ' + (ConvertTo-PortalArgument $bootstrap) + ' -Root ' + (ConvertTo-PortalArgument $Root)
+    } else {
+        # Recovery of older payloads must remain possible before a new start
+        # has exported the native helper into this installation.
+        $info.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-PortalArgument $bootstrap) + ' -Root ' + (ConvertTo-PortalArgument $Root)
+    }
     # This fallback may be launched by the short-lived start helper with piped
     # stdout. ShellExecute detaches those handles so that helper can finish.
     $info.UseShellExecute = $true

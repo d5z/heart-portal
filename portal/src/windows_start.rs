@@ -16,6 +16,7 @@ pub async fn run(
     config: Option<&str>,
     connect: Option<&str>,
     name: Option<&str>,
+    logs: bool,
 ) -> Result<()> {
     if action == "start" {
         println!("Heart Portal {}", crate::upgrade::PORTAL_VERSION);
@@ -107,6 +108,7 @@ pub async fn run(
         "portal-supervisor.ps1",
         "portal-supervisor-bootstrap.ps1",
         "portal-supervisor-hidden.vbs",
+        "portal-background-v1.exe",
     ] {
         let _ = std::fs::remove_file(stage.join("support").join(name));
     }
@@ -139,7 +141,7 @@ pub async fn run(
         // The EXE must exit after handoff so an upgrade can replace it. A
         // separate PowerShell reader keeps an interactive console useful.
         // Redirected/script callers still return promptly and close their pipes.
-        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        if logs && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
             println!("[日志] 正在接入实时日志；关闭窗口或按 Ctrl+C 只退出日志查看，Portal 和守护继续运行。");
             println!(
                 "[停止] 要停止 Portal，请另开 PowerShell 窗口执行：{} stop",
@@ -234,7 +236,7 @@ fn print_launch_summary(launch: &Value, exe: &Path) {
         println!("\n============================================================");
         println!("  【需要配置】尚未配置 Being 连接，当前仅提供本地 MCP 服务");
         println!("============================================================");
-        println!("请另开 PowerShell 窗口，依次执行下面三行（此日志窗口不接收命令）：");
+        println!("请在 PowerShell 中依次执行下面三行：");
         println!("$beingLink = Read-Host '请粘贴从 Beings 复制的完整连接链接（包含 token=）'");
         let command = powershell_exe(exe);
         println!("{command} stop");
@@ -244,7 +246,7 @@ fn print_launch_summary(launch: &Value, exe: &Path) {
     } else {
         // Never echo the saved URL or token. Configured is not connected.
         println!("\n========== Being 连接：已配置链接 ==========");
-        println!("已配置 Being 链接；后台将尝试连接。日志窗口会显示正在连接、已连接或等待重试。");
+        println!("已配置 Being 链接；后台将尝试连接。可在日志文件中查看连接状态，或在终端使用 --logs 查看实时日志。");
         println!("==========================================\n");
     }
     let _ = std::io::stdout().flush();

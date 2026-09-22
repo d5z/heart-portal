@@ -46,7 +46,7 @@ function Stop-PortalCheckoutProcesses([string]$Root, [int[]]$ExcludeProcessIds =
             if ($phase -eq 'supervisor') {
                 return ($_.Name -in @('powershell.exe', 'pwsh.exe')) -and (Test-PortalScriptCommand $_.CommandLine $supervisor)
             }
-            return (($_.Name -in @('powershell.exe', 'pwsh.exe')) -and
+            return (($_.Name -in @('powershell.exe', 'pwsh.exe', 'portal-background-v1.exe')) -and
                     (Test-PortalScriptCommand $_.CommandLine $bootstrap)) -or
                 (($_.Name -in @('wscript.exe', 'cscript.exe')) -and
                     (Test-PortalScriptCommand $_.CommandLine $launcher))

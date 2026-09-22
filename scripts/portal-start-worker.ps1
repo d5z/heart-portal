@@ -38,6 +38,22 @@ try {
         exit 0
     }
 
+    # Repair existing registrations without restarting a live supervisor. The
+    # immutable helper stays separate so upgrades can replace the engine.
+    $background = Join-Path $root 'scripts\portal-background-v1.exe'
+    if (-not (Test-Path -LiteralPath $background)) {
+        [IO.Directory]::CreateDirectory((Join-Path $root 'scripts')) | Out-Null
+        [IO.File]::Copy((Join-Path $PSScriptRoot 'support\portal-background-v1.exe'), $background)
+    }
+    if ($taskName) {
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($task -and $task.Actions[0].Execute -ne $background) {
+            $arguments = '-File ' + (ConvertTo-PortalArgument (Join-Path $root 'scripts\portal-supervisor-bootstrap.ps1')) + ' -Root ' + (ConvertTo-PortalArgument $root)
+            $action = New-ScheduledTaskAction -Execute $background -Argument $arguments -WorkingDirectory $root
+            Set-ScheduledTask -TaskName $taskName -Action $action | Out-Null
+        }
+    }
+
     $runtime = Read-PortalJson (Join-Path $root '.portal-runtime.json')
     $running = Get-PortalRecordedProcess $root $runtime
     $hasRuntime = $null -ne $running
@@ -117,10 +133,9 @@ try {
     try {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if (-not $task) {
-            $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ' +
+            $arguments = '-File ' +
                 (ConvertTo-PortalArgument (Join-Path $scripts 'portal-supervisor-bootstrap.ps1')) + ' -Root ' + (ConvertTo-PortalArgument $root)
-            $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments -WorkingDirectory $root
+            $action = New-ScheduledTaskAction -Execute $background -Argument $arguments -WorkingDirectory $root
             $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
             $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited

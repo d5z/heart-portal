@@ -272,6 +272,7 @@ pub fn delegate(target: &Path, cli: &crate::Cli) -> Result<()> {
     if let Some(name) = &cli.name {
         command.arg("--name").arg(name);
     }
+    if cli.logs { command.arg("--logs"); }
     if let Some(connect) = &cli.connect {
         command.env("PORTAL_CONNECT_LINK", connect);
     }

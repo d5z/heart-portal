@@ -86,8 +86,14 @@ fn spawn_worker(worker: &Path, root: &Path, recover: bool) -> Result<DetachedWor
     }
 }
 
+pub fn export_launcher(path: &Path) -> Result<()> {
+    std::fs::write(path, include_bytes!(concat!(env!("OUT_DIR"), "/portal-background-v1.exe")))?;
+    Ok(())
+}
+
 pub fn export_runtime(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
+    export_launcher(&path.join("portal-background-v1.exe"))?;
     for (name, source) in [
         ("portal-lifecycle.ps1", LIFECYCLE),
         (

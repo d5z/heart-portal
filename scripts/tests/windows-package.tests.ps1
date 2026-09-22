@@ -94,7 +94,7 @@ try {
     Assert $startStatus.autostart "logon recovery registered: $($startStatus.warning)"
     $taskName = Get-PortalSavedValue $testRoot '.portal-task-name'
     Assert-PortalTaskOwnership $testRoot $taskName
-    Assert ((Get-ScheduledTask -TaskName $taskName).Actions[0].Execute -like '*powershell.exe') 'no VBScript prerequisite'
+    Assert ((Get-ScheduledTask -TaskName $taskName).Actions[0].Execute -like '*portal-background-v1.exe') 'native console-free launcher, no VBScript prerequisite'
     if ($LocalOnly) {
         $socket = [Net.Sockets.TcpClient]::new()
         try { $socket.Connect('127.0.0.1', $LocalPort); Assert $socket.Connected 'no Being link is needed for the local MCP listener' }
@@ -104,7 +104,11 @@ try {
     $launchBefore = [IO.File]::ReadAllText((Join-Path $testRoot '.portal-launch.json'))
     Assert ((ConvertFrom-Json $launchBefore).working_directory -eq $runtimeRoot) 'guardian working directory does not depend on the download folder'
     $configBefore = [IO.File]::ReadAllText($effectiveConfig)
+    # Emulate the previous release's registration without launching a console.
+    $legacyAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -File ' + (ConvertTo-PortalArgument (Join-Path $testRoot 'scripts\portal-supervisor-bootstrap.ps1')) + ' -Root ' + (ConvertTo-PortalArgument $testRoot)) -WorkingDirectory $testRoot
+    Set-ScheduledTask -TaskName $taskName -Action $legacyAction | Out-Null
     $result = Run-Portal @() $tempBase
+    Assert ((Get-ScheduledTask -TaskName $taskName).Actions[0].Execute -like '*portal-background-v1.exe') 'repeat launch migrates legacy tasks without restarting the engine'
     Assert ($result.code -eq 0) "repeat launch succeeds: $($result.error)"
     Assert ((Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid -eq $initial.pid) 'repeat launch reuses the process'
     Assert ([IO.File]::ReadAllText((Join-Path $testRoot '.portal-launch.json')) -eq $launchBefore) 'another cwd cannot change saved launch settings'
