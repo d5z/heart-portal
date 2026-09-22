@@ -721,6 +721,10 @@ fn default_env_passthrough() -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn test_config_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("heart-portal-{tag}-{}.toml", uuid::Uuid::new_v4()))
+    }
+
     #[test]
     fn test_parse_bind_host_port() {
         let (h, p) = parse_bind("0.0.0.0:9100").unwrap();
@@ -789,8 +793,9 @@ web_fetch = false
 
     #[test]
     fn subagent_defaults_when_the_section_is_absent() {
-        std::fs::write("/tmp/test-portal-nosub.toml", "name = \"vale\"\n").unwrap();
-        let config = PortalConfig::load("/tmp/test-portal-nosub.toml").unwrap();
+        let path = test_config_path("nosub");
+        std::fs::write(&path, "name = \"vale\"\n").unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
         let s = &config.subagent;
         assert!(s.enabled, "the sub-agent is on by default; availability gates the tools");
         assert!(!s.eager, "but the daemon starts lazily");
@@ -805,6 +810,7 @@ web_fetch = false
         assert!(s.auto_install, "a missing pi is provisioned unless opted out");
         assert!(s.env_passthrough.contains(&"PATH".to_string()));
         assert!(s.env_passthrough.contains(&"ANTHROPIC_API_KEY".to_string()));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -835,8 +841,9 @@ model = "claude-sonnet-4-5"
 thinking = "medium"
 api_key = "sk-or-v1-secret"
 "#;
-        std::fs::write("/tmp/test-portal-sub.toml", toml).unwrap();
-        let config = PortalConfig::load("/tmp/test-portal-sub.toml").unwrap();
+        let path = test_config_path("sub");
+        std::fs::write(&path, toml).unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
         let s = &config.subagent;
         assert_eq!(
             s.command.as_deref(),
@@ -857,6 +864,7 @@ api_key = "sk-or-v1-secret"
         assert_eq!(s.model.api_key.as_deref(), Some("sk-or-v1-secret"));
         assert_eq!(s.skills, vec!["/skills/review".to_string()]);
         assert_eq!(s.append_system_prompt.as_deref(), Some("Prefer small diffs."));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -870,9 +878,11 @@ api_key = "sk-or-v1-secret"
     #[test]
     fn subagent_can_be_disabled() {
         let toml = "name = \"vale\"\n\n[subagent]\nenabled = false\n";
-        std::fs::write("/tmp/test-portal-suboff.toml", toml).unwrap();
-        let config = PortalConfig::load("/tmp/test-portal-suboff.toml").unwrap();
+        let path = test_config_path("suboff");
+        std::fs::write(&path, toml).unwrap();
+        let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
         assert!(!config.subagent.enabled);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -429,13 +429,24 @@ mod tests {
         dir
     }
 
+    fn test_shell_command() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["/bin/sh".to_string()]
+        }
+    }
+
     fn base_config(workspace: &PathBuf) -> PortalConfig {
         let mut config = PortalConfig::default();
         config.security.workspace_root = workspace.clone();
         config.subagent.state_dir = Some(workspace.join("state").display().to_string());
         // A real binary that is not pi: enough to exercise validation paths
         // without spawning a daemon.
-        config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        config.subagent.command = Some(test_shell_command());
         // Independent of whatever `*_API_KEY` this machine exports.
         config.subagent.env_passthrough = vec!["PATH".to_string(), "HOME".to_string()];
         config
@@ -587,7 +598,7 @@ mod tests {
         let resp = handle(
             &m,
             "portal_subagent_spawn",
-            json!({"brief": "do it", "workdir": "/etc"}),
+            json!({"brief": "do it", "workdir": std::env::temp_dir().display().to_string()}),
         )
         .await
         .unwrap();
@@ -696,7 +707,7 @@ mod tests {
         let resp = handle(
             &m,
             "portal_subagent_spawn",
-            json!({"brief": "do it", "workdir": "/etc"}),
+            json!({"brief": "do it", "workdir": std::env::temp_dir().display().to_string()}),
         )
         .await
         .unwrap();

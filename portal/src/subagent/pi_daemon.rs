@@ -1310,6 +1310,17 @@ mod tests {
         })
     }
 
+    fn test_shell() -> String {
+        #[cfg(windows)]
+        {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+        }
+        #[cfg(not(windows))]
+        {
+            "/bin/sh".to_string()
+        }
+    }
+
     #[test]
     fn paths_follow_the_documented_layout() {
         let d = daemon_for(PathBuf::from("/state/subagent"));
@@ -1338,12 +1349,13 @@ mod tests {
 
     #[test]
     fn resolve_command_honors_an_explicit_absolute_path() {
+        let shell = test_shell();
         let resolved = PiDaemon::resolve_command(Some(&[
-            "/bin/sh".to_string(),
+            shell.clone(),
             "--flag".to_string(),
         ]))
         .unwrap();
-        assert_eq!(resolved, vec!["/bin/sh".to_string(), "--flag".to_string()]);
+        assert_eq!(resolved, vec![shell, "--flag".to_string()]);
     }
 
     #[test]
@@ -1356,8 +1368,16 @@ mod tests {
 
     #[test]
     fn resolve_command_searches_path_for_a_bare_name() {
-        let resolved = PiDaemon::resolve_command(Some(&["sh".to_string()])).unwrap();
-        assert!(resolved[0].ends_with("/sh"), "{resolved:?}");
+        let bare = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        let resolved = PiDaemon::resolve_command(Some(&[bare.to_string()])).unwrap();
+        assert_eq!(
+            std::path::Path::new(&resolved[0])
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_ascii_lowercase()),
+            Some(bare.to_ascii_lowercase()),
+            "{resolved:?}"
+        );
     }
 
     #[test]
@@ -1407,12 +1427,22 @@ mod tests {
         assert!(json.get("token").is_none(), "health must never carry secrets");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_failure_reports_the_log_tail_and_leaves_no_child() {
         let root = temp_dir("failstart");
+        let shell = test_shell();
+        let script = if cfg!(windows) {
+            "echo pi: no provider configured 1>&2 & exit /B 3"
+        } else {
+            "echo 'pi: no provider configured' >&2; exit 3"
+        };
         let d = PiDaemon::new(PiDaemonConfig {
-            command: vec!["/bin/sh".to_string(), "-c".to_string(),
-                          "echo 'pi: no provider configured' >&2; exit 3".to_string()],
+            command: if cfg!(windows) {
+                vec![shell, "/C".to_string(), script.to_string()]
+            } else {
+                vec![shell, "-c".to_string(), script.to_string()]
+            },
             state_dir: root.join("subagent"),
             workspace_root: PathBuf::from("/tmp"),
             env_passthrough: vec!["PATH".to_string()],
