@@ -1,6 +1,6 @@
 [package]
 name = "heart-portal"
-version = "0.8.3"
+version = "0.9.2"
 edition = "2021"
 description = "Portal — Being's gateway to the world. Lightweight MCP server with built-in tools."
 
@@ -16,6 +16,8 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
+# Format- and comment-preserving edits of portal.toml (portal_subagent_setup).
+toml_edit = "0.22"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json", "gzip"] }

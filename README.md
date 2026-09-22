@@ -324,6 +324,16 @@ mode. When Git for Windows is installed, Portal adds its Unix tools as a PATH
 fallback without changing the configured shell or overriding existing commands.
 See the [tool reference](starter-kit/guides/portal-ref.md) for shell quoting,
 file `unescape` behavior, and environment/authentication troubleshooting.
+
+On Windows, sub-agent processes retain `SystemRoot`, `SystemDrive`,
+`ProgramFiles`, `ProgramFiles(x86)`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`,
+`TEMP`, `TMP`, and `COMSPEC` in addition to `[subagent].env_passthrough`.
+This also applies to existing configurations with an explicit passthrough list.
+These values come from the current machine so Node can resolve DNS and pi can
+find an existing Git Bash installation. Git Bash must still be installed;
+for a custom shell location, configure pi's `shellPath` in its `settings.json`,
+or make bash discoverable on the forwarded `PATH`.
+
 For Chinese text in Windows PowerShell, use
 `{"shell":"powershell","command":"Get-Content -LiteralPath '中文.txt'"}`;
 this selects UTF-8 output/text defaults and transports the script without code-page

@@ -15,6 +15,9 @@ pub struct JsonRpcRequest {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    /// Some Heart transports attach scene metadata to the request envelope.
+    #[serde(default, alias = "_meta", skip_serializing_if = "serde_json::Value::is_null")]
+    pub meta: serde_json::Value,
 }
 
 impl JsonRpcRequest {
@@ -24,6 +27,7 @@ impl JsonRpcRequest {
             id: Some(ids.fetch_add(1, Ordering::SeqCst)),
             method: method.into(),
             params,
+            meta: serde_json::Value::Null,
         }
     }
 
@@ -33,6 +37,7 @@ impl JsonRpcRequest {
             id: None,
             method: method.into(),
             params,
+            meta: serde_json::Value::Null,
         }
     }
 }

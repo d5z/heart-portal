@@ -2,17 +2,20 @@
 
 use crate::config::PortalConfig;
 use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
+use crate::heart_callback::{
+    build_callback_payload, CallbackTask, HeartCallback, CALLBACK_OUTPUT_MAX_BYTES,
+};
 use crate::tools::text::{OutputDecoder, OutputEncoding};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 const DEFAULT_MAX_SESSIONS: usize = 10;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -25,41 +28,14 @@ pub const MAX_STDIN_WRITE_BYTES: usize = 256 * 1024;
 /// Session ids are `sess_` + UUID; reject oversized / odd keys.
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 
-/// Tail of the output ring buffer attached to a callback payload.
-/// 200KB leaves ~56KB of headroom for the other payload fields (cap 256KB).
-const CALLBACK_OUTPUT_MAX_BYTES: usize = 200 * 1024;
-/// Smaller tail used when the JSON-escaped payload still exceeds the cap.
-const CALLBACK_OUTPUT_FALLBACK_BYTES: usize = 128 * 1024;
-/// Hard cap on the serialized callback payload.
-const CALLBACK_PAYLOAD_MAX_BYTES: usize = 256 * 1024;
-/// The command is being-supplied and otherwise unbounded; keep it from eating
-/// the payload budget that the output tail is sized against.
-const CALLBACK_COMMAND_MAX_BYTES: usize = 4096;
-/// 1 initial attempt + 2 retries.
-const CALLBACK_ATTEMPTS: usize = 3;
-/// Backoff before retry N (index 0 = before the 2nd attempt).
-const CALLBACK_BACKOFF: [Duration; CALLBACK_ATTEMPTS - 1] =
-    [Duration::from_secs(2), Duration::from_secs(4)];
 /// Bound the wait when descendants retain the exited process's pipe handles.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const CALLBACK_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const CALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Where finished background sessions are reported (Heart's `POST /api/callback`).
-/// Present only in `--connect` mode; `None` means standalone (no callback).
-#[derive(Clone)]
-pub struct CallbackConfig {
-    pub url: String,
-    pub token: String,
-    pub portal_name: String,
-    pub client: reqwest::Client,
-}
 
 pub struct ProcessManager {
     sessions: Arc<AsyncMutex<HashMap<String, ManagedProcess>>>,
     max_sessions: usize,
     max_output_bytes: usize,
-    callback_config: Arc<Mutex<Option<CallbackConfig>>>,
+    callback: HeartCallback,
 }
 
 pub struct ManagedProcess {
@@ -144,6 +120,16 @@ impl OutputBuffer {
             truncated,
             self.total_written,
         ))
+    }
+
+    /// Last `max` retained bytes plus the monotonic total — the shape both
+    /// callback builders want (`crate::heart_callback`).
+    pub fn snapshot_tail(&self, max: usize) -> (Vec<u8>, u64) {
+        let mut from = self.data.len().saturating_sub(max);
+        while !self.is_char_boundary(from) {
+            from += 1;
+        }
+        (self.data[from..].to_vec(), self.total_written)
     }
 
     pub fn bytes_range(&self, offset: u64, limit: usize) -> Result<(Vec<u8>, u64)> {
@@ -251,196 +237,55 @@ async fn read_into_buffer<R: tokio::io::AsyncRead + Unpin>(
     notify.notify_waiters();
 }
 
-/// A finished background session, as reported to Heart.
-#[derive(Clone, Debug)]
-struct CallbackTask {
-    session_id: String,
-    command: String,
-    workdir: String,
-    exit_code: i32,
-    elapsed_secs: u64,
-    output_encoding: OutputEncoding,
-}
+/// Exit code reported to Heart for a session deliberately killed via kill/kill_all.
+///
+/// POSIX convention: death by signal N is reported as 128+N (SIGKILL=9 -> 137);
+/// Heart recognizes this range as a deliberate kill rather than an ordinary exit.
+/// On Unix, signal deaths surface naturally via `ExitStatus::signal()`. On
+/// Windows there is no signal channel -- `taskkill /F` terminates the process
+/// with a plain exit code (1), indistinguishable from a natural exit -- so a
+/// deliberate kill is rewritten to 128+9 using the killed flag, which kill()
+/// sets before sending any signal.
+const SIGKILL_EXIT_CODE: i32 = 128 + 9;
 
-/// Last `max` bytes of `data` (tail — the interesting end of a build/test log).
-fn tail(data: &[u8], max: usize) -> &[u8] {
-    let mut start = data.len().saturating_sub(max);
-    while start < data.len() && data[start] & 0xc0 == 0x80 {
-        start += 1;
-    }
-    &data[start..]
-}
-
-/// Head of `s` capped at `max` bytes, never splitting a UTF-8 char.
-fn clamp_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[truncated]", &s[..end])
-}
-
-fn payload_with_tail(
-    task: &CallbackTask,
-    portal_name: &str,
-    data: &[u8],
-    total_output_bytes: u64,
-    max_output: usize,
-) -> serde_json::Value {
-    let slice = tail(data, max_output);
-    let truncated = (slice.len() as u64) < total_output_bytes;
-    let command = clamp_str(&task.command, CALLBACK_COMMAND_MAX_BYTES);
-    serde_json::json!({
-        "source": "portal",
-        "task_id": task.session_id,
-        "summary": format!(
-            "portal_exec completed: '{}' (exit {})",
-            command, task.exit_code
-        ),
-        "result": {
-            "session_id": task.session_id,
-            "exit_code": task.exit_code,
-            "output": String::from_utf8_lossy(slice),
-            "output_encoding": task.output_encoding.as_str(),
-            "command": command,
-            "workdir": task.workdir,
-            "elapsed_secs": task.elapsed_secs,
-            "portal_name": portal_name,
-            "truncated": truncated,
-            "total_output_bytes": total_output_bytes,
-        }
-    })
-}
-
-/// Build the `POST /api/callback` body. Output is the *tail* of the ring buffer;
-/// if JSON escaping still blows past the payload cap, fall back to a shorter tail.
-fn build_callback_payload(
-    task: &CallbackTask,
-    portal_name: &str,
-    data: &[u8],
-    total_output_bytes: u64,
-) -> serde_json::Value {
-    let payload = payload_with_tail(
-        task,
-        portal_name,
-        data,
-        total_output_bytes,
-        CALLBACK_OUTPUT_MAX_BYTES,
-    );
-    let size = serde_json::to_vec(&payload)
-        .map(|b| b.len())
-        .unwrap_or(usize::MAX);
-    if size <= CALLBACK_PAYLOAD_MAX_BYTES {
-        return payload;
-    }
-    payload_with_tail(
-        task,
-        portal_name,
-        data,
-        total_output_bytes,
-        CALLBACK_OUTPUT_FALLBACK_BYTES,
-    )
-}
-
-/// Retry 5xx (Heart restarting / proxy hiccup); never retry 4xx (401, 413, …).
-fn should_retry_status(status: u16) -> bool {
-    status >= 500
-}
-
-/// Retry transport failures that a later attempt may survive.
-fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout()
-}
-
-/// Strip the query string so a token can never reach the logs.
-fn redact_url(url: &str) -> String {
-    match url.split_once('?') {
-        Some((base, _)) => format!("{base}?<redacted>"),
-        None => url.to_string(),
-    }
-}
-
-/// POST the payload with `Authorization: Bearer`, retrying per PRD §3.
-/// Never returns an error: a lost callback is a WARN, not a Portal failure
-/// (the being can still `portal_process poll`).
-async fn deliver_callback(cfg: CallbackConfig, session_id: String, payload: serde_json::Value) {
-    let mut last_err = String::from("no attempt made");
-    for attempt in 0..CALLBACK_ATTEMPTS {
-        if attempt > 0 {
-            time::sleep(CALLBACK_BACKOFF[attempt - 1]).await;
-        }
-        // Heart checks `?token=` query param, not Authorization header.
-        let url_with_token = format!("{}?token={}", cfg.url, cfg.token);
-        match cfg
-            .client
-            .post(&url_with_token)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    debug!("callback delivered for session {session_id} ({status})");
-                    return;
-                }
-                last_err = format!("HTTP {status}");
-                if !should_retry_status(status.as_u16()) {
-                    break;
-                }
+fn session_exit_code(status: Option<&std::process::ExitStatus>, killed: bool) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(s) = status {
+            if let Some(sig) = s.signal() {
+                return 128 + sig;
             }
-            Err(e) => {
-                let retry = should_retry_error(&e);
-                last_err = e.without_url().to_string();
-                if !retry {
-                    break;
-                }
+            if let Some(c) = s.code() {
+                // Exited on its own after our signal (e.g. it handles SIGTERM
+                // and exits cleanly): still report a deliberate kill.
+                return if killed { SIGKILL_EXIT_CODE } else { c };
             }
         }
+        if killed { SIGKILL_EXIT_CODE } else { -1 }
     }
-    warn!(
-        "callback delivery failed for session {} to {}: {}",
-        session_id,
-        redact_url(&cfg.url),
-        last_err
-    );
+    #[cfg(not(unix))]
+    {
+        if killed {
+            return SIGKILL_EXIT_CODE;
+        }
+        status.and_then(|s| s.code()).unwrap_or_else(|| {
+            tracing::debug!("Process terminated by signal, no exit code available");
+            -1
+        })
+    }
 }
 
 impl ProcessManager {
-    pub fn new() -> Self {
+    /// `callback` is the Portal-wide [`HeartCallback`] handle, shared with
+    /// `SubagentManager` so both deliver through one configured client.
+    pub fn new(callback: HeartCallback) -> Self {
         Self {
             sessions: Arc::new(AsyncMutex::new(HashMap::new())),
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
-            callback_config: Arc::new(Mutex::new(None)),
+            callback,
         }
-    }
-
-    /// Enable async callbacks: finished background sessions POST their result to
-    /// `url` with `Authorization: Bearer <token>`. Called from `--connect` mode
-    /// before the relay handshake. Without it, sessions exit silently.
-    pub fn set_callback_config(&self, url: String, token: String, portal_name: String) {
-        let client = match reqwest::Client::builder()
-            .timeout(CALLBACK_HTTP_TIMEOUT)
-            .connect_timeout(CALLBACK_CONNECT_TIMEOUT)
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("failed to build callback HTTP client: {e}; async callbacks disabled");
-                return;
-            }
-        };
-        info!("async callback enabled → {}", redact_url(&url));
-        *self.callback_config.lock().unwrap() = Some(CallbackConfig {
-            url,
-            token,
-            portal_name,
-            client,
-        });
     }
 
     #[cfg(test)]
@@ -559,17 +404,13 @@ impl ProcessManager {
         let cmd_wait = command.to_string();
         let workdir_wait = workdir.to_string();
         let output_wait = Arc::clone(&output);
-        let callback_config = Arc::clone(&self.callback_config);
+        let callback = self.callback.clone();
         let killed_wait = Arc::clone(&killed);
         let callback_output_encoding = output_encoding;
         tokio::spawn(async move {
-            let code = match child.wait().await {
-                Ok(s) => s.code().unwrap_or_else(|| {
-                    tracing::debug!("Process terminated by signal, no exit code available");
-                    -1
-                }),
-                Err(_) => -1,
-            };
+            let wait_status = child.wait().await.ok();
+            let killed = killed_wait.load(Ordering::SeqCst);
+            let code = session_exit_code(wait_status.as_ref(), killed);
             let now = tokio::time::Instant::now();
             {
                 let mut g = sessions_wait.lock().await;
@@ -602,7 +443,7 @@ impl ProcessManager {
                 debug!("session {sid_wait} was killed; skipping callback");
                 return;
             }
-            let Some(cfg) = callback_config.lock().unwrap().clone() else {
+            let Some(portal_name) = callback.portal_name() else {
                 return;
             };
 
@@ -616,12 +457,13 @@ impl ProcessManager {
             };
             // Detached: the exit watcher must never wait on the network.
             tokio::spawn(async move {
+                // Only the tail can reach the payload; don't clone the ring.
                 let (data, total) = {
                     let buf = output_wait.lock().await;
-                    (buf.data.clone(), buf.total_written())
+                    buf.snapshot_tail(CALLBACK_OUTPUT_MAX_BYTES)
                 };
-                let payload = build_callback_payload(&task, &cfg.portal_name, &data, total);
-                deliver_callback(cfg, task.session_id, payload).await;
+                let payload = build_callback_payload(&task, &portal_name, &data, total);
+                callback.deliver_detached(task.session_id, payload);
             });
         });
 
@@ -936,6 +778,18 @@ impl ProcessManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heart_callback::{payload_with_tail, tail};
+
+    #[test]
+    fn snapshot_tail_returns_last_bytes_and_total() {
+        let mut b = OutputBuffer::new(10);
+        b.append("0123456789ABCDE");
+        let (tail, total) = b.snapshot_tail(4);
+        assert_eq!(tail, b"BCDE");
+        assert_eq!(total, 15);
+        let (all, _) = b.snapshot_tail(1000);
+        assert_eq!(all, b"56789ABCDE");
+    }
 
     #[test]
     fn output_buffer_ring_and_offsets() {
@@ -976,8 +830,14 @@ mod tests {
             assert_eq!(next, text.len() as u64);
             assert!(text.ends_with(std::str::from_utf8(tail(text.as_bytes(), max)).unwrap()));
         }
-        let mut task = sample_task();
-        task.output_encoding = OutputEncoding::Oem;
+        let task = CallbackTask {
+            session_id: "sess_abc".to_string(),
+            command: "make test".to_string(),
+            workdir: "/home/alice/project".to_string(),
+            exit_code: 0,
+            elapsed_secs: 42,
+            output_encoding: OutputEncoding::Oem,
+        };
         let payload = payload_with_tail(&task, "p", text.as_bytes(), text.len() as u64, 8);
         assert_eq!(
             payload["result"]["output"], "🙂éz",
@@ -1063,105 +923,6 @@ mod tests {
         assert!(validate_session_id(&format!("sess_{}", "x".repeat(200))).is_err());
     }
 
-    fn sample_task() -> CallbackTask {
-        CallbackTask {
-            session_id: "sess_abc".to_string(),
-            command: "make test".to_string(),
-            workdir: "/home/alice/project".to_string(),
-            exit_code: 0,
-            elapsed_secs: 42,
-            output_encoding: OutputEncoding::Utf8,
-        }
-    }
-
-    #[test]
-    fn callback_payload_has_prd_shape() {
-        let task = sample_task();
-        let v = build_callback_payload(&task, "alice-laptop", b"hello", 5);
-
-        assert_eq!(v["source"], "portal");
-        assert_eq!(v["task_id"], "sess_abc");
-        assert_eq!(v["summary"], "portal_exec completed: 'make test' (exit 0)");
-        assert_eq!(v["result"]["session_id"], "sess_abc");
-        assert_eq!(v["result"]["exit_code"], 0);
-        assert_eq!(v["result"]["output"], "hello");
-        assert_eq!(v["result"]["output_encoding"], "utf8");
-        assert_eq!(v["result"]["command"], "make test");
-        assert_eq!(v["result"]["workdir"], "/home/alice/project");
-        assert_eq!(v["result"]["elapsed_secs"], 42);
-        assert_eq!(v["result"]["portal_name"], "alice-laptop");
-        assert_eq!(v["result"]["truncated"], false);
-        assert_eq!(v["result"]["total_output_bytes"], 5);
-    }
-
-    #[test]
-    fn callback_payload_takes_tail_and_marks_truncated() {
-        let task = sample_task();
-        let mut data = vec![b'a'; CALLBACK_OUTPUT_MAX_BYTES];
-        data.extend_from_slice(b"THE_END");
-        let total = data.len() as u64;
-
-        let v = build_callback_payload(&task, "p", &data, total);
-        let out = v["result"]["output"].as_str().unwrap();
-
-        assert_eq!(out.len(), CALLBACK_OUTPUT_MAX_BYTES);
-        assert!(out.ends_with("THE_END"), "tail must be kept, not the head");
-        assert_eq!(v["result"]["truncated"], true);
-        assert_eq!(v["result"]["total_output_bytes"], total);
-    }
-
-    #[test]
-    fn callback_payload_truncated_when_ring_dropped_bytes() {
-        let task = sample_task();
-        // Ring buffer holds 5 bytes but 1000 were written overall.
-        let v = build_callback_payload(&task, "p", b"tail!", 1000);
-        assert_eq!(v["result"]["truncated"], true);
-        assert_eq!(v["result"]["total_output_bytes"], 1000);
-    }
-
-    #[test]
-    fn callback_payload_falls_back_when_escaping_blows_the_cap() {
-        let task = sample_task();
-        // Every byte escapes to 6 chars (\u00XX) — 200KB tail would be ~1.2MB.
-        let data = vec![0x01u8; CALLBACK_OUTPUT_MAX_BYTES + 10];
-        let v = build_callback_payload(&task, "p", &data, data.len() as u64);
-        let out = v["result"]["output"].as_str().unwrap();
-        assert_eq!(out.len(), CALLBACK_OUTPUT_FALLBACK_BYTES);
-    }
-
-    #[test]
-    fn callback_payload_clamps_a_huge_command() {
-        let mut task = sample_task();
-        task.command = "é".repeat(10_000); // multi-byte: must not split a char
-        let v = build_callback_payload(&task, "p", b"", 0);
-        let cmd = v["result"]["command"].as_str().unwrap();
-        assert!(cmd.len() < CALLBACK_COMMAND_MAX_BYTES + 32);
-        assert!(cmd.ends_with("…[truncated]"));
-        assert!(serde_json::to_vec(&v).unwrap().len() <= CALLBACK_PAYLOAD_MAX_BYTES);
-    }
-
-    #[test]
-    fn retry_only_on_5xx() {
-        assert!(should_retry_status(500));
-        assert!(should_retry_status(503));
-        assert!(!should_retry_status(200));
-        assert!(!should_retry_status(401));
-        assert!(!should_retry_status(413));
-        assert!(!should_retry_status(404));
-    }
-
-    #[test]
-    fn redact_url_strips_query() {
-        assert_eq!(
-            redact_url("https://echo.beings.town/alice/api/callback?token=secret"),
-            "https://echo.beings.town/alice/api/callback?<redacted>"
-        );
-        assert_eq!(
-            redact_url("https://echo.beings.town/alice/api/callback"),
-            "https://echo.beings.town/alice/api/callback"
-        );
-    }
-
     // --- end-to-end delivery against a local HTTP server ---
 
     struct TestServer {
@@ -1169,9 +930,10 @@ mod tests {
         hits: Arc<std::sync::Mutex<Vec<(serde_json::Value, Option<String>)>>>,
     }
 
-    /// Spawn a one-route axum server that records callback bodies + auth headers.
+    /// Spawn a one-route axum server that records callback bodies + the raw
+    /// query string (Heart authenticates on `?token=`, not on a header).
     async fn start_test_server(status: axum::http::StatusCode) -> TestServer {
-        use axum::extract::State;
+        use axum::extract::{RawQuery, State};
         use axum::routing::post;
 
         type Hits = Arc<std::sync::Mutex<Vec<(serde_json::Value, Option<String>)>>>;
@@ -1182,14 +944,10 @@ mod tests {
                 "/api/callback",
                 post(
                     |State((hits, status)): State<(Hits, axum::http::StatusCode)>,
-                     headers: axum::http::HeaderMap,
+                     RawQuery(query): RawQuery,
                      body: String| async move {
-                        let auth = headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.to_string());
                         let v = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-                        hits.lock().unwrap().push((v, auth));
+                        hits.lock().unwrap().push((v, query));
                         status
                     },
                 ),
@@ -1225,8 +983,9 @@ mod tests {
         use crate::config::PortalConfig;
 
         let server = start_test_server(axum::http::StatusCode::OK).await;
-        let pm = ProcessManager::new();
-        pm.set_callback_config(
+        let cb = HeartCallback::new();
+        let pm = ProcessManager::new(cb.clone());
+        cb.set(
             server.url.clone(),
             "tok_secret".to_string(),
             "alice-laptop".to_string(),
@@ -1239,9 +998,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(10)).await, 1);
-        let (body, auth) = server.hits.lock().unwrap()[0].clone();
+        let (body, query) = server.hits.lock().unwrap()[0].clone();
 
-        assert_eq!(auth, None); // Heart callback auth is sent in the URL query.
+        assert_eq!(query.as_deref(), Some("token=tok_secret"));
         assert_eq!(body["source"], "portal");
         assert_eq!(body["task_id"], info.session_id);
         assert_eq!(body["result"]["exit_code"], 0);
@@ -1261,8 +1020,8 @@ mod tests {
         use crate::config::PortalConfig;
 
         let server = start_test_server(axum::http::StatusCode::OK).await;
-        let pm = ProcessManager::new();
-        // Deliberately no set_callback_config — standalone mode.
+        // Deliberately unconfigured HeartCallback — standalone mode.
+        let pm = ProcessManager::new(HeartCallback::new());
 
         let config = PortalConfig::default();
         pm.spawn(&config, "echo standalone", ".", &[]).await.unwrap();
@@ -1275,8 +1034,9 @@ mod tests {
         use crate::config::PortalConfig;
 
         let server = start_test_server(axum::http::StatusCode::OK).await;
-        let pm = ProcessManager::new();
-        pm.set_callback_config(server.url.clone(), "tok".to_string(), "p".to_string());
+        let cb = HeartCallback::new();
+        let pm = ProcessManager::new(cb.clone());
+        cb.set(server.url.clone(), "tok".to_string(), "p".to_string());
 
         let config = PortalConfig::default();
         let info = pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
@@ -1290,8 +1050,9 @@ mod tests {
         use crate::config::PortalConfig;
 
         let server = start_test_server(axum::http::StatusCode::OK).await;
-        let pm = ProcessManager::new();
-        pm.set_callback_config(server.url.clone(), "tok".to_string(), "p".to_string());
+        let cb = HeartCallback::new();
+        let pm = ProcessManager::new(cb.clone());
+        cb.set(server.url.clone(), "tok".to_string(), "p".to_string());
 
         let config = PortalConfig::default();
         pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
@@ -1305,8 +1066,9 @@ mod tests {
         use crate::config::PortalConfig;
 
         let server = start_test_server(axum::http::StatusCode::UNAUTHORIZED).await;
-        let pm = ProcessManager::new();
-        pm.set_callback_config(server.url.clone(), "bad".to_string(), "p".to_string());
+        let cb = HeartCallback::new();
+        let pm = ProcessManager::new(cb.clone());
+        cb.set(server.url.clone(), "bad".to_string(), "p".to_string());
 
         let config = PortalConfig::default();
         pm.spawn(&config, "echo nope", ".", &[]).await.unwrap();

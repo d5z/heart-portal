@@ -331,16 +331,12 @@ pub async fn run_upgrade() -> Result<()> {
             eprintln!("  Backup: {}", backup_path.display());
         }
 
-        std::fs::rename(&temp_path, &target).or_else(|rename_err| {
-            std::fs::copy(&temp_path, &target)
-                .with_context(|| format!("Copying upgrade into {}", target.display()))?;
-            std::fs::remove_file(&temp_path).ok();
-            if rename_err.kind() == std::io::ErrorKind::CrossesDevices {
-                Ok(())
-            } else {
-                Err(rename_err).with_context(|| format!("Replacing {}", target.display()))
-            }
-        })?;
+        // The temporary file lives beside the target, so rename is atomic and
+        // preserves a fresh inode. Never fall back to copying over `target`:
+        // on macOS that can leave the kernel's code-signing page cache keyed
+        // to the old inode while its contents have changed.
+        std::fs::rename(&temp_path, &target)
+            .with_context(|| format!("Atomically replacing {}", target.display()))?;
 
         eprintln!("Done — upgraded to {}", latest_version);
         restart_portal(&install_dir)
