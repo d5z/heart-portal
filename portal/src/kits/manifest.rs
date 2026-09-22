@@ -10,6 +10,7 @@ pub struct KitManifest {
     pub author: Option<String>,
     pub platform: Option<Vec<String>>,
     pub runtime: Option<String>,
+    #[serde(deserialize_with = "deserialize_command")]
     pub command: Vec<String>,
     pub tools: Vec<KitToolDef>,
     pub permissions: Option<Vec<String>>,
@@ -18,6 +19,33 @@ pub struct KitManifest {
     pub eager: Option<bool>,
     /// Grove setup metadata. Credentials are supplied locally, never by Grove.
     pub provision: Option<KitProvision>,
+}
+
+/// Accept the original command array and the platform-specific form
+/// `{ "windows": [...], "posix": [...] }`.
+fn deserialize_command<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Command {
+        Legacy(Vec<String>),
+        Platforms {
+            windows: Option<Vec<String>>,
+            posix: Option<Vec<String>>,
+        },
+    }
+
+    Ok(match Command::deserialize(deserializer)? {
+        Command::Legacy(values) => values,
+        Command::Platforms { windows, posix } => {
+            #[cfg(target_os = "windows")]
+            { windows.or(posix).unwrap_or_default() }
+            #[cfg(not(target_os = "windows"))]
+            { posix.or(windows).unwrap_or_default() }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -232,5 +260,20 @@ mod tests {
         assert!(manifest.platform.is_none());
         assert!(manifest.eager.is_none());
         assert_eq!(manifest.tools.len(), 1);
+    }
+
+    #[test]
+    fn selects_platform_command_variant() {
+        let manifest: KitManifest = serde_json::from_value(serde_json::json!({
+            "name": "platform-kit",
+            "version": "1",
+            "command": { "windows": ["powershell.exe"], "posix": ["sh"] },
+            "tools": []
+        }))
+        .unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(manifest.command, ["powershell.exe"]);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(manifest.command, ["sh"]);
     }
 }

@@ -50,6 +50,25 @@ impl Drop for TestKits {
     }
 }
 
+#[test]
+fn scanner_accepts_utf8_bom_and_ignores_retired_backup_directory() {
+    let root = TestKits::new();
+    let active = root.install("active", "PORTAL_TEST_KIT_TOKEN=test");
+    let manifest = std::fs::read(active.join("manifest.json")).unwrap();
+    let mut bom_manifest = vec![0xEF, 0xBB, 0xBF];
+    bom_manifest.extend(manifest);
+    std::fs::write(active.join("manifest.json"), bom_manifest).unwrap();
+
+    let retired = root.0.join("kit-retired");
+    std::fs::create_dir_all(&retired).unwrap();
+    std::fs::write(retired.join("manifest.json"), b"{").unwrap();
+
+    let scan = root.scan();
+    assert_eq!(scan.kits.len(), 1);
+    assert_eq!(scan.kits[0].manifest.name, "active");
+    assert!(scan.invalid_dirs.is_empty());
+}
+
 fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut Value)) {
     let path = dir.join("manifest.json");
     let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

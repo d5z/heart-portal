@@ -71,6 +71,10 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
     let mut manifests = 0;
     for entry in entries {
         let kit_dir = entry.path();
+        if is_ignored_kit_dir(&kit_dir) {
+            debug!("Skipping ignored kit backup directory {}", kit_dir.display());
+            continue;
+        }
         match std::fs::metadata(&kit_dir) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => continue,
@@ -112,6 +116,7 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
     // Keeping both directories invalid preserves the previously loaded owner.
     let mut owners = std::collections::HashMap::new();
     let mut conflicts = std::collections::HashSet::new();
+    let mut conflict_pairs = std::collections::HashSet::new();
     for (index, kit) in kits.iter().enumerate() {
         let routes = std::iter::once(format!("kit:{}", kit.manifest.name)).chain(
             kit.manifest
@@ -120,15 +125,23 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
                 .map(|tool| format!("tool:{}", tool_route(&kit.manifest.name, &tool.name))),
         );
         for route in routes {
-            if let Some(previous) = owners.insert(route, index) {
+            if let Some(previous) = owners.insert(route.clone(), index) {
                 conflicts.insert(previous);
                 conflicts.insert(index);
+                let pair = if previous < index { (previous, index) } else { (index, previous) };
+                if conflict_pairs.insert(pair) {
+                    warn!(
+                        "Kit conflict for route '{}': '{}' and '{}'; both directories excluded",
+                        route,
+                        kits[previous].kit_dir.display(),
+                        kit.kit_dir.display()
+                    );
+                }
             }
         }
     }
     let kits = kits.into_iter().enumerate().filter_map(|(index, kit)| {
         if conflicts.contains(&index) {
-            warn!("Kit '{}' conflicts with another kit name or tool route; keeping previous inventory entry", kit.manifest.name);
             invalid_dirs.push(kit.kit_dir);
             None
         } else { Some(kit) }
@@ -137,11 +150,30 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
     Ok(KitScan { kits, invalid_dirs })
 }
 
+fn is_ignored_kit_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name == "kit-retired"
+        || name.starts_with("kit-retired-")
+        || name.ends_with("-kit-retired")
+        || name.ends_with(".kit-retired")
+}
+
 fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKit>> {
     let content = crate::bounded_file::text(manifest_path, 256 * 1024)
         .with_context(|| format!("Reading kit manifest {}", manifest_path.display()))?;
-    let manifest: KitManifest = serde_json::from_str(&content)
-        .with_context(|| format!("Parsing kit manifest {}", manifest_path.display()))?;
+    let had_bom = content.starts_with('\u{feff}');
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let manifest: KitManifest = serde_json::from_str(content).with_context(|| {
+        let bom_note = if had_bom {
+            " manifest.json started with a UTF-8 BOM; check header bytes EF BB BF."
+        } else {
+            " manifest.json may contain a UTF-8 BOM; check header bytes EF BB BF."
+        };
+        format!("Parsing kit manifest {}.{}", manifest_path.display(), bom_note)
+    })?;
     anyhow::ensure!(is_valid_kit_name(&manifest.name), "Invalid kit name");
     anyhow::ensure!(
         manifest.name.len() <= 64 && manifest.tools.len() <= 128 && manifest.command.len() <= 64,
