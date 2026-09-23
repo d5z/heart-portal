@@ -324,7 +324,7 @@ impl ToolHost {
                         "output_encoding": {
                             "type": "string",
                             "enum": text::OutputEncoding::supported_values(),
-                            "description": "Source output decoding (default: auto). PowerShell and non-Windows default to UTF-8. Windows cmd auto tries UTF-8 then system OEM per line; non-ASCII lines may wait for newline/EOF (buffer capped at 64KiB). Use utf8 or oem for known encodings and immediate streaming; oem requires Windows. A mixed-encoding line is ambiguous. Responses are always UTF-8 text, including poll/log and callbacks."
+                            "description": "Source output decoding for the child pipe created by portal_exec (default: auto). PowerShell and non-Windows default to UTF-8. Windows cmd auto tries UTF-8 then system OEM per line; non-ASCII lines may wait for newline/EOF (buffer capped at 64KiB). Use utf8 or oem for known encodings and immediate streaming; oem requires Windows. A mixed-encoding line is ambiguous. Responses are always UTF-8 text, including poll/log and callbacks. Kits that create their own child processes must decode those pipes themselves and emit valid UTF-8 MCP JSON."
                         }
                     },
                     "required": ["command"]

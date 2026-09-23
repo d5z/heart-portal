@@ -92,6 +92,10 @@ async fn invalid_manifest_retains_running_owner_against_another_directory() {
         let report = manager.refresh_kits_target(root.scan(), true, target).await;
         assert!(!report.changed());
         assert_eq!(report.retained_invalid, ["sample"]);
+        assert_eq!(
+            manager.setup("sample").await.unwrap()["directory"],
+            json!(old)
+        );
         let current = manager
             .call_tool("sample", "ping", json!({}))
             .await

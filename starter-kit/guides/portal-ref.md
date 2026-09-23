@@ -3,7 +3,7 @@
 | Tool | Parameters | Returns | Example |
 |------|------------|---------|---------|
 | `portal_status` | (none) | Running version/build ID, effective configuration, live connection state and loaded kit summary; no credential values | `{}` |
-| `portal_exec` | `command`, optional `shell`, `workdir`, `timeout_secs`, `background` | Shell output or background session info | `{"command": "uname -a"}` |
+| `portal_exec` | `command`, optional `shell`, `workdir`, `timeout_secs`, `background`, `output_encoding` | Shell output or background session info | `{"command": "uname -a"}` |
 | `portal_process` | `action` (`list` \| `poll` \| `log` \| `write` \| `kill`), optional `session_id`, `timeout_ms`, `offset`, `limit`, `data` | Session/output bytes | `{"action": "list"}` |
 | `portal_file_read` | `path` | File text | `{"path": "notes.txt"}` |
 | `portal_file_write` | `path`, `content`, optional `append`, `encoding`, `unescape` | Ack text | `{"path": "out.txt", "content": "hi"}` |
@@ -77,8 +77,20 @@ console/pipe text encoding to UTF-8, and defaults `Get-Content`, `Set-Content`,
 precedence. This option does not change system settings or execution policy.
 Windows PowerShell may add a UTF-8 BOM when writing files; use `portal_file_write`
 for exact UTF-8 contents. Binary/non-UTF-8 programs still require their own encoding
-options. A nested `powershell -Command ...` inside the default cmd shell does not
-receive these PowerShell defaults.
+options. A nested `powershell -Command ...` inside the default cmd shell is rejected
+with `PowerShell commands require shell='powershell'; pass the script directly`.
+Use that shell value and send only the PowerShell script as `command`; Portal does
+not rewrite nested commands because their quoting and code-page behavior is ambiguous.
+
+Encoding is normalized at the boundary that owns each child pipe. Portal owns and
+decodes pipes created by `portal_exec`/`portal_process`. A kit that starts another
+process owns that internal pipe and must decode it before emitting valid UTF-8 MCP
+JSON; structured MCP errors should carry failures instead of undecodable stderr.
+
+`output_encoding` accepts `auto`, `utf8`, or Windows-only `oem`. PowerShell uses
+UTF-8. Windows cmd `auto` selects UTF-8 or the system OEM code page per line; use
+an explicit value for known encodings or output that must stream before a newline.
+Every Portal response is normalized UTF-8 text.
 
 When reading UTF-8 files directly in a separate PowerShell session, use
 `Get-Content -LiteralPath '中文.txt' -Encoding UTF8` or

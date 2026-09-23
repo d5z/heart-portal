@@ -228,7 +228,10 @@ scanner or explicitly reload the target after changing its files. `starting`
 means an MCP handshake is in progress; it does not block status or other kits.
 The `portal_` management namespace is reserved, including normalized aliases.
 Conflicting kit names or tool routes are rejected while the existing owner is
-retained; a second kit cannot silently take over a loaded route.
+retained. Ownership includes the installed directory and its loaded generation:
+an invalid manifest, duplicate name or target-excluded directory cannot transfer
+that ownership. Targeted reload checks conflicts before changing registry state,
+so ambiguity fails closed and a second kit cannot silently take over a loaded route.
 
 A shared relay/TCP connection handles up to 32 concurrent work requests and
 reserves eight additional management requests. Responses may arrive out of

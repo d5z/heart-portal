@@ -337,8 +337,10 @@ or make bash discoverable on the forwarded `PATH`.
 For Chinese text in Windows PowerShell, use
 `{"shell":"powershell","command":"Get-Content -LiteralPath '中文.txt'"}`;
 this selects UTF-8 output/text defaults and transports the script without code-page
-loss. `Path outside workspace` remains a boundary rejection, not a reason to
-create a different workspace or retry via shell commands.
+loss. A nested `powershell -Command ...` in the default cmd shell is rejected with
+`PowerShell commands require shell='powershell'; pass the script directly`; use
+that shell and pass only the script. `Path outside workspace` remains a boundary
+rejection, not a reason to create a different workspace or retry via shell commands.
 
 Command output supports `output_encoding: "auto" | "utf8" | "oem"` (`oem`
 is Windows-only). The default uses UTF-8 for PowerShell and macOS/Linux. For
@@ -348,6 +350,11 @@ may wait until EOF or a 64KiB buffer limit; at the limit, the decoder locks its
 choice until the next newline. Use an explicit encoding for interactive output
 or ambiguous legacy bytes; mixed encodings within one line cannot be reliably
 auto-detected. This decodes captured output, not arbitrary file contents or stdin.
+
+Encoding is normalized at the boundary that owns each child pipe. Portal owns and
+decodes pipes created by `portal_exec`/`portal_process`. A kit that starts another
+process owns that internal pipe and must decode it before emitting valid UTF-8 MCP
+JSON; structured MCP errors should carry failures instead of undecodable stderr.
 
 Background output is normalized once to UTF-8. `portal_process` offsets,
 `next_offset`, limits, and `total_output_bytes` count **normalized UTF-8 bytes**,
