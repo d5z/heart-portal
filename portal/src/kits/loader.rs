@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tracing::{debug, warn};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use tracing::{debug, info, warn};
 
 use crate::config::PortalConfig;
 
@@ -47,7 +49,9 @@ pub fn load_kits_from_dir(kits_dir: &Path) -> Result<Vec<LoadedKit>> {
 }
 
 pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
+    let mut diagnostics = HashSet::new();
     if !kits_dir.try_exists()? {
+        report_diagnostics(kits_dir, diagnostics);
         debug!("No kits directory at {}", kits_dir.display());
         return Ok(KitScan {
             kits: vec![],
@@ -72,7 +76,10 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
     for entry in entries {
         let kit_dir = entry.path();
         if is_ignored_kit_dir(&kit_dir) {
-            debug!("Skipping ignored kit backup directory {}", kit_dir.display());
+            debug!(
+                "Skipping ignored kit backup directory {}",
+                kit_dir.display()
+            );
             continue;
         }
         match std::fs::metadata(&kit_dir) {
@@ -80,11 +87,11 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
             Ok(_) => continue,
             Err(err) => {
                 // A temporary access failure must not be treated as uninstall.
-                warn!(
+                diagnostics.insert(format!(
                     "Cannot inspect kit directory {}: {}",
                     kit_dir.display(),
                     err
-                );
+                ));
                 invalid_dirs.push(kit_dir);
                 continue;
             }
@@ -102,12 +109,16 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
             "Too many kit manifests; keeping current inventory"
         );
 
-        match load_manifest(&kit_dir, &manifest_path) {
+        match load_manifest(&kit_dir, &manifest_path, &mut diagnostics) {
             Ok(Some(kit)) => kits.push(kit),
             Ok(None) => {}
             Err(err) => {
                 invalid_dirs.push(kit_dir);
-                warn!("Skipping kit manifest {}: {}", manifest_path.display(), err);
+                diagnostics.insert(format!(
+                    "Skipping kit manifest {}: {}",
+                    manifest_path.display(),
+                    err
+                ));
             }
         }
     }
@@ -128,25 +139,36 @@ pub fn scan_kits_from_dir(kits_dir: &Path) -> Result<KitScan> {
             if let Some(previous) = owners.insert(route.clone(), index) {
                 conflicts.insert(previous);
                 conflicts.insert(index);
-                let pair = if previous < index { (previous, index) } else { (index, previous) };
+                let pair = if previous < index {
+                    (previous, index)
+                } else {
+                    (index, previous)
+                };
                 if conflict_pairs.insert(pair) {
-                    warn!(
+                    diagnostics.insert(format!(
                         "Kit conflict for route '{}': '{}' and '{}'; both directories excluded",
                         route,
                         kits[previous].kit_dir.display(),
                         kit.kit_dir.display()
-                    );
+                    ));
                 }
             }
         }
     }
-    let kits = kits.into_iter().enumerate().filter_map(|(index, kit)| {
-        if conflicts.contains(&index) {
-            invalid_dirs.push(kit.kit_dir);
-            None
-        } else { Some(kit) }
-    }).collect();
+    let kits = kits
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, kit)| {
+            if conflicts.contains(&index) {
+                invalid_dirs.push(kit.kit_dir);
+                None
+            } else {
+                Some(kit)
+            }
+        })
+        .collect();
 
+    report_diagnostics(kits_dir, diagnostics);
     Ok(KitScan { kits, invalid_dirs })
 }
 
@@ -161,7 +183,11 @@ fn is_ignored_kit_dir(path: &Path) -> bool {
         || name.ends_with(".kit-retired")
 }
 
-fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKit>> {
+fn load_manifest(
+    kit_dir: &Path,
+    manifest_path: &Path,
+    diagnostics: &mut HashSet<String>,
+) -> Result<Option<LoadedKit>> {
     let content = crate::bounded_file::text(manifest_path, 256 * 1024)
         .with_context(|| format!("Reading kit manifest {}", manifest_path.display()))?;
     let had_bom = content.starts_with('\u{feff}');
@@ -172,7 +198,11 @@ fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKi
         } else {
             " manifest.json may contain a UTF-8 BOM; check header bytes EF BB BF."
         };
-        format!("Parsing kit manifest {}.{}", manifest_path.display(), bom_note)
+        format!(
+            "Parsing kit manifest {}.{}",
+            manifest_path.display(),
+            bom_note
+        )
     })?;
     anyhow::ensure!(is_valid_kit_name(&manifest.name), "Invalid kit name");
     anyhow::ensure!(
@@ -216,7 +246,7 @@ fn load_manifest(kit_dir: &Path, manifest_path: &Path) -> Result<Option<LoadedKi
     let command =
         resolve_command_with_environment(kit_dir, &manifest.command, &environment.process_values());
     for warning in manifest_validation_warnings(&manifest, &command) {
-        warn!("{}", warning);
+        diagnostics.insert(warning);
     }
 
     let auth = AuthState::load(kit_dir, &manifest, &environment);
@@ -619,5 +649,51 @@ mod tests {
         assert!(!is_valid_kit_name("echo_test"));
         assert!(!is_valid_kit_name("echo test"));
         assert!(!is_valid_kit_name("écho"));
+    }
+}
+
+// Keep diagnostics across scans, including explicit reloads. A successful scan
+// clears resolved errors so a later recurrence is reported again.
+fn report_diagnostics(root: &Path, current: HashSet<String>) {
+    static PREVIOUS: OnceLock<Mutex<HashMap<PathBuf, HashSet<String>>>> = OnceLock::new();
+    let mut previous = PREVIOUS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let old = previous.entry(root.to_path_buf()).or_default();
+    let (added, resolved) = diagnostic_changes(old, &current);
+    for message in added {
+        warn!("{}", message);
+    }
+    for message in resolved {
+        info!("Kit issue resolved: {}", message);
+    }
+    *old = current;
+}
+
+fn diagnostic_changes<'a>(
+    old: &'a HashSet<String>,
+    current: &'a HashSet<String>,
+) -> (Vec<&'a String>, Vec<&'a String>) {
+    (
+        current.difference(old).collect(),
+        old.difference(current).collect(),
+    )
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn reports_changes_and_recurrence_only() {
+        let empty = HashSet::new();
+        let missing = HashSet::from(["missing binary".to_owned()]);
+        let conflict = HashSet::from(["route conflict".to_owned()]);
+        assert_eq!(diagnostic_changes(&empty, &missing).0.len(), 1);
+        assert_eq!(diagnostic_changes(&missing, &missing), (vec![], vec![]));
+        let (added, resolved) = diagnostic_changes(&missing, &conflict);
+        assert_eq!((added.len(), resolved.len()), (1, 1));
+        assert_eq!(diagnostic_changes(&missing, &empty).1.len(), 1);
+        assert_eq!(diagnostic_changes(&empty, &missing).0.len(), 1);
     }
 }

@@ -7,6 +7,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod bounded_file;
+mod logging;
 mod config;
 mod connection_status;
 mod exec_policy;
@@ -374,16 +375,7 @@ async fn main() -> Result<()> {
         macos_upgrade::recover_interrupted()?;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,heart_portal=debug".parse().unwrap_or_else(|e| {
-                    eprintln!("Failed to parse default log filter: {}", e);
-                    tracing_subscriber::EnvFilter::new("info")
-                })
-            }),
-        )
-        .init();
+    logging::init()?;
 
     // Supervisors can provide the Loom link through the environment so the
     // credential is not exposed in the OS process command line.

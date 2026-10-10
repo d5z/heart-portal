@@ -192,10 +192,22 @@ impl ToolHost {
                 status::KIT_REFRESH_INTERVAL_SECS,
             ));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_error = None;
             loop {
                 interval.tick().await;
-                if let Err(err) = host.refresh_kits(false).await {
-                    warn!("Failed to refresh kits: {}", err);
+                match host.refresh_kits(false).await {
+                    Err(err) => {
+                        let message = err.to_string();
+                        if last_error.as_ref() != Some(&message) {
+                            warn!("Failed to refresh kits: {}", message);
+                        }
+                        last_error = Some(message);
+                    }
+                    Ok(_) => {
+                        if last_error.take().is_some() {
+                            info!("Kit refresh recovered");
+                        }
+                    }
                 }
             }
         })

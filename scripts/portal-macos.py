@@ -306,6 +306,7 @@ def restore_manual(root, snapshot=None):
     for key in ('HEART_PORTAL_SUPERVISED', 'HEART_PORTAL_MACOS_SUPERVISOR',
                 'HEART_PORTAL_READY_FILE', 'HEART_PORTAL_READY_NONCE', 'HEART_PORTAL_UPGRADE_START'):
         env.pop(key, None)
+    env['HEART_PORTAL_LOG_FILE'] = str(root / 'portal-runtime.log')
     with open(root / 'portal-runtime.log', 'ab') as out, open(root / 'portal-runtime.err.log', 'ab') as err:
         # Installation still owns the maintenance lock while unwinding a failed
         # bootstrap. Wait outside the manager before exec, otherwise the restored

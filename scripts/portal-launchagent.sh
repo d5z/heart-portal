@@ -17,6 +17,7 @@ portal_name=$(cat .portal-name)
 [ -n "$PORTAL_CONNECT_LINK" ] && [ -n "$portal_name" ]
 export PORTAL_CONNECT_LINK
 export HEART_PORTAL_SUPERVISED=1
+export HEART_PORTAL_LOG_FILE="$root/portal-runtime.log"
 export RUST_LOG="${RUST_LOG:-info}"
 # Use files, not supervisor pipes: inherited kit output cannot delay recovery.
 # Retain one previous launch for diagnosing crashes, with bounded generations.

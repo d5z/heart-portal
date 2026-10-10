@@ -126,6 +126,7 @@ def watch(request):
                         (root / '.portal-ready.json').unlink(missing_ok=True)
                         env = dict(os.environ, HEART_PORTAL_SUPERVISED='1', HEART_PORTAL_MACOS_SUPERVISOR=request['token'])
                         env.pop('HEART_PORTAL_UPGRADE_START', None)
+                        env['HEART_PORTAL_LOG_FILE'] = str(root / 'portal-runtime.log')
                         try:
                             with open(root / 'portal-runtime.log', 'ab') as out, open(root / 'portal-runtime.err.log', 'ab') as err:
                                 child = subprocess.Popen([str(target), *request['arguments']], cwd=request['cwd'], env=env,
