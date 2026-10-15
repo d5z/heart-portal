@@ -80,8 +80,11 @@ fn powershell_encoded_command(command: &str) -> String {
     use base64::Engine;
     // -EncodedCommand transports source as UTF-16LE; the launched shell's
     // redirected output and common text cmdlets use UTF-8 explicitly.
+    // Fresh Windows PowerShell sessions serialize module-loading progress to
+    // CLIXML on stderr. Suppress progress only; retain warnings and errors.
     let script = format!(
-        "$OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false);\n\
+        "$ProgressPreference = 'SilentlyContinue';\n\
+         $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false);\n\
          $PSDefaultParameterValues['Get-Content:Encoding'] = 'UTF8';\n\
          $PSDefaultParameterValues['Set-Content:Encoding'] = 'UTF8';\n\
          $PSDefaultParameterValues['Add-Content:Encoding'] = 'UTF8';\n\
@@ -347,6 +350,7 @@ mod tests {
             .collect();
         let script = String::from_utf16(&wide).unwrap();
         assert!(script.ends_with(command));
+        assert!(script.starts_with("$ProgressPreference = 'SilentlyContinue';\n"));
         assert!(script.contains("[Console]::OutputEncoding"));
         assert!(script.contains("['Get-Content:Encoding'] = 'UTF8'"));
     }

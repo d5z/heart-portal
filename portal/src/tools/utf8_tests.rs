@@ -137,3 +137,46 @@ async fn large_utf8_output_keeps_mcp_connection_alive() {
     handler.abort();
     let _ = handler.await;
 }
+
+/// stderr is diagnostic output, not a failure flag. Exercise the tool boundary
+/// so successful diagnostics and silent nonzero exits cannot be misclassified.
+#[tokio::test]
+async fn exec_status_uses_exit_code_and_retains_stderr() {
+    let workspace = Workspace::new();
+    let mut config = PortalConfig {
+        kits_enabled: false,
+        ..PortalConfig::default()
+    };
+    config.security.workspace_root = workspace.0.clone();
+    let host = ToolHost::new(&config);
+    for (code, diagnostics) in [(0, true), (7, true), (7, false)] {
+        let command = if cfg!(windows) {
+            format!(
+                "{}exit /b {code}",
+                if diagnostics {
+                    "echo diagnostic 1>&2 & "
+                } else {
+                    ""
+                }
+            )
+        } else {
+            format!(
+                "{}exit {code}",
+                if diagnostics {
+                    "echo diagnostic >&2; "
+                } else {
+                    ""
+                }
+            )
+        };
+        let result = host
+            .call("portal_exec", serde_json::json!({"command": command}))
+            .await
+            .unwrap();
+        assert_eq!(result["isError"], code != 0, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.contains("--- stderr ---"), diagnostics, "{text}");
+        assert_eq!(text.contains("diagnostic"), diagnostics, "{text}");
+        assert_eq!(text.contains("exit code: 7"), code == 7, "{text}");
+    }
+}

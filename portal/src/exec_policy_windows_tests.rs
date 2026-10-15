@@ -191,3 +191,41 @@ async fn installed_git_tools_are_available_to_exec_children() {
         assert!(!workspace.0.join("scratch file.txt").exists());
     }
 }
+
+#[tokio::test]
+#[cfg_attr(not(windows), ignore = "requires native Windows")]
+async fn powershell_progress_is_quiet_but_errors_and_exit_codes_survive() {
+    let workspace = Workspace::new();
+    for background in [false, true] {
+        // Repeat in fresh processes, including module loading and explicit progress.
+        for _ in 0..2 {
+            let (failed, output) = execute_with_shell(
+                &workspace.config(),
+                "Import-Module Microsoft.PowerShell.Management; Write-Progress -Activity 'fixture' -Status 'loading' -PercentComplete 50; Write-Output 'ok'",
+                background,
+                "powershell",
+            ).await;
+            assert!(!failed, "{output}");
+            assert_eq!(output.trim(), "ok", "background={background}");
+        }
+        for code in [0, 7] {
+            let (failed, output) = execute_with_shell(
+                &workspace.config(),
+                &format!("[Console]::Error.WriteLine('diagnostic'); exit {code}"),
+                background,
+                "powershell",
+            )
+            .await;
+            assert_eq!(failed, code != 0, "{output}");
+            assert!(output.contains("diagnostic"), "{output}");
+        }
+        let (failed, output) = execute_with_shell(
+            &workspace.config(),
+            "throw 'real-error'",
+            background,
+            "powershell",
+        )
+        .await;
+        assert!(failed && output.contains("real-error"), "{output}");
+    }
+}

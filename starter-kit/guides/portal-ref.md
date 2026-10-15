@@ -74,7 +74,11 @@ the script directly (also supported with `background: true`):
 Portal transports the script with PowerShell's UTF-16LE `-EncodedCommand`, sets
 console/pipe text encoding to UTF-8, and defaults `Get-Content`, `Set-Content`,
 `Add-Content`, and `Out-File` to UTF-8. Explicit `-Encoding` arguments still take
-precedence. This option does not change system settings or execution policy.
+precedence. Each PowerShell session starts with `$ProgressPreference = 'SilentlyContinue'`
+to suppress module-loading progress that would otherwise appear as CLIXML on stderr.
+Warnings and errors remain available; `portal_exec` uses the process exit status,
+not the presence of stderr, to set `isError`. This option does not change system
+settings or execution policy.
 Windows PowerShell may add a UTF-8 BOM when writing files; use `portal_file_write`
 for exact UTF-8 contents. Binary/non-UTF-8 programs still require their own encoding
 options. A nested `powershell -Command ...` inside the default cmd shell is rejected
