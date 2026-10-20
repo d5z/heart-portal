@@ -8,6 +8,7 @@ mod client;
 mod connection;
 pub(crate) mod limits;
 mod ownership;
+pub(crate) use ownership::ProcessOwner;
 mod protocol;
 #[cfg(windows)]
 mod windows_job;

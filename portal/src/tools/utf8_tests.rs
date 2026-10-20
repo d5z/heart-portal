@@ -100,9 +100,14 @@ async fn large_utf8_output_keeps_mcp_connection_alive() {
                 assert!(text.starts_with("\n--- stderr ---\n"));
             } else {
                 assert_eq!(result["truncated"], truncated);
-                assert!(text.starts_with(&input[..expected_len]));
+                if tool == "portal_exec" && truncated {
+                    assert!(text.starts_with(super::text::byte_prefix(&input, 40_000)));
+                    assert!(text.ends_with(&input.chars().last().unwrap().to_string()));
+                } else {
+                    assert!(text.starts_with(&input[..expected_len]));
+                }
                 if truncated {
-                    assert!(text[expected_len..].contains("truncated"));
+                    assert!(text.contains("truncated"));
                 } else {
                     assert_eq!(text, input);
                 }

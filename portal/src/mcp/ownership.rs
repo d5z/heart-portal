@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::{Child, Command};
 
-pub(super) struct ProcessOwner {
+pub(crate) struct ProcessOwner {
     stopped: AtomicBool,
     #[cfg(windows)]
     job: super::windows_job::KitJob,
@@ -44,9 +44,21 @@ impl ProcessOwner {
     }
 
     pub fn spawn(command: &mut Command) -> Result<(Child, Self)> {
+        Self::spawn_owned(command, true)
+    }
+
+    pub(crate) fn spawn_exec(command: &mut Command) -> Result<(Child, Self)> {
+        Self::spawn_owned(command, false)
+    }
+
+    fn spawn_owned(command: &mut Command, _kit: bool) -> Result<(Child, Self)> {
         #[cfg(windows)]
         {
-            let (child, job) = super::windows_job::KitJob::spawn(command)?;
+            let (child, job) = if _kit {
+                super::windows_job::KitJob::spawn(command)?
+            } else {
+                super::windows_job::KitJob::spawn_exec(command)?
+            };
             Ok((
                 child,
                 Self {

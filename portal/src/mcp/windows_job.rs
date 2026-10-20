@@ -28,6 +28,14 @@ pub struct KitJob(OwnedHandle);
 
 impl KitJob {
     pub fn spawn(command: &mut Command) -> Result<(Child, Self)> {
+        Self::spawn_owned(command, true)
+    }
+
+    pub(crate) fn spawn_exec(command: &mut Command) -> Result<(Child, Self)> {
+        Self::spawn_owned(command, false)
+    }
+
+    fn spawn_owned(command: &mut Command, kit: bool) -> Result<(Child, Self)> {
         // NULL security attributes make the handle non-inheritable. Otherwise a
         // Kit could keep its own job alive after Portal has been terminated.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -40,9 +48,11 @@ impl KitJob {
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         // Kit descendants cannot detach from ownership. Portal lifecycle work
         // belongs to the host management channel, never a kit process.
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 32;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if kit {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = 32;
+        }
         if unsafe {
             SetInformationJobObject(
                 handle,
@@ -58,9 +68,11 @@ impl KitJob {
         // Suspend before user code executes so launchers cannot create children
         // between spawn and job assignment. Keep Rust's command quoting, PATH,
         // environment and .cmd support instead of rebuilding CreateProcess args.
+        if kit {
+            command.env("HEART_PORTAL_KIT_JOB", "1");
+        }
         let mut child = command
             .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
-            .env("HEART_PORTAL_KIT_JOB", "1")
             .kill_on_drop(true)
             .spawn()
             .context("Spawning suspended Kit")?;

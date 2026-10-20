@@ -20,7 +20,7 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .get("max_matches")
         .and_then(super::value_as_u64)
         .unwrap_or(200)
-        .min(2000) as usize;
+        .clamp(1, 2000) as usize;
 
     let path_filter = arguments
         .get("path")
@@ -28,9 +28,12 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .unwrap_or(".");
 
     let root = resolve_existing_path(config, path_filter)?;
+    let include_ignored = arguments
+        .get("include_ignored")
+        .and_then(super::value_as_bool)
+        .unwrap_or(false);
 
-    let re = Regex::new(pattern)
-        .map_err(|e| anyhow::anyhow!("Invalid regex: {}", e))?;
+    let re = Regex::new(pattern).map_err(|e| anyhow::anyhow!("Invalid regex: {}", e))?;
 
     // Keep both paths in canonical form. This is especially important on
     // Windows, where canonicalization may use the verbatim-path prefix.
@@ -44,15 +47,23 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
     );
 
     let matches = tokio::task::spawn_blocking(move || {
-        grep_workspace(&workspace, &root, &re, max_matches, max_file)
+        grep_workspace(
+            &workspace,
+            &root,
+            &re,
+            max_matches,
+            max_file,
+            include_ignored,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("Search task failed: {}", e))??;
 
-    let text = serde_json::to_string(&matches)?;
+    let text = serde_json::to_string(&matches.items)?;
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }],
-        "match_count": matches.len()
+        "match_count": matches.items.len(), "truncated": matches.truncated,
+        "files_scanned": matches.files_scanned, "skipped_directories": matches.skipped_directories
     }))
 }
 
@@ -63,21 +74,58 @@ struct GrepMatch {
     text: String,
 }
 
+#[derive(Default)]
+struct SearchResults {
+    items: Vec<GrepMatch>,
+    truncated: bool,
+    files_scanned: usize,
+    skipped_directories: usize,
+}
+fn ignored_directory(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+    )
+}
+
 fn grep_workspace(
     workspace_root: &Path,
     search_root: &Path,
     re: &Regex,
     max_matches: usize,
     max_file_bytes: usize,
-) -> Result<Vec<GrepMatch>> {
+    include_ignored: bool,
+) -> Result<SearchResults> {
+    let mut result = SearchResults::default();
     let mut out = Vec::new();
+    let mut output_bytes = 2usize;
+    let mut skipped_directories = 0;
 
     for entry in WalkDir::new(search_root)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| {
+            let skip = !include_ignored
+                && entry.depth() > 0
+                && entry.file_type().is_dir()
+                && ignored_directory(&entry.file_name().to_string_lossy());
+            if skip {
+                skipped_directories += 1;
+            }
+            !skip
+        })
         .filter_map(|e| e.ok())
     {
         if out.len() >= max_matches {
+            result.truncated = true;
             break;
         }
 
@@ -106,7 +154,8 @@ fn grep_workspace(
             Err(_) => continue,
         };
 
-        let bytes = match std::fs::read(&canonical) {
+        result.files_scanned += 1;
+        let bytes = match crate::bounded_file::read(&canonical, max_file_bytes) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -125,16 +174,28 @@ fn grep_workspace(
                 break;
             }
             if re.is_match(line) {
-                out.push(GrepMatch {
+                let found = GrepMatch {
                     path: rel.clone(),
                     line: i + 1,
-                    text: line.chars().take(2000).collect(),
-                });
+                    text: super::text::byte_prefix(line, 2000).to_string(),
+                };
+                output_bytes += serde_json::to_vec(&found)?.len() + 1;
+                if output_bytes > 100_000 {
+                    result.truncated = true;
+                    break;
+                }
+                out.push(found);
             }
+        }
+        if result.truncated {
+            break;
         }
     }
 
-    Ok(out)
+    result.items = out;
+    result.truncated |= result.items.len() >= max_matches;
+    result.skipped_directories = skipped_directories;
+    Ok(result)
 }
 
 #[cfg(all(test, unix))]
@@ -162,12 +223,71 @@ mod tests {
 
         let workspace = workspace.canonicalize().unwrap();
         let re = Regex::new("search-marker").unwrap();
-        let matches = grep_workspace(&workspace, &workspace, &re, 10, 1024).unwrap();
+        let matches = grep_workspace(&workspace, &workspace, &re, 10, 1024, false).unwrap();
 
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].path, "inside.txt");
-        assert_eq!(matches[0].text, "search-marker inside");
+        assert_eq!(matches.items.len(), 1);
+        assert_eq!(matches.items[0].path, "inside.txt");
+        assert_eq!(matches.items[0].text, "search-marker inside");
 
         std::fs::remove_dir_all(&temp).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod efficiency_tests {
+    use super::*;
+    #[test]
+    fn excludes_dependencies_but_allows_explicit_opt_in_and_root() {
+        let dir =
+            std::env::temp_dir().join(format!("portal-search-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("node_modules/package")).unwrap();
+        std::fs::write(dir.join("index.html"), "marker").unwrap();
+        for i in 0..100 {
+            std::fs::write(dir.join(format!("node_modules/package/{i}.js")), "marker").unwrap();
+        }
+        let root = dir.canonicalize().unwrap();
+        let pattern = Regex::new("marker").unwrap();
+        let normal = grep_workspace(&root, &root, &pattern, 200, 1024, false).unwrap();
+        assert_eq!(normal.files_scanned, 1);
+        assert_eq!(normal.items.len(), 1);
+        assert_eq!(normal.skipped_directories, 1);
+        let all = grep_workspace(&root, &root, &pattern, 200, 1024, true).unwrap();
+        assert_eq!(all.files_scanned, 101);
+        assert_eq!(all.items.len(), 101);
+        let explicit = grep_workspace(
+            &root,
+            &root.join("node_modules"),
+            &pattern,
+            200,
+            1024,
+            false,
+        )
+        .unwrap();
+        assert_eq!(explicit.items.len(), 100);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn limits_serialized_output_even_when_match_count_is_large() {
+        let dir =
+            std::env::temp_dir().join(format!("portal-search-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("large.txt"),
+            format!("{}\n", "中".repeat(1000)).repeat(1000),
+        )
+        .unwrap();
+        let root = dir.canonicalize().unwrap();
+        let result = grep_workspace(
+            &root,
+            &root,
+            &Regex::new("中").unwrap(),
+            2000,
+            4_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(result.truncated);
+        assert!(serde_json::to_vec(&result.items).unwrap().len() <= 100_000);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

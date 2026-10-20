@@ -3,8 +3,80 @@
 use crate::config::PortalConfig;
 use anyhow::Result;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tracing::debug;
+
+// Serialize mutations of the same canonical file, while unrelated files remain concurrent.
+fn mutation_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, value| value.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+async fn bounded_bytes(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || crate::bounded_file::read(&path, limit)).await??)
+}
+
+fn checksum(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn check_revision(arguments: &Value, bytes: &[u8]) -> Result<()> {
+    if let Some(expected) = arguments.get("expected_sha256") {
+        anyhow::ensure!(
+            expected.as_str() == Some(checksum(bytes).as_str()),
+            "File changed since it was read. Read it again and reapply only the intended edits."
+        );
+    }
+    Ok(())
+}
+
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    struct Temporary(PathBuf);
+    impl Drop for Temporary {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let temp =
+        Temporary(path.with_file_name(format!(".portal-write-{}.tmp", uuid::Uuid::new_v4())));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp.0)
+        .await?;
+    if let Ok(metadata) = tokio::fs::metadata(path).await {
+        file.set_permissions(metadata.permissions()).await?;
+    }
+    file.write_all(bytes).await?;
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&temp.0, path).await?;
+    Ok(())
+}
+
+fn write_result(path: &Path, bytes: &[u8], message: String) -> Value {
+    let link = url::Url::from_file_path(path)
+        .ok()
+        .map(|url| format!("[预览文件]({url})"));
+    serde_json::json!({
+        "content": [{"type":"text", "text": format!("{}{}", message, link.as_ref().map(|link| format!("\n{link}")).unwrap_or_default())}],
+        "path": path, "bytes": bytes.len(), "sha256": checksum(bytes), "preview_link": link
+    })
+}
 
 /// File/search tools are exposed only after `PortalConfig::prepare_workspace`.
 /// Reject an unprepared relative root instead of trying to reinterpret it
@@ -37,14 +109,14 @@ pub(crate) fn canonical_workspace_root(config: &PortalConfig) -> Result<PathBuf>
 pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let root = prepared_workspace_root(config)?;
     let path = PathBuf::from(path_str);
-    
+
     // Build the full path
     let full = if path.is_absolute() {
         path
     } else {
         root.join(path_str)
     };
-    
+
     // Normalize: resolve . and .. components without requiring the file to exist.
     // This is critical for write operations on new files.
     let mut normalized = PathBuf::new();
@@ -64,12 +136,16 @@ pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Res
             }
         }
     }
-    
+
     // Verify the normalized path is within workspace root
     if !normalized.starts_with(root) {
-        anyhow::bail!("Path outside workspace: {} (resolved to {})", path_str, normalized.display());
+        anyhow::bail!(
+            "Path outside workspace: {} (resolved to {})",
+            path_str,
+            normalized.display()
+        );
     }
-    
+
     Ok(normalized)
 }
 
@@ -81,7 +157,11 @@ pub(crate) fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Re
         anyhow::bail!("Path does not exist: {}", path_str);
     }
     let c = logical.canonicalize().map_err(|e| {
-        anyhow::anyhow!("path cannot be canonicalized ({}): {}", logical.display(), e)
+        anyhow::anyhow!(
+            "path cannot be canonicalized ({}): {}",
+            logical.display(),
+            e
+        )
     })?;
     if !c.starts_with(&root_canon) {
         anyhow::bail!(
@@ -99,9 +179,9 @@ pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Resul
     let logical = resolve_path_logical(config, path_str)?;
     let root = prepared_workspace_root(config)?;
     let root_canon = canonical_workspace_root(config)?;
-    let rel = logical.strip_prefix(root).map_err(|_| {
-        anyhow::anyhow!("Path outside workspace: {}", path_str)
-    })?;
+    let rel = logical
+        .strip_prefix(root)
+        .map_err(|_| anyhow::anyhow!("Path outside workspace: {}", path_str))?;
     let mut cur = root_canon.clone();
     for comp in rel.components() {
         cur.push(comp);
@@ -164,7 +244,8 @@ fn image_mime_type(ext: &str) -> Option<&'static str> {
 const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
 
 pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
-    let path_str = arguments.get("path")
+    let path_str = arguments
+        .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
 
@@ -173,27 +254,29 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
 
     // Check if this is an image file
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if let Some(mime) = image_mime_type(ext) {
+    // SVG is text: apply the same output budget, partial reads and revision hash.
+    if let Some(mime) = image_mime_type(ext).filter(|mime| *mime != "image/svg+xml") {
         // Binary read + base64 for images
-        let bytes = tokio::fs::read(&path).await
+        let bytes = bounded_bytes(&path, MAX_IMAGE_SIZE.min(config.security.max_file_size))
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
 
         if bytes.len() > MAX_IMAGE_SIZE {
-            anyhow::bail!("Image too large: {} bytes (max: {})", bytes.len(), MAX_IMAGE_SIZE);
+            anyhow::bail!(
+                "Image too large: {} bytes (max: {})",
+                bytes.len(),
+                MAX_IMAGE_SIZE
+            );
         }
 
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-        // SVG files are text — return as text, not image
-        if mime == "image/svg+xml" {
-            let text = String::from_utf8_lossy(&bytes);
-            return Ok(serde_json::json!({
-                "content": [{ "type": "text", "text": text }]
-            }));
-        }
-
-        debug!("file_read: returning image ({}, {} bytes)", mime, bytes.len());
+        debug!(
+            "file_read: returning image ({}, {} bytes)",
+            mime,
+            bytes.len()
+        );
         return Ok(serde_json::json!({
             "content": [
                 { "type": "text", "text": format!("[Image: {} ({} bytes)]", path.display(), bytes.len()) },
@@ -203,39 +286,80 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     }
 
     // Text file path
-    let content = tokio::fs::read_to_string(&path).await
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+    let content = String::from_utf8(bounded_bytes(&path, config.security.max_file_size).await?)
+        .map_err(|e| anyhow::anyhow!("File is not UTF-8 text ({}): {}", path.display(), e))?;
 
     if content.len() > config.security.max_file_size {
-        anyhow::bail!("File too large: {} bytes (max: {})", content.len(), config.security.max_file_size);
+        anyhow::bail!(
+            "File too large: {} bytes (max: {})",
+            content.len(),
+            config.security.max_file_size
+        );
     }
 
     // Truncate large responses to avoid flooding the being's context
-    const MAX_RESPONSE_BYTES: usize = 100_000; // 100KB
+    let max_response_bytes = arguments
+        .get("max_bytes")
+        .and_then(super::value_as_u64)
+        .unwrap_or(100_000)
+        .clamp(1, 100_000) as usize;
+    let sha256 = checksum(content.as_bytes());
 
     // Line-based partial read
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
 
-    let offset = arguments.get("offset")
+    let offset = arguments
+        .get("offset")
         .and_then(super::value_as_u64)
-        .map(|v| v as usize)
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
         .unwrap_or(0); // 0-based line number
 
-    let limit = arguments.get("limit")
+    let limit = arguments
+        .get("limit")
         .and_then(super::value_as_u64)
-        .map(|v| v as usize);
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
 
     let (text, truncated) = if offset > 0 || limit.is_some() {
         let start = offset.min(total_lines);
-        let end = limit.map(|l| (start + l).min(total_lines)).unwrap_or(total_lines);
-        let slice = lines[start..end].join("\n");
-        let header = format!("[lines {}-{} of {}]\n", start + 1, end, total_lines);
-        (format!("{}{}", header, slice), start > 0 || end < total_lines)
+        let end = limit
+            .map(|l| start.saturating_add(l).min(total_lines))
+            .unwrap_or(total_lines);
+        let mut slice = String::new();
+        let mut clipped = false;
+        for (index, line) in lines[start..end].iter().enumerate() {
+            let separator = if index == 0 { "" } else { "\n" };
+            if slice.len() + separator.len() + line.len() > max_response_bytes {
+                let remaining = max_response_bytes.saturating_sub(slice.len() + separator.len());
+                if remaining > 0 {
+                    slice.push_str(separator);
+                    slice.push_str(super::text::byte_prefix(line, remaining));
+                }
+                clipped = true;
+                break;
+            }
+            slice.push_str(separator);
+            slice.push_str(line);
+        }
+        let header = format!(
+            "[requested lines {}-{} of {}]\n",
+            start.saturating_add(1),
+            end,
+            total_lines
+        );
+        let notice = if clipped {
+            "\n(truncated by max_bytes; narrow offset/limit or increase max_bytes up to 100000.)"
+        } else {
+            ""
+        };
+        (
+            format!("{}{}{}", header, slice, notice),
+            clipped || start > 0 || end < total_lines,
+        )
     } else {
         // Existing truncation logic for full read
-        if content.len() > MAX_RESPONSE_BYTES {
-            let prefix = super::text::byte_prefix(&content, MAX_RESPONSE_BYTES);
+        if content.len() > max_response_bytes {
+            let prefix = super::text::byte_prefix(&content, max_response_bytes);
             (
                 format!("{}...\n\n(truncated: showing {}/{} bytes. Use offset/limit to read specific sections.)",
                     prefix, prefix.len(), content.len()),
@@ -248,28 +372,34 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
 
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }],
-        "truncated": truncated
+        "truncated": truncated,
+        "path": path, "sha256": sha256, "total_lines": total_lines
     }))
 }
 
 pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
-    let path_str = arguments.get("path")
+    let path_str = arguments
+        .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
 
-    let raw_content = arguments.get("content")
+    let raw_content = arguments
+        .get("content")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
 
-    let unescape = arguments.get("unescape")
+    let unescape = arguments
+        .get("unescape")
         .and_then(super::value_as_bool)
         .unwrap_or(false);
 
-    let append = arguments.get("append")
+    let append = arguments
+        .get("append")
         .and_then(super::value_as_bool)
         .unwrap_or(false);
 
-    let encoding = arguments.get("encoding")
+    let encoding = arguments
+        .get("encoding")
         .and_then(|v| v.as_str())
         .unwrap_or("utf8");
 
@@ -292,12 +422,31 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
     };
 
     if bytes.len() > config.security.max_file_size {
-        anyhow::bail!("Content too large: {} bytes (max: {})", bytes.len(), config.security.max_file_size);
+        anyhow::bail!(
+            "Content too large: {} bytes (max: {})",
+            bytes.len(),
+            config.security.max_file_size
+        );
     }
 
     let path = resolve_write_path(config, path_str)?;
+    let lock = mutation_lock(&path);
+    let _guard = lock.lock().await;
+    if arguments.get("expected_sha256").is_some() {
+        check_revision(
+            &arguments,
+            &bounded_bytes(&path, config.security.max_file_size).await?,
+        )?;
+    }
     let mode_label = if append { "append" } else { "write" };
-    debug!("file_{}: {} ({} bytes, unescape={}, encoding={})", mode_label, path.display(), bytes.len(), unescape, encoding);
+    debug!(
+        "file_{}: {} ({} bytes, unescape={}, encoding={})",
+        mode_label,
+        path.display(),
+        bytes.len(),
+        unescape,
+        encoding
+    );
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -311,21 +460,31 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
             .open(&path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open {} for append: {}", path.display(), e))?;
-        file.write_all(&bytes).await
+        file.write_all(&bytes)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
     } else {
-        tokio::fs::write(&path, &bytes).await
+        atomic_write(&path, &bytes)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
     }
 
     let verb = if append { "Appended" } else { "Written" };
-    Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": format!("{} {} bytes to {}", verb, bytes.len(), path.display()) }]
-    }))
+    if append {
+        return Ok(
+            serde_json::json!({"content":[{"type":"text","text":format!("{} {} bytes to {}",verb,bytes.len(),path.display())}],"path":path,"bytes_written":bytes.len()}),
+        );
+    }
+    Ok(write_result(
+        &path,
+        &bytes,
+        format!("{} {} bytes to {}", verb, bytes.len(), path.display()),
+    ))
 }
 
 pub async fn list(config: &PortalConfig, arguments: Value) -> Result<Value> {
-    let path_str = arguments.get("path")
+    let path_str = arguments
+        .get("path")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| {
             debug!("Missing path argument in file_list, using current directory");
@@ -336,7 +495,8 @@ pub async fn list(config: &PortalConfig, arguments: Value) -> Result<Value> {
     debug!("file_list: {}", path.display());
 
     let mut entries = Vec::new();
-    let mut dir = tokio::fs::read_dir(&path).await
+    let mut dir = tokio::fs::read_dir(&path)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to list {}: {}", path.display(), e))?;
 
     while let Some(entry) = dir.next_entry().await? {
@@ -374,77 +534,118 @@ pub async fn list(config: &PortalConfig, arguments: Value) -> Result<Value> {
 }
 
 pub async fn edit(config: &PortalConfig, arguments: Value) -> Result<Value> {
-    let path_str = arguments.get("path")
-        .and_then(|v| v.as_str())
+    let path_str = arguments
+        .get("path")
+        .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
-
-    let old_text_raw = arguments.get("old_text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'old_text' argument"))?;
-
-    let new_text_raw = arguments.get("new_text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'new_text' argument"))?;
-
-    let unescape = arguments.get("unescape")
-        .and_then(super::value_as_bool)
-        .unwrap_or(false);
-
-    let old_text = if unescape { unescape_backslash_sequences(old_text_raw) } else { old_text_raw.to_string() };
-    let new_text = if unescape { unescape_backslash_sequences(new_text_raw) } else { new_text_raw.to_string() };
-
-    // count can be -1 (replace all); keep signed i64 coercion (no HF-7 helper for i64)
-    let max_replacements = arguments.get("count")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
-        .unwrap_or(1);
-
     let path = resolve_existing_path(config, path_str)?;
-    debug!("file_edit: {} (count={})", path.display(), max_replacements);
-
-    let content = tokio::fs::read_to_string(&path).await
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
-
-    let match_count = content.matches(old_text.as_str()).count();
-    if match_count == 0 {
-        anyhow::bail!("text not found in file");
-    }
-
-    let (new_content, replaced) = if max_replacements < 0 {
-        (content.replace(old_text.as_str(), new_text.as_str()), match_count)
-    } else {
-        let n = max_replacements as usize;
-        if n == 1 && match_count > 1 {
-            anyhow::bail!("multiple matches found — be more specific ({} occurrences). Use count=-1 for all.", match_count);
+    let lock = mutation_lock(&path);
+    let _guard = lock.lock().await;
+    let bytes = bounded_bytes(&path, config.security.max_file_size).await?;
+    check_revision(&arguments, &bytes)?;
+    let mut content = String::from_utf8(bytes)?;
+    let edits = match arguments.get("edits") {
+        Some(Value::Array(edits)) if !edits.is_empty() && edits.len() <= 64 => {
+            edits.iter().collect::<Vec<_>>()
         }
-        (content.replacen(old_text.as_str(), new_text.as_str(), n), n.min(match_count))
+        Some(_) => anyhow::bail!("edits must contain between 1 and 64 exact-text replacements"),
+        None => vec![&arguments],
     };
-
-    tokio::fs::write(&path, new_content.as_bytes()).await
-        .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", path.display(), e))?;
-
-    let msg = if replaced == 1 {
-        let pos = new_content.find(new_text.as_str()).unwrap_or(0);
-        let start_line = new_content[..pos].lines().count();
-        let new_lines = new_text.lines().count().max(1);
-        let affected_lines = old_text.lines().count().max(1);
-        let end_line = start_line + new_lines.max(affected_lines) - 1;
-        let result_lines: Vec<&str> = new_content.lines().collect();
-        let ctx_start = if start_line > 3 { start_line - 3 } else { 1 };
-        let ctx_end = (end_line + 3).min(result_lines.len());
-        let context: String = result_lines[ctx_start.saturating_sub(1)..ctx_end]
-            .iter()
-            .enumerate()
-            .map(|(i, l)| format!("{:4}| {}", ctx_start + i, l))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("Replaced in {} (lines {}-{})\n{}", path.display(), start_line, end_line, context)
-    } else {
-        format!("Replaced {} occurrence(s) in {} ({} bytes)", replaced, path.display(), new_content.len())
-    };
-
-    Ok(serde_json::json!({
-        "content": [{ "type": "text", "text": msg }]
-    }))
+    let mut replaced = 0usize;
+    let mut changed_line = 1usize;
+    for (index, edit) in edits.iter().enumerate() {
+        let old = edit
+            .get("old_text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Edit {} missing old_text", index + 1))?;
+        let new = edit
+            .get("new_text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Edit {} missing new_text", index + 1))?;
+        let unescape = edit
+            .get("unescape")
+            .or_else(|| arguments.get("unescape"))
+            .and_then(super::value_as_bool)
+            .unwrap_or(false);
+        let old = if unescape {
+            unescape_backslash_sequences(old)
+        } else {
+            old.to_string()
+        };
+        let new = if unescape {
+            unescape_backslash_sequences(new)
+        } else {
+            new.to_string()
+        };
+        anyhow::ensure!(
+            !old.is_empty(),
+            "Edit {} old_text must not be empty",
+            index + 1
+        );
+        let count = edit
+            .get("count")
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(1);
+        anyhow::ensure!(
+            count == -1 || count > 0,
+            "count must be -1 or a positive integer"
+        );
+        let matches = content.matches(&old).count();
+        anyhow::ensure!(
+            matches > 0,
+            "Edit {} text not found; no edits were written",
+            index + 1
+        );
+        anyhow::ensure!(count != 1 || matches == 1, "Edit {} multiple matches found — be more specific ({} occurrences). Use count=-1 for all.", index + 1, matches);
+        let n = if count == -1 {
+            matches
+        } else {
+            usize::try_from(count).unwrap_or(usize::MAX).min(matches)
+        };
+        let size = content
+            .len()
+            .saturating_sub(old.len().saturating_mul(n))
+            .saturating_add(new.len().saturating_mul(n));
+        anyhow::ensure!(
+            size <= config.security.max_file_size,
+            "Edited file exceeds max_file_size; no edits were written"
+        );
+        changed_line = content[..content.find(&old).unwrap()]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        content = content.replacen(&old, &new, n);
+        replaced += n;
+    }
+    atomic_write(&path, content.as_bytes()).await?;
+    let start = changed_line.saturating_sub(4);
+    let mut context = String::new();
+    for (index, line) in content.lines().enumerate().skip(start).take(8) {
+        let line = format!("{:4}| {}\n", index + 1, line);
+        context.push_str(super::text::byte_prefix(
+            &line,
+            8000usize.saturating_sub(context.len()),
+        ));
+        if context.len() >= 7996 {
+            break;
+        }
+    }
+    Ok(write_result(
+        &path,
+        content.as_bytes(),
+        format!(
+            "Applied {} edit(s), replaced {} occurrence(s) in {} ({} bytes)\n{}",
+            edits.len(),
+            replaced,
+            path.display(),
+            content.len(),
+            context
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -552,7 +753,8 @@ mod tests {
 
         let err = resolve_existing_path(&config, "leak.txt").unwrap_err();
         assert!(
-            err.to_string().contains("outside workspace") || err.to_string().contains("resolved to"),
+            err.to_string().contains("outside workspace")
+                || err.to_string().contains("resolved to"),
             "{}",
             err
         );
@@ -580,7 +782,8 @@ mod tests {
 
         let err = resolve_write_path(&config, "nested/evil/x.txt").unwrap_err();
         assert!(
-            err.to_string().contains("outside workspace") || err.to_string().contains("resolved to"),
+            err.to_string().contains("outside workspace")
+                || err.to_string().contains("resolved to"),
             "{}",
             err
         );
@@ -589,7 +792,10 @@ mod tests {
 
     #[test]
     fn test_newline() {
-        assert_eq!(unescape_backslash_sequences("hello\\nworld"), "hello\nworld");
+        assert_eq!(
+            unescape_backslash_sequences("hello\\nworld"),
+            "hello\nworld"
+        );
     }
 
     #[test]
@@ -614,7 +820,10 @@ mod tests {
 
     #[test]
     fn test_no_escapes() {
-        assert_eq!(unescape_backslash_sequences("plain text 123"), "plain text 123");
+        assert_eq!(
+            unescape_backslash_sequences("plain text 123"),
+            "plain text 123"
+        );
     }
 
     #[test]
@@ -628,5 +837,151 @@ mod tests {
             unescape_backslash_sequences("line1\\nline2\\ttab\\\\slash"),
             "line1\nline2\ttab\\slash"
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+    struct Workspace(PathBuf);
+    impl Workspace {
+        fn new() -> (Self, PortalConfig) {
+            let path =
+                std::env::temp_dir().join(format!("portal-harness-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            let path = path.canonicalize().unwrap();
+            let mut config = PortalConfig::default();
+            config.security.workspace_root = path.clone();
+            (Self(path), config)
+        }
+    }
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_read_obeys_budget_and_handles_large_offsets() {
+        let (dir, config) = Workspace::new();
+        std::fs::write(dir.0.join("large.html"), "中🙂".repeat(20_000)).unwrap();
+        let result = read(
+            &config,
+            serde_json::json!({"path":"large.html","offset":0,"limit":1000,"max_bytes":1024}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["truncated"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().len() < 1300);
+        assert_eq!(result["sha256"].as_str().unwrap().len(), 64);
+        read(
+            &config,
+            serde_json::json!({"path":"large.html","offset":u64::MAX,"limit":u64::MAX}),
+        )
+        .await
+        .unwrap();
+        std::fs::write(dir.0.join("blank.txt"), "\n\nlast").unwrap();
+        let result = read(
+            &config,
+            serde_json::json!({"path":"blank.txt","offset":0,"limit":3}),
+        )
+        .await
+        .unwrap();
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("\n\n\nlast"));
+    }
+
+    #[tokio::test]
+    async fn svg_reads_obey_text_budget_and_support_revision_edits() {
+        let (dir, config) = Workspace::new();
+        let svg = format!("<svg>\n{}\n</svg>", "中".repeat(10_000));
+        std::fs::write(dir.0.join("chart.svg"), &svg).unwrap();
+        let result = read(&config, serde_json::json!({"path":"chart.svg","max_bytes":512})).await.unwrap();
+        assert_eq!(result["truncated"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().len() < 800);
+        assert_eq!(result["sha256"], checksum(svg.as_bytes()));
+        let partial = read(&config, serde_json::json!({"path":"chart.svg","offset":2,"limit":1,"max_bytes":512})).await.unwrap();
+        assert!(partial["content"][0]["text"].as_str().unwrap().ends_with("</svg>"));
+    }
+
+    #[tokio::test]
+    async fn html_is_created_then_edited_in_one_call_with_a_preview_link() {
+        let (dir, config) = Workspace::new();
+        let created = write(
+            &config,
+            serde_json::json!({"path":"page.html","content":"<h1>Old</h1><p>Text</p>"}),
+        )
+        .await
+        .unwrap();
+        let result = edit(&config, serde_json::json!({"path":"page.html","expected_sha256":created["sha256"],"edits":[{"old_text":"Old","new_text":"New"},{"old_text":"Text","new_text":"Updated"}]})).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("page.html")).unwrap(),
+            "<h1>New</h1><p>Updated</p>"
+        );
+        assert!(result["preview_link"].as_str().unwrap().contains("file://"));
+        assert_eq!(result["sha256"], checksum(b"<h1>New</h1><p>Updated</p>"));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("   1|"));
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_and_stale_revision_never_partially_write() {
+        let (dir, config) = Workspace::new();
+        std::fs::write(dir.0.join("page.html"), "original").unwrap();
+        let result = edit(&config, serde_json::json!({"path":"page.html","edits":[{"old_text":"original","new_text":"changed"},{"old_text":"missing","new_text":"oops"}]})).await;
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("page.html")).unwrap(),
+            "original"
+        );
+        assert!(edit(&config, serde_json::json!({"path":"page.html","old_text":"original","new_text":"changed","expected_sha256":"stale"})).await.is_err());
+        assert!(edit(
+            &config,
+            serde_json::json!({"path":"page.html","old_text":"","new_text":"oops"})
+        )
+        .await
+        .is_err());
+        assert!(edit(&config, serde_json::json!({"path":"page.html","old_text":"original","new_text":"oops","count":0})).await.is_err());
+        assert!(write(
+            &config,
+            serde_json::json!({"path":"page.html","content":"oops","expected_sha256":"stale"})
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("page.html")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_with_the_same_revision_have_one_winner() {
+        let (dir, config) = Workspace::new();
+        std::fs::write(dir.0.join("page.html"), "old").unwrap();
+        let args = serde_json::json!({"path":"page.html","old_text":"old","new_text":"new","expected_sha256":checksum(b"old")});
+        let (a, b) = tokio::join!(edit(&config, args.clone()), edit(&config, args));
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("page.html")).unwrap(),
+            "new"
+        );
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_first_line_or_all_content_does_not_panic() {
+        let (dir, config) = Workspace::new();
+        std::fs::write(dir.0.join("page.html"), "remove").unwrap();
+        edit(
+            &config,
+            serde_json::json!({"path":"page.html","old_text":"remove","new_text":""}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(dir.0.join("page.html")).unwrap(), b"");
     }
 }

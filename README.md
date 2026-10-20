@@ -387,3 +387,9 @@ MIT
 ---
 
 *Portal v0.6.0 — Being's hands in the world.*
+
+### Local artifact and tool efficiency updates
+
+File writes/edits return the canonical local path, SHA-256 and a preview link for the current desktop conversation. Use `portal_file_edit` with up to 64 ordered `edits` to modify an existing artifact in one call; all replacements must validate before a single atomic save. An optional `expected_sha256` rejects stale mutations. Legacy `old_text`/`new_text` calls remain supported.
+
+Text reads accept `max_bytes` (up to 100000) for both full and partial reads. Searches skip common dependency/build directories by default (`include_ignored=true` opts in) and report scan/truncation metadata. Foreground exec accepts `max_output_bytes`, retains bounded head/tail output, and returns exit code, duration and total output bytes separately. Normal child process trees are cleaned up on timeout/cancellation. These mechanisms were compared with OpenAI Codex commit `e18a20d6`; this is an independent adaptation, not Codex tool-protocol compatibility.

@@ -312,6 +312,7 @@ impl ToolHost {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_output_bytes": {"type":"integer","minimum":1,"maximum":100000,"description":"Foreground output budget in UTF-8 bytes (default 100000); use 16000 for routine checks. Pipes are drained with bounded memory. Exit status and duration are always returned separately."},
                         "command": {
                             "type": "string",
                             "description": "Shell command to execute. On Windows, PowerShell scripts require shell='powershell' and must be passed directly."
@@ -389,10 +390,11 @@ impl ToolHost {
         if self.config.tools.file {
             tools.push(ToolInfo {
                 name: "portal_file_read".to_string(),
-                description: "Read file contents. Returns text for text files, base64 for images. For large files, use offset (0-based line number) and limit to read specific sections instead of portal_exec head/tail.".to_string(),
+                description: "Read file contents and return sha256 for conflict-aware edits. Returns text for text files, base64 for images. Text output is bounded even with offset/limit; use max_bytes for a smaller context budget. For large files, use offset (0-based line number) and limit to read specific sections instead of portal_exec head/tail.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "max_bytes": {"type":"integer","minimum":1,"maximum":100000,"description":"Text output budget (default 100000); applies to full and partial reads."},
                         "path": {
                             "type": "string",
                             "description": "File path (relative to workspace root)"
@@ -412,10 +414,11 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_write".to_string(),
-                description: "Write content to a file (creates parent dirs automatically). THE preferred way to write files — no shell escaping issues.\n\nModes:\n- Default: overwrite file with content\n- append=true: add to end of existing file\n- encoding=\"base64\": decode base64 content before writing (for binary files)\n- unescape=true: process escape sequences (\\n to newline, \\t to tab). Default: content written as-is".to_string(),
+                description: "Write content to a file (creates parent dirs automatically). Overwrites use atomic replacement and return a local preview link; Include the returned preview_link in your reply so desktop clients can open the file. For local HTML previews, use self-contained CSS/JavaScript or relative static assets; external network requests are unavailable. HTML and document work stays in the current conversation. Prefer portal_file_edit for follow-up changes. THE preferred way to write files — no shell escaping issues.\n\nModes:\n- Default: overwrite file with content\n- append=true: add to end of existing file\n- encoding=\"base64\": decode base64 content before writing (for binary files)\n- unescape=true: process escape sequences (\\n to newline, \\t to tab). Default: content written as-is".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "expected_sha256": {"type":"string","description":"Optional sha256 from file_read; reject overwriting a changed file."},
                         "path": {
                             "type": "string",
                             "description": "File path (relative to workspace root)"
@@ -443,10 +446,12 @@ impl ToolHost {
 
             tools.push(ToolInfo {
                 name: "portal_file_edit".to_string(),
-                description: "Find and replace exact text in a file. Safer than sed — no shell escaping issues. Shows line-numbered context after replacement.\n\nBehavior:\n- Single match: replaces it, shows surrounding context\n- Multiple matches with count=1 (default): errors asking for more specific text\n- count=-1: replace ALL occurrences".to_string(),
+                description: "Apply focused exact-text edits instead of rewriting a whole file. Batch up to 64 edits to one file in a single call; all matches are validated before one atomic save. Optionally pass expected_sha256 from file_read to reject stale edits. Returns the saved local path and preview link; include preview_link in your reply and continue in the same scene.\n\nBehavior:\n- Single match: replaces it, shows surrounding context\n- Multiple matches with count=1 (default): errors asking for more specific text\n- count=-1: replace ALL occurrences".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "expected_sha256": {"type":"string","description":"Optional sha256 from file_read; reject stale edits."},
+                        "edits": {"type":"array","minItems":1,"maxItems":64,"description":"Ordered replacements applied to the same file in memory, then saved once. Use instead of top-level old_text/new_text.","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"},"count":{"type":"integer"},"unescape":{"type":"boolean"}},"required":["old_text","new_text"]}},
                         "path": {
                             "type": "string",
                             "description": "File path (relative to workspace root)"
@@ -468,7 +473,8 @@ impl ToolHost {
                             "description": "If true, process escape sequences in old_text/new_text (\n→newline, \t→tab). Default: false (match/replace as-is)."
                         }
                     },
-                    "required": ["path", "old_text", "new_text"]
+                    "required": ["path"],
+                    "anyOf": [{"required":["old_text","new_text"]},{"required":["edits"]}]
                 }),
             });
 
@@ -515,10 +521,11 @@ impl ToolHost {
         if self.config.tools.search {
             tools.push(ToolInfo {
                 name: "portal_search".to_string(),
-                description: "Recursively search text files under the workspace for a regex pattern (ripgrep-style Rust regex).".to_string(),
+                description: "Search source files under the workspace with Rust regex. Skips common dependency/build directories by default; include_ignored=true opts in. Returns bounded matches, scan counts and truncation status.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "include_ignored": {"type":"boolean","description":"Include common dependency/build directories (.git, node_modules, target, dist, build, .next, .venv, venv, __pycache__). Default false; explicit search roots are always included."},
                         "pattern": {
                             "type": "string",
                             "description": "Rust regex pattern to match against each line"
