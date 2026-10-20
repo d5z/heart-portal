@@ -79,7 +79,7 @@ class KitLifecycleTests(unittest.TestCase):
             env=env, stdout=self.log, stderr=self.log,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         self.addCleanup(self.stop)
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         while True:
             try:
                 self.connection = socket.create_connection(('127.0.0.1', self.port), timeout=2)

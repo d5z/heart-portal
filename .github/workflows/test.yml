@@ -25,7 +25,39 @@ jobs:
           $git = Join-Path $env:ProgramFiles 'Git\usr\bin\ls.exe'
           if (-not (Test-Path $git)) { throw 'Git for Windows is required for the PATH regression test.' }
       - name: Rust tests (includes native Windows exec regressions)
-        run: cargo test --locked
+        shell: bash
+        run: |
+          # bash steps run with `set -e -o pipefail`. `cmd | tee || status=$?`
+          # only guards tee, NOT the pipeline: under errexit+pipefail a failing
+          # cargo aborts the script before any annotation code runs (runs
+          # 5/8/9 emitted zero ::error:: lines). Disable errexit around the
+          # pipeline and capture $? explicitly.
+          out="$RUNNER_TEMP/test-output.txt"
+          set +e
+          cargo test --locked --no-fail-fast --color=never 2>&1 | tee "$out"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            set +e
+            {
+              grep -E '^(error|thread)' "$out" | head -5
+              echo '--- tail ---'
+              tail -n 10 "$out" | grep -v '^[[:space:]]*$'
+            } | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error::$line"
+            done
+            {
+              echo '### cargo test failures (exit '"$status"')'
+              echo '```'
+              grep -E '^test .* \.\.\. FAILED' "$out" | head -20
+              grep -A 40 '^failures:' "$out" | head -80
+              grep -E '^(error|thread)' "$out" | head -20
+              echo '--- last 100 lines ---'
+              tail -n 100 "$out"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
       - name: Build Portal
         run: cargo build --locked
       - name: Runtime status over TCP and relay

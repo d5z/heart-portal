@@ -1,0 +1,110 @@
+name: heart-portal Android NDK build
+
+on:
+  push:
+    branches: [android]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RUST_TOOLCHAIN: 1.90.0
+  ANDROID_NDK_VERSION: 27.2.12479018
+  ANDROID_API_LEVEL: 24
+  TARGET: aarch64-linux-android
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.TARGET }}
+
+      - name: Install pinned Android NDK r27c
+        run: |
+          curl -fsSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q ndk.zip
+          test -x "${GITHUB_WORKSPACE}/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+
+      - name: Configure Android NDK toolchain
+        run: |
+          ndk_home="${GITHUB_WORKSPACE}/android-ndk-r27c"
+          ndk_bin="$ndk_home/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$ndk_bin/${TARGET}${ANDROID_API_LEVEL}-clang"
+          test -x "$ndk_bin/llvm-strip"
+          echo "ANDROID_NDK_HOME=$ndk_home" >> "$GITHUB_ENV"
+          echo "$ndk_bin" >> "$GITHUB_PATH"
+          echo "NDK_BIN=$ndk_bin" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TARGET}${ANDROID_API_LEVEL}-clang" >> "$GITHUB_ENV"
+          echo "CC_AARCH64_LINUX_ANDROID=${TARGET}${ANDROID_API_LEVEL}-clang" >> "$GITHUB_ENV"
+          echo "CXX_AARCH64_LINUX_ANDROID=${TARGET}${ANDROID_API_LEVEL}-clang++" >> "$GITHUB_ENV"
+          echo "AR_AARCH64_LINUX_ANDROID=llvm-ar" >> "$GITHUB_ENV"
+          echo "PATH configured with pinned NDK r27c toolchain: $ndk_bin"
+
+      - name: Build heart-portal-android with locked dependencies
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          cargo build --locked --release --target "$TARGET" 2>&1 | tee artifacts/build.log
+          "$NDK_BIN/llvm-strip" \
+            "target/$TARGET/release/heart-portal" \
+            -o artifacts/heart-portal-android
+
+      - name: Verify ELF, architecture, interpreter, and hashes
+        if: always()
+        run: |
+          mkdir -p artifacts
+          report=artifacts/heart-portal-android-report.txt
+          {
+            echo "repository=$(git rev-parse HEAD)"
+            echo "rust_toolchain=$RUST_TOOLCHAIN"
+            echo "target=$TARGET"
+            echo "android_ndk=r27c ($ANDROID_NDK_VERSION)"
+            echo "--- artifact ---"
+            if [[ -f artifacts/heart-portal-android ]]; then
+              file artifacts/heart-portal-android
+              readelf -h artifacts/heart-portal-android | grep -E 'Class:|Type:|Machine:'
+              readelf -lW artifacts/heart-portal-android | grep 'Requesting program interpreter'
+              readelf -dW artifacts/heart-portal-android | grep NEEDED || true
+              sha256sum artifacts/heart-portal-android
+              test "$(file -b artifacts/heart-portal-android | grep -c 'ELF 64-bit.*ARM aarch64')" -eq 1
+              readelf -h artifacts/heart-portal-android | grep -q 'Machine:.*AArch64'
+              readelf -lW artifacts/heart-portal-android | grep -q 'Requesting program interpreter: /system/bin/linker64'
+              echo "verification=passed"
+            else
+              echo "verification=not-run (heart-portal-android was not produced)"
+              exit 1
+            fi
+            echo "--- build log tail ---"
+            tail -80 artifacts/build.log 2>/dev/null || true
+          } > "$report" 2>&1
+          cat "$report"
+
+      - name: Upload heart-portal-android and build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heart-portal-android-${{ github.sha }}
+          if-no-files-found: warn
+          path: |
+            artifacts/heart-portal-android
+            artifacts/heart-portal-android-report.txt
+            artifacts/build.log
+
+      - name: Publish heart-portal-android to android-ci release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view android-ci >/dev/null 2>&1 || gh release create android-ci --title "Android CI builds" --notes "Rolling builds from the android branch" --prerelease
+          gh release upload android-ci artifacts/heart-portal-android artifacts/heart-portal-android-report.txt --clobber

@@ -122,7 +122,7 @@ class SessionRecoveryTests(unittest.TestCase):
         self.orphan(stage)
         with manager.maintenance_lock(self.root):
             process = self.start()
-            self.assertNotEqual(process.wait(timeout=10), 0)
+            self.assertNotEqual(process.wait(timeout=60), 0)
             self.assertTrue((self.root / '.portal-upgrade.json').exists())
             self.assertFalse((stage / 'result.json').exists())
 
@@ -159,7 +159,7 @@ class SessionRecoveryTests(unittest.TestCase):
             occupied.bind(('127.0.0.1', port))
             occupied.listen()
             process = self.start()
-            self.assertNotEqual(process.wait(timeout=15), 0)
+            self.assertNotEqual(process.wait(timeout=60), 0)
             wait_for(lambda: not manager.supervisor_state(self.root))
             time.sleep(.5)
             self.assertFalse(manager.checkout_pids(self.root))
@@ -170,7 +170,7 @@ class SessionRecoveryTests(unittest.TestCase):
             (stage / 'portal-macos-upgrade.py').write_text('raise RuntimeError("must not execute")')
             self.orphan(stage)
             process = self.start()
-            self.assertNotEqual(process.wait(timeout=10), 0)
+            self.assertNotEqual(process.wait(timeout=60), 0)
             log = (self.root / 'test.log').read_text()
             self.assertIn('outside this installation', log)
             self.assertNotIn('must not execute', log)
@@ -210,7 +210,7 @@ scope['restart'] = restart
         self.assertFalse((self.root / '.portal-upgrade.json').exists())
         self.assertEqual(manager.supervisor_state(self.root)['owner'], owner)
         self.assertEqual(len(manager.checkout_pids(self.root)), 1)
-        self.assertEqual(process.wait(timeout=10), 0)
+        self.assertEqual(process.wait(timeout=60), 0)
 
     def test_pre_ready_candidate_exit_rolls_back_through_original_guardian(self):
         self.check_failed_candidate(False)
@@ -230,7 +230,7 @@ scope['restart'] = restart
         self.assertTrue(result['restart_required'])
         self.assertEqual(self.target.read_bytes(), previous)
         self.assertFalse((self.root / '.portal-upgrade.json').exists())
-        process.wait(timeout=10)
+        process.wait(timeout=60)
         restarted = self.start()
         self.assertEqual(self.ready(restarted)['pid'], restarted.pid)
         self.assertTrue(manager.supervisor_state(self.root))

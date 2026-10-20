@@ -1019,9 +1019,20 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_workspace(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("portal-toolhost-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir = (if cfg!(unix) { PathBuf::from("/tmp") } else { std::env::temp_dir() }).join(format!("portal-toolhost-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn test_shell_command() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["/bin/sh".to_string()]
+        }
     }
 
     fn config_with_subagent(workspace: &PathBuf, command: Option<Vec<String>>) -> PortalConfig {
@@ -1045,7 +1056,7 @@ mod tests {
         let ws = temp_workspace("available");
         // A resolvable binary stands in for pi: availability is about the
         // command resolving, not about what it is.
-        let host = ToolHost::new(&config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()])));
+        let host = ToolHost::new(&config_with_subagent(&ws, Some(test_shell_command())));
         let names = tool_names(&host);
         assert!(host.subagent.is_available());
         for expected in subagent::TOOL_NAMES {
@@ -1075,7 +1086,7 @@ mod tests {
     #[test]
     fn subagent_tools_are_hidden_when_disabled() {
         let ws = temp_workspace("disabled");
-        let mut config = config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()]));
+        let mut config = config_with_subagent(&ws, Some(test_shell_command()));
         config.subagent.enabled = false;
         let host = ToolHost::new(&config);
         assert!(!host.subagent.is_available());
@@ -1106,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_setup_is_dispatched_and_no_status_surface_leaks_the_key() {
         let ws = temp_workspace("setupdispatch");
-        let mut config = config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()]));
+        let mut config = config_with_subagent(&ws, Some(test_shell_command()));
         let path = ws.join("portal.toml");
         std::fs::write(&path, "name = \"vale\"\n").unwrap();
         config.config_path = Some(path.clone());
@@ -1142,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_and_cleanup_cover_the_subagent() {
         let ws = temp_workspace("shutdown");
-        let host = ToolHost::new(&config_with_subagent(&ws, Some(vec!["/bin/sh".to_string()])));
+        let host = ToolHost::new(&config_with_subagent(&ws, Some(test_shell_command())));
         // Neither path may hang or panic when nothing is running.
         host.cleanup_background_sessions().await;
         host.kill_all_managed_processes().await;

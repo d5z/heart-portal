@@ -8,5 +8,19 @@ linker = "x86_64-w64-mingw32-gcc"
 # A downloaded single exe must work without the Visual C++ redistributable.
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# --- Android arm64 (bionic dynamic) ---------------------------------------
+# Do NOT switch to musl static: musl static cannot reach Android's netd DNS
+# resolver, so hostnames never resolve on-device (verified 2026-10-11,
+# Redmi Note 13). API level 24 is encoded in the tool names below; the
+# Android app's minSdk (26) sits above it, so the lib is always loadable.
+# Tool names are bare on purpose: they resolve from PATH. Add
+# $NDK/toolchains/llvm/prebuilt/<host>/bin to PATH before building (CI
+# does this in one line; locally, export it or use Android Studio's NDK).
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+
 [env]
 CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"
+CC_aarch64_linux_android = "aarch64-linux-android24-clang"
+CXX_aarch64_linux_android = "aarch64-linux-android24-clang++"
+AR_aarch64_linux_android = "llvm-ar"

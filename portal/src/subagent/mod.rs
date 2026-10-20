@@ -2508,11 +2508,23 @@ fn head(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+fn test_shell_command() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["/bin/sh".to_string()]
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_workspace(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("portal-sub-{tag}-{}", uuid::Uuid::new_v4()));
+        let dir = (if cfg!(unix) { PathBuf::from("/tmp") } else { std::env::temp_dir() }).join(format!("portal-sub-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("proj")).unwrap();
         dir
     }
@@ -2534,7 +2546,7 @@ mod tests {
     /// whatever `*_API_KEY` this developer machine has exported.
     fn unconfigured_manager(workspace: &Path) -> Arc<SubagentManager> {
         manager_for(workspace, |c| {
-            c.command = Some(vec!["/bin/sh".to_string()]);
+            c.command = Some(test_shell_command());
             c.model = SubagentModelConfig::default();
             c.env_passthrough = vec!["PATH".to_string(), "HOME".to_string()];
         })
@@ -2665,7 +2677,7 @@ mod tests {
         let mut config = PortalConfig::load(path.to_str().unwrap()).unwrap();
         config.security.workspace_root = ws.clone();
         config.subagent.state_dir = Some(ws.join("state").display().to_string());
-        config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        config.subagent.command = Some(test_shell_command());
         config.subagent.env_passthrough = vec![];
         let m = SubagentManager::new(&config, HeartCallback::new());
         assert!(m.needs_setup());
@@ -2830,7 +2842,7 @@ mod tests {
         let proj = m.resolve_workdir(Some("proj")).unwrap();
         assert_eq!(proj, ws.join("proj").canonicalize().unwrap());
 
-        let err = m.resolve_workdir(Some("/etc")).unwrap_err().to_string();
+        let err = m.resolve_workdir(Some(&std::env::temp_dir().display().to_string())).unwrap_err().to_string();
         assert!(err.contains("outside the workspace root"), "{err}");
         assert!(m.resolve_workdir(Some("does/not/exist")).is_err());
         let _ = std::fs::remove_dir_all(ws);
@@ -2876,7 +2888,7 @@ mod tests {
         assert!(err.contains("does not exist"), "{err}");
 
         // With pi present nothing is installed and nothing is refused.
-        let ready = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let ready = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         assert!(ready.setup_offered());
         assert_eq!(ready.ensure_pi_installed().await.unwrap(), false);
         let _ = std::fs::remove_dir_all(ws);
@@ -2887,7 +2899,7 @@ mod tests {
         let ws = temp_workspace("disabled");
         let m = manager_for(&ws, |c| {
             c.enabled = false;
-            c.command = Some(vec!["/bin/sh".to_string()]);
+            c.command = Some(test_shell_command());
         });
         assert!(!m.is_available());
         let err = m.ensure_available().unwrap_err().to_string();
@@ -2898,7 +2910,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_validates_the_brief_before_touching_pi() {
         let ws = temp_workspace("brief");
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
 
         let base = SpawnRequest {
             brief: "   ".to_string(),
@@ -2924,7 +2936,7 @@ mod tests {
 
         let mut bad_dir = base;
         bad_dir.brief = "do it".to_string();
-        bad_dir.workdir = Some("/etc".to_string());
+        bad_dir.workdir = Some(std::env::temp_dir().display().to_string());
         let err = m.spawn(bad_dir).await.unwrap_err().to_string();
         assert!(err.contains("outside the workspace root"), "{err}");
         let _ = std::fs::remove_dir_all(ws);
@@ -2933,7 +2945,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_availability_without_a_daemon() {
         let ws = temp_workspace("status");
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         let status = m.status(None, None).await.unwrap();
 
         assert_eq!(status["enabled"], true);
@@ -2953,7 +2965,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_task_ids_are_rejected_by_every_control_path() {
         let ws = temp_workspace("unknown");
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         assert!(m.status(Some("sub_nope"), None).await.is_err());
         assert!(m.log("sub_nope", 0, 1024, 0).await.is_err());
         assert!(m.cancel("sub_nope").await.is_err());
@@ -2973,7 +2985,7 @@ mod tests {
         ledger.start_task("sub_orphan", "scene-42", "Refactor auth", &ws.display().to_string(), None);
         ledger.save().unwrap();
 
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         m.reconcile().await;
 
         let reloaded = Ledger::load(state_dir.join("ledger.json"));
@@ -2990,7 +3002,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_without_a_daemon_is_harmless() {
         let ws = temp_workspace("shutdown");
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         m.shutdown().await;
         m.cleanup().await;
         assert!(!m.status_summary().await["daemon"]["running"]
@@ -3002,7 +3014,7 @@ mod tests {
     #[tokio::test]
     async fn callback_payload_has_the_documented_subagent_shape() {
         let ws = temp_workspace("payload");
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         let task = Arc::new(TaskState {
             task_id: "sub_3f9c".to_string(),
             session_key: "scene-42".to_string(),
@@ -3073,7 +3085,7 @@ mod tests {
     #[tokio::test]
     async fn callback_payload_respects_the_wire_cap() {
         let ws = temp_workspace("cap");
-        let m = manager_for(&ws, |c| c.command = Some(vec!["/bin/sh".to_string()]));
+        let m = manager_for(&ws, |c| c.command = Some(test_shell_command()));
         let task = Arc::new(TaskState {
             task_id: "sub_big".to_string(),
             session_key: "k".to_string(),
@@ -3469,7 +3481,7 @@ mod flow_tests {
         let mut config = PortalConfig::default();
         config.security.workspace_root = workspace.clone();
         config.subagent.state_dir = Some(state_dir.display().to_string());
-        config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        config.subagent.command = Some(test_shell_command());
         // The fake daemon is "logged in": skip first-use setup guidance.
         config.subagent.model.provider = Some("anthropic".to_string());
         // Somewhere for portal_subagent_setup to write.
@@ -4106,7 +4118,7 @@ mod flow_tests {
         let mut config = PortalConfig::default();
         config.security.workspace_root = workspace.clone();
         config.subagent.state_dir = Some(state_dir.display().to_string());
-        config.subagent.command = Some(vec!["/bin/sh".to_string()]);
+        config.subagent.command = Some(test_shell_command());
         config.subagent.max_concurrent = 1;
         config.subagent.model.provider = Some("anthropic".to_string());
         let manager = SubagentManager::new(&config, callback);

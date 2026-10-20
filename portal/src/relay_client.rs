@@ -24,6 +24,7 @@ use crate::tools::ToolHost;
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 /// If no relay frame is received within this window, reconnect (D-077).
 const HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+const SCHEDULING_GAP_MULTIPLIER: u32 = 3;
 
 #[derive(Deserialize)]
 struct HandshakeResponse {
@@ -228,7 +229,13 @@ async fn run_one_session(
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(15))
             .with_interval(Duration::from_secs(5));
-        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+        // TCP_KEEPCNT (retries) is not exposed by socket2 0.5.x on windows targets;
+        // OS default probe count applies (Linux/Android 9, Win10 10). 15s idle + 5s interval via with_time/with_interval.
+        #[allow(unused_mut)]
+        let keepalive = keepalive;
+        if let Err(error) = sock_ref.set_tcp_keepalive(&keepalive) {
+            warn!("relay TCP keepalive configuration failed: {error}");
+        }
         let _ = sock_ref.set_nodelay(true);
         let (ws, _) = tokio::time::timeout(
             Duration::from_secs(15),
@@ -266,6 +273,7 @@ async fn run_one_session(
     }
     let supports_text_keepalive =
         handshake_resp.relay_keepalive.as_deref() == Some("text-v1");
+    let keepalive_mode = if supports_text_keepalive { "text-v1" } else { "websocket-ping" };
 
     info!("Portal relay handshake OK — starting MCP server on WebSocket bridge");
     tool_host.set_connection_state(crate::tools::status::ConnectionState::Connected);
@@ -340,15 +348,26 @@ async fn run_one_session(
         let mut interval =
             tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let session_started = Instant::now();
+        let mut previous_tick = Instant::now();
         loop {
             interval.tick().await;
+            let now = Instant::now();
+            let tick_gap = now.saturating_duration_since(previous_tick);
+            previous_tick = now;
+            if scheduling_gap_detected(tick_gap) {
+                warn!(gap_secs = tick_gap.as_secs_f64(), "relay liveness scheduling gap detected");
+                anyhow::bail!("relay liveness scheduling gap detected");
+            }
             {
                 let last_seen = *last_seen_hb.lock().await;
-                if Instant::now().saturating_duration_since(last_seen)
+                let inbound_age = now.saturating_duration_since(last_seen);
+                if inbound_age
                     > Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)
                 {
                     // Closing can itself block behind a congested writer. The
                     // session owner drops the socket when this future returns.
+                    warn!(session_age_secs = session_started.elapsed().as_secs(), last_inbound_secs = inbound_age.as_secs(), keepalive_mode, "relay heartbeat response timeout");
                     anyhow::bail!(
                         "no relay heartbeat response within {}s (D-077)",
                         HEARTBEAT_TIMEOUT_SECS
@@ -376,6 +395,10 @@ async fn run_one_session(
         _ = ws_to_bridge => anyhow::bail!("relay receive bridge closed"),
         _ = bridge_to_ws => anyhow::bail!("relay send bridge closed"),
     }
+}
+
+fn scheduling_gap_detected(gap: Duration) -> bool {
+    gap > Duration::from_secs(HEARTBEAT_INTERVAL_SECS * SCHEDULING_GAP_MULTIPLIER as u64)
 }
 
 #[cfg(test)]
@@ -477,6 +500,12 @@ mod tests {
         assert_eq!(next_backoff(Duration::from_secs(2)), Duration::from_secs(4));
         assert_eq!(next_backoff(Duration::from_secs(16)), Duration::from_secs(30));
         assert_eq!(next_backoff(Duration::from_secs(30)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn scheduling_gap_requires_more_than_three_heartbeat_intervals() {
+        assert!(!scheduling_gap_detected(Duration::from_secs(45)));
+        assert!(scheduling_gap_detected(Duration::from_secs(46)));
     }
 
     #[test]
