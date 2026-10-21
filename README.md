@@ -1,5 +1,8 @@
 [3897 chars] # Heart Portal
 
+Android APK integration on the `android-portal` branch: see
+[embedded host and native tool bridge](docs/android-embedded-host.md).
+
 **Being's hands in the world.** Portal gives beings the ability to execute commands, read/write files, search the web, and manage a workspace on your machine.
 
 Portal runs on **your computer** and connects to your being via secure WebSocket relay. Your being's memory and identity stay safe on Origin Hearth — Portal only provides physical capabilities.

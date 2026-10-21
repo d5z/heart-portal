@@ -209,6 +209,24 @@ pub(crate) fn configure_shell_command(
     // These describe the supervised Portal, not arbitrary commands it launches.
     cmd.env_remove("HEART_PORTAL_SUPERVISED")
         .env_remove("PORTAL_CONNECT_LINK");
+    #[cfg(target_os = "android")]
+    {
+        cmd.env_remove("PORTAL_MCP_TOKEN")
+            .env_remove("HEART_ANDROID_TOKEN")
+            .env_remove("HEART_ANDROID_PORT")
+            .env_remove("HEART_PORTAL_READY_NONCE")
+            .env_remove("HEART_PORTAL_READY_FILE")
+            .kill_on_drop(true);
+        let parent = unsafe { libc::getpid() };
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 || libc::getppid() != parent {
+                    return Err(std::io::Error::other("Android Portal parent exited"));
+                }
+                Ok(())
+            });
+        }
+    }
 
     if std::env::var_os("HOME").is_none() {
         let home = std::env::var("HOME").ok().unwrap_or_else(|| {

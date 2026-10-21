@@ -263,6 +263,8 @@ impl ToolHost {
     /// List all available tools (built-in + custom)
     pub async fn list_tools(&self) -> Vec<ToolInfo> {
         let mut tools = self.list_builtin_tools();
+        #[cfg(target_os = "android")]
+        tools.extend(crate::android_tools::list().await);
         let custom = self.custom.list_tools().await;
         let kit_tools = self.kits.list_healthy_tools().await;
         let external: Vec<_> = custom.into_iter().chain(kit_tools).collect();
@@ -517,18 +519,24 @@ impl ToolHost {
             });
         }
 
-        tools.push(ToolInfo {
-            name: "portal_oauth_authorize".to_string(),
-            description: "Start OAuth Authorization Code + PKCE flow. Opens browser for user authorization and returns tokens.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "provider": { "type": "string", "enum": ["openai"], "description": "OAuth provider" },
-                    "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120)", "default": 120 }
-                },
-                "required": ["provider"]
-            }),
-        });
+        #[cfg(target_os = "android")]
+        let external_runtime_available = !crate::android_tools::configured();
+        #[cfg(not(target_os = "android"))]
+        let external_runtime_available = true;
+        if external_runtime_available {
+            tools.push(ToolInfo {
+                name: "portal_oauth_authorize".to_string(),
+                description: "Start OAuth Authorization Code + PKCE flow. Opens browser for user authorization and returns tokens.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string", "enum": ["openai"], "description": "OAuth provider" },
+                        "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120)", "default": 120 }
+                    },
+                    "required": ["provider"]
+                }),
+            });
+        }
 
         #[cfg(target_os = "macos")]
         tools.push(ToolInfo {
@@ -537,16 +545,18 @@ impl ToolHost {
             input_schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
         });
 
-        // Always include tools_reload
-        tools.push(ToolInfo {
-            name: "portal_tools_reload".to_string(),
-            description: "Reload custom tools from workspace/tools/mcp.toml. Kit changes use portal_kits_reload. Connected clients are notified; Portal stays running.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        });
+        // Embedded APK hosts do not offer a disabled custom runtime reload.
+        if external_runtime_available {
+            tools.push(ToolInfo {
+                name: "portal_tools_reload".to_string(),
+                description: "Reload custom tools from workspace/tools/mcp.toml. Kit changes use portal_kits_reload. Connected clients are notified; Portal stays running.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            });
+        }
 
         if self.restart_supported {
             tools.push(ToolInfo {
@@ -601,6 +611,25 @@ impl ToolHost {
 
     /// Execute a tool call (built-in or custom)
     pub async fn call(&self, tool_name: &str, arguments: Value) -> Result<Value> {
+        #[cfg(target_os = "android")]
+        if tool_name.starts_with("portal_android_") {
+            return crate::android_tools::call(tool_name, arguments).await;
+        }
+        // Listing is discovery, not authorization: reject direct calls as well.
+        if matches!(tool_name, "portal_file_read" | "portal_file_write" | "portal_file_list" | "portal_file_edit") {
+            anyhow::ensure!(self.config.tools.file, "File tools are disabled in configuration");
+        }
+        if tool_name == "portal_search" {
+            anyhow::ensure!(self.config.tools.search, "Search is disabled in configuration");
+        }
+        if tool_name == "portal_web_fetch" {
+            anyhow::ensure!(self.config.tools.web_fetch, "Web fetch is disabled in configuration");
+        }
+        #[cfg(target_os = "android")]
+        if crate::android_tools::configured() {
+            anyhow::ensure!(!matches!(tool_name, "portal_oauth_authorize" | "portal_tools_reload"),
+                "This tool is unavailable in the embedded Android host");
+        }
         // Reserve the diagnostic endpoint: an installed server must not replace
         // a read-only status query with an arbitrary custom or kit operation.
         if tool_name == "portal_status" {
@@ -1049,6 +1078,24 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn disabled_file_search_and_web_tools_reject_stale_direct_calls() {
+        let ws = temp_workspace("disabled-direct-calls");
+        let mut config = config_with_subagent(&ws, None);
+        config.subagent.enabled = false;
+        config.tools.file = false;
+        config.tools.search = false;
+        config.tools.web_fetch = false;
+        let host = ToolHost::new(&config);
+        for name in ["portal_file_read", "portal_file_write", "portal_file_list", "portal_file_edit", "portal_search", "portal_web_fetch"] {
+            assert!(!tool_names(&host).contains(&name.to_owned()));
+            let error = host.call(name, serde_json::json!({"path":"must-not-exist", "content":"blocked"})).await.unwrap_err();
+            assert!(error.to_string().contains("disabled"), "{name}: {error}");
+        }
+        assert!(!ws.join("must-not-exist").exists());
+        let _ = std::fs::remove_dir_all(ws);
     }
 
     #[test]

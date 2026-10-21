@@ -107,7 +107,7 @@ pub async fn connect_and_serve(
         Ok(x) => x,
         Err(e) => {
             tool_host.set_connection_state(crate::tools::status::ConnectionState::Invalid);
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "android"))]
             crate::connection_status::publish("invalid");
             warn!("invalid Loom link: {e:#}");
             return;
@@ -122,7 +122,7 @@ pub async fn connect_and_serve(
     let mut backoff = Duration::from_secs(BACKOFF_MIN_SECS);
     loop {
         tool_host.set_connection_state(crate::tools::status::ConnectionState::Connecting);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "android"))]
         crate::connection_status::publish("connecting");
         let session_start = Instant::now();
         match run_one_session(&relay_url, &being_id, &token, tool_host, portal_name).await {
@@ -152,7 +152,7 @@ pub async fn connect_and_serve(
             }
         }
         tool_host.set_connection_state(crate::tools::status::ConnectionState::Retrying);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "android"))]
         crate::connection_status::publish("retrying");
         tokio::time::sleep(Duration::from_millis(backoff_sleep_ms(backoff, jitter_ratio())))
             .await;
@@ -277,7 +277,7 @@ async fn run_one_session(
 
     info!("Portal relay handshake OK — starting MCP server on WebSocket bridge");
     tool_host.set_connection_state(crate::tools::status::ConnectionState::Connected);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     crate::connection_status::publish("connected");
 
     let (portal_stream, bridge_stream) = tokio::io::duplex(65536);

@@ -6,8 +6,12 @@
 
 mod bounded_file;
 mod config;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 mod connection_status;
+#[cfg(target_os = "android")]
+mod android_host;
+#[cfg(target_os = "android")]
+mod android_tools;
 mod exec_policy;
 mod heart_callback;
 mod kits;
@@ -142,6 +146,8 @@ enum KitCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "android")]
+    let _android_host = android_host::attach()?;
     #[cfg(any(windows, target_os = "macos"))]
     {
         // Older updaters execute the staged candidate with --version before
