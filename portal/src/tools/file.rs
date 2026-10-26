@@ -202,6 +202,53 @@ pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Resul
     Ok(cur)
 }
 
+fn authorize_write(config: &PortalConfig, path: &Path) -> Result<()> {
+    use crate::config::PermissionMode;
+    if config.security.permission_mode == PermissionMode::FullAccess { return Ok(()); }
+    anyhow::ensure!(config.security.permission_mode != PermissionMode::ReadOnly, "Read-only permission mode");
+    let root = canonical_workspace_root(config)?;
+    let relative = path.strip_prefix(&root)?;
+    for part in relative.components() {
+        let raw = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+        let name = raw.trim_end_matches(['.', ' ']);
+        anyhow::ensure!(!name.contains(':') && !matches!(name, ".git" | ".codex" | ".agents" | ".ssh" | ".portal-client.json" | "connection.json" | "portal.toml" | "desktop-portal.toml" | "mcp.toml") && !name.starts_with(".env"),
+            "Protected configuration cannot be changed in supervised mode");
+    }
+    if let Some(config_path) = &config.config_path {
+        let canonical = config_path.canonicalize()?;
+        anyhow::ensure!(path != canonical, "Cannot change active Portal configuration in supervised mode");
+    }
+    Ok(())
+}
+
+// Append mutates the existing file object; canonical paths do not reveal other
+// hard links to protected configuration or files outside the workspace. Inspect
+// the actual opened handle before writing, rather than performing another lookup.
+async fn authorize_append(config: &PortalConfig, file: &tokio::fs::File) -> Result<()> {
+    if config.security.permission_mode == crate::config::PermissionMode::FullAccess {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().await?.nlink()
+    };
+    #[cfg(windows)]
+    let links = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        info.nNumberOfLinks as u64
+    };
+    #[cfg(not(any(unix, windows)))]
+    let links = 0;
+    anyhow::ensure!(links == 1, "Cannot append to a hard-linked file in supervised mode");
+    Ok(())
+}
+
 /// Convert literal backslash escape sequences to their byte values.
 /// Compensates for upstream DSL parsers that consume backslashes during JSON serialization.
 pub(crate) fn unescape_backslash_sequences(input: &str) -> String {
@@ -430,6 +477,7 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
     }
 
     let path = resolve_write_path(config, path_str)?;
+    authorize_write(config, &path)?;
     let lock = mutation_lock(&path);
     let _guard = lock.lock().await;
     if arguments.get("expected_sha256").is_some() {
@@ -460,6 +508,7 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
             .open(&path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to open {} for append: {}", path.display(), e))?;
+        authorize_append(config, &file).await?;
         file.write_all(&bytes)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
@@ -539,6 +588,7 @@ pub async fn edit(config: &PortalConfig, arguments: Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
     let path = resolve_existing_path(config, path_str)?;
+    authorize_write(config, &path)?;
     let lock = mutation_lock(&path);
     let _guard = lock.lock().await;
     let bytes = bounded_bytes(&path, config.security.max_file_size).await?;

@@ -11,6 +11,7 @@ mod permissions;
 mod process;
 mod screenshot;
 mod search;
+mod security;
 pub(crate) mod status;
 mod subagent;
 pub(crate) mod text;
@@ -116,6 +117,7 @@ impl ToolHost {
     }
 
     pub fn with_client_handler(mut self, handler: Arc<dyn client::ClientHandler>) -> Self {
+        self.subagent.set_approval_handler(handler.clone());
         self.client_handler = handler;
         self
     }
@@ -637,6 +639,26 @@ impl ToolHost {
         arguments: Value,
         scene_id: Option<&str>,
     ) -> Result<Value> {
+        let decision = security::decide(self.config.security.permission_mode, tool_name);
+        info!(tool = tool_name, decision = ?decision, "tool authorization");
+        match decision {
+            security::Decision::Allow => {},
+            security::Decision::Deny => anyhow::bail!("Tool denied by permission mode; change permissions in Desktop settings if intended"),
+            security::Decision::Ask => {
+                let sandboxed_shell = tool_name == "portal_exec" && cfg!(windows)
+                    && !arguments.get("command").and_then(Value::as_str)
+                        .is_some_and(|command| command.trim_start().starts_with('@'));
+                let request = serde_json::json!({"tool": tool_name, "arguments": &arguments,
+                    "workspace": self.config.security.workspace_root,
+                    "isolation": if sandboxed_shell { "windows-lpac-offline" } else { "host-tool" }});
+                let request = serde_json::to_string(&request)?;
+                anyhow::ensure!(request.len() <= 16000, "Approval request too large; split the operation");
+                let approved = self.client_handler.handle_client_command("security-approve", &request, scene_id).await;
+                let allowed = approved.as_ref().is_ok_and(|answer| answer == "allow-once");
+                info!(tool = tool_name, allowed, "tool approval resolved");
+                anyhow::ensure!(allowed, "Tool approval denied, expired, or Desktop unavailable");
+            }
+        }
         // Reserve the diagnostic endpoint: an installed server must not replace
         // a read-only status query with an arbitrary custom or kit operation.
         if tool_name == "portal_status" {
@@ -678,6 +700,7 @@ impl ToolHost {
                         .split_once(char::is_whitespace)
                         .unwrap_or((command, ""));
                     anyhow::ensure!(!verb.is_empty(), "Missing client command after @");
+                    anyhow::ensure!(verb != "security-approve", "Reserved client command");
                     let text = self
                         .client_handler
                         .handle_client_command(verb, args.trim(), scene_id)

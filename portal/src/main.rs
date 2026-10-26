@@ -11,6 +11,9 @@ mod logging;
 mod config;
 mod connection_status;
 mod exec_policy;
+mod sandbox;
+#[cfg(windows)]
+mod windows_sandbox;
 mod heart_callback;
 mod kits;
 #[cfg(target_os = "macos")]
@@ -95,10 +98,16 @@ struct Cli {
     /// Override the config file's kits setting for managed desktop runs.
     #[arg(long, hide = true)]
     kits_enabled: Option<bool>,
+    /// Application tool authorization policy (separate from OS sandboxing).
+    #[arg(long, value_enum)]
+    permission_mode: Option<config::PermissionMode>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    SandboxRun { payload: String },
     /// Install and configure the subagent from a bounded JSON object on stdin.
     SubagentSetup,
     /// Inspect configuration paths or copy legacy configuration into the user directory
@@ -175,6 +184,13 @@ async fn main() -> Result<()> {
     }
     let runtime_started = std::time::Instant::now();
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Some(Commands::SandboxRun { payload }) = &cli.command {
+        match windows_sandbox::run_payload(payload) {
+            Ok(code) => std::process::exit(code as i32),
+            Err(error) => { eprintln!("Windows sandbox failed (no fallback): {error:#}"); std::process::exit(126); }
+        }
+    }
     if std::env::var_os("HEART_PORTAL_EXTERNAL_TOOL").is_some() {
         // Prevent accidental recursive host administration from managed MCP
         // processes. This inherited marker is not a hostile-code security check.
@@ -413,6 +429,9 @@ async fn main() -> Result<()> {
     };
     if let Some(enabled) = cli.exec_enabled {
         config.tools.exec = enabled;
+    }
+    if let Some(mode) = cli.permission_mode {
+        config.security.permission_mode = mode;
     }
     if let Some(enabled) = cli.kits_enabled {
         config.kits_enabled = enabled;

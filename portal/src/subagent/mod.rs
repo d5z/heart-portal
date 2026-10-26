@@ -23,6 +23,7 @@ pub mod pi_client;
 pub mod pi_daemon;
 pub mod protocol;
 pub mod transcript;
+mod tool_bridge;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -423,6 +424,8 @@ struct TaskOutcome {
 // ── manager ─────────────────────────────────────────────────────────
 
 pub struct SubagentManager {
+    portal_config: PortalConfig,
+    approval_handler: StdMutex<Arc<dyn crate::tools::client::ClientHandler>>,
     /// Everything but `[subagent.model]`, which lives in `model` because the
     /// being can change it at runtime through `portal_subagent_setup`.
     config: SubagentConfig,
@@ -477,6 +480,9 @@ impl Drop for SpawnGuard {
 }
 
 impl SubagentManager {
+    pub fn set_approval_handler(&self, handler: Arc<dyn crate::tools::client::ClientHandler>) {
+        *self.approval_handler.lock().unwrap_or_else(|e| e.into_inner()) = handler;
+    }
     /// Build the manager. Never fails: a missing pi binary makes the sub-agent
     /// unavailable, which is reported through `portal_status`, not a crash.
     pub fn new(config: &PortalConfig, callback: HeartCallback) -> Arc<Self> {
@@ -520,6 +526,8 @@ impl SubagentManager {
         let max_concurrent = sub.max_concurrent.max(1);
 
         Arc::new(Self {
+            portal_config: config.clone(),
+            approval_handler: StdMutex::new(Arc::new(crate::tools::client::NoClientHandler)),
             model: StdMutex::new(sub.model.clone()),
             config_path: config.config_path.clone(),
             config: sub,
@@ -860,6 +868,14 @@ impl SubagentManager {
     async fn transport(self: &Arc<Self>) -> Result<Transport> {
         self.ensure_available()?;
         self.prepare_custom_model()?;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            anyhow::bail!("Portal is shutting down; no new subagent task can start");
+        }
+        // Restricted runs use a task-private broker; never adopt an older daemon
+        // that may still have unmediated built-in tools or third-party extensions.
+        if self.portal_config.security.permission_mode != crate::config::PermissionMode::FullAccess {
+            return Ok(Transport::Stdio);
+        }
         // `ensure_transport` would start a fresh pi daemon; during shutdown
         // that resurrects the very process we are tearing down (and outlives
         // us).
@@ -1485,7 +1501,16 @@ impl SubagentManager {
         };
 
         let daemon = self.daemon();
-        let mut handle = tokio::spawn(async move { daemon.run_stdio_task(spec).await });
+        let config = self.portal_config.clone();
+        let handler = self.approval_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let scene = task.scene_id.clone();
+        let mut handle = tokio::spawn(async move {
+            if config.security.permission_mode == crate::config::PermissionMode::FullAccess {
+                return daemon.run_stdio_task(spec).await;
+            }
+            let bridge = tool_bridge::ToolBridge::start(config, handler, scene, daemon.agent_dir().join("portal-tools")).await?;
+            daemon.run_stdio_task_with_bridge(spec, Some(&bridge)).await
+        });
 
         // There is no socket to abort over: cancelling a stdio task means
         // dropping the run, which kills pi (`kill_on_drop`).
@@ -2597,6 +2622,54 @@ mod tests {
         config.subagent.auto_install = false;
         tweak(&mut config.subagent);
         SubagentManager::new(&config, HeartCallback::new())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stdio_subagent_keeps_native_tools_only_in_full_access() {
+        use crate::config::PermissionMode;
+        for mode in [PermissionMode::FullAccess, PermissionMode::Supervised, PermissionMode::ReadOnly] {
+            let workspace = temp_workspace("stdio-policy");
+            let script = workspace.join("fake-pi.ps1");
+            std::fs::write(&script, r###"
+$record = @{ args = @($args); broker = [bool]$env:PORTAL_TOOL_TOKEN }
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'launch.json'), (ConvertTo-Json -InputObject $record -Compress))
+Write-Output '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"## Result\nDone"}],"stopReason":"stop"}}'
+Write-Output '{"type":"agent_end","messages":[]}'
+"###).unwrap();
+            let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+            let mut config = PortalConfig::default();
+            config.security.workspace_root = workspace.clone();
+            config.security.permission_mode = mode;
+            config.subagent.auto_install = false;
+            config.subagent.state_dir = Some(workspace.join("state").display().to_string());
+            config.subagent.command = Some(vec![powershell.display().to_string(), "-NoProfile".into(),
+                "-NonInteractive".into(), "-File".into(), script.display().to_string()]);
+            config.subagent.model.provider = Some("openai".into());
+            config.subagent.model.api_key = Some("test-key".into());
+            config.prepare_workspace().unwrap();
+            let manager = SubagentManager::new(&config, HeartCallback::new());
+            let request = SpawnRequest { brief: "Check launch policy".into(), session: "policy-test".into(),
+                workdir: None, budget: manager.default_budget(), model: None, thinking: None, scene_id: None };
+            // Exercise the per-task fallback directly; the fake process does not
+            // implement the independent long-lived daemon/RPC protocol.
+            let (session, _) = manager.ensure_session(&Transport::Stdio, &request.session, &workspace, &request).await.unwrap();
+            let task = manager.register_task("policy-task".into(), &request.session, &request.brief, &workspace, &request).await;
+            let run = time::timeout(Duration::from_secs(20), manager.clone().run_task_stdio(
+                session, task.clone(), request.brief.clone(), manager.model_choice(&request))).await;
+            let status = task.inner.lock().await.status;
+            manager.shutdown().await;
+            let launch: Value = serde_json::from_slice(&std::fs::read(workspace.join("launch.json")).unwrap()).unwrap();
+            std::fs::remove_dir_all(workspace).unwrap();
+            run.unwrap();
+            assert_eq!(status, TaskStatus::Done);
+            let restricted = mode != PermissionMode::FullAccess;
+            assert_eq!(launch["broker"], restricted);
+            for flag in ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"] {
+                assert_eq!(launch["args"].as_array().unwrap().iter().any(|arg| arg == flag), restricted, "{mode:?}: {flag}");
+            }
+        }
     }
 
     /// A manager with nothing telling pi which LLM to use, independent of

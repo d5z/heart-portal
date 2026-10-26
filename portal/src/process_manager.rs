@@ -1,7 +1,7 @@
 //! Background process manager for portal_exec (background) + portal_process tools.
 
 use crate::config::PortalConfig;
-use crate::exec_policy::{configure_shell_command, validate_exec_allowlist, ExecShell};
+use crate::exec_policy::{validate_exec_allowlist, ExecShell};
 use crate::heart_callback::{
     build_callback_payload, CallbackTask, HeartCallback, CALLBACK_OUTPUT_MAX_BYTES,
 };
@@ -340,19 +340,16 @@ impl ProcessManager {
         let status = Arc::new(AsyncMutex::new(ProcessStatus::Running));
         let notify = Arc::new(Notify::new());
 
-        let mut cmd = Command::new(shell.program());
+        let mut cmd = crate::sandbox::shell_command(config, command, workdir, shell)?;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        configure_shell_command(&mut cmd, command, config, workdir, shell);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn: {}", e))?;
+        let (mut child, process_owner) = crate::mcp::ProcessOwner::spawn_exec(&mut cmd)?;
         let pid = child.id().unwrap_or_else(|| {
             tracing::warn!("Failed to get child process ID");
             0
@@ -408,7 +405,11 @@ impl ProcessManager {
         let killed_wait = Arc::clone(&killed);
         let callback_output_encoding = output_encoding;
         tokio::spawn(async move {
+            #[cfg(unix)]
+            { let _ = process_owner.wait_unreaped().await; process_owner.terminate(); }
             let wait_status = child.wait().await.ok();
+            #[cfg(windows)]
+            process_owner.terminate();
             let killed = killed_wait.load(Ordering::SeqCst);
             let code = session_exit_code(wait_status.as_ref(), killed);
             let now = tokio::time::Instant::now();

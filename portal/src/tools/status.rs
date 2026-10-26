@@ -85,6 +85,10 @@ impl RuntimeStatus {
 
     #[cfg(test)]
     pub(super) fn for_test(config: &PortalConfig) -> Self {
+        Self::for_bridge(config)
+    }
+
+    pub(crate) fn for_bridge(config: &PortalConfig) -> Self {
         Self {
             name: config.name.clone(),
             config_location: ConfigLocation {
@@ -224,6 +228,16 @@ impl ToolHost {
                     "environment": "runtime-allowlist-plus-explicit-kit-credentials",
                     "malicious_code_sandbox": false,
                 },
+            },
+            "authorization": {
+                "permission_mode": format!("{:?}", config.security.permission_mode),
+                "os_sandbox": cfg!(windows) && config.security.permission_mode != crate::config::PermissionMode::FullAccess,
+                "command_backend": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "host" }
+                    else if config.security.permission_mode == crate::config::PermissionMode::ReadOnly { "disabled" }
+                    else if cfg!(windows) { "windows-lpac" } else { "unavailable" },
+                "command_network": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "host-policy" } else { "denied" },
+                "subagent_tools": "portal-broker-in-restricted-mode",
+                "approval_scope": "single-call",
             },
             "tools": {
                 "exec": config.tools.exec,

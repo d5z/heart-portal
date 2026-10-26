@@ -78,6 +78,8 @@ struct RawConfig {
 #[derive(Debug, Deserialize)]
 struct RawSecurityConfig {
     #[serde(default)]
+    permission_mode: PermissionMode,
+    #[serde(default)]
     expose_host_details: bool,
     #[serde(default)]
     exec_allowlist: Option<Vec<String>>,
@@ -459,8 +461,19 @@ pub struct ToolsConfig {
     ignored_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
+/// Standalone legacy configs retain their behavior; Desktop explicitly selects supervised.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionMode {
+    ReadOnly,
+    Supervised,
+    #[default]
+    FullAccess,
+}
+
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
+    pub permission_mode: PermissionMode,
     /// Local administrator opt-in for host paths/PID in portal_status.
     pub expose_host_details: bool,
     pub exec_allowlist: Vec<String>,
@@ -504,6 +517,7 @@ impl Default for ToolsConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            permission_mode: PermissionMode::default(),
             expose_host_details: false,
             exec_allowlist: vec![],
             workspace_root: default_workspace_root(),
@@ -543,6 +557,7 @@ impl PortalConfig {
         let workspace = crate::paths::resolve_relative(&workspace, std::path::Path::new(path))?;
 
         let security = SecurityConfig {
+            permission_mode: raw.security.as_ref().map(|s| s.permission_mode).unwrap_or_default(),
             expose_host_details: raw.security.as_ref().is_some_and(|s| s.expose_host_details),
             exec_allowlist: raw
                 .security

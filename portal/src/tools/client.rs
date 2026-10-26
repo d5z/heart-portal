@@ -51,7 +51,7 @@ impl ClientHandler for DesktopClientHandler {
                 .context("Missing client token")?;
             let response = reqwest::Client::builder()
                 .no_proxy().redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(10)).build()?
+                .timeout(std::time::Duration::from_secs(if verb == "security-approve" { 125 } else { 10 })).build()?
                 .post(format!("http://127.0.0.1:{port}/command"))
                 .bearer_auth(token)
                 .json(&serde_json::json!({"verb": verb, "args": args, "sceneId": scene_id, "endpoint": self.endpoint}))

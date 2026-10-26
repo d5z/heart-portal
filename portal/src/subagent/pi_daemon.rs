@@ -623,6 +623,10 @@ impl PiDaemon {
     /// future kills pi. The only deadline enforced here is `task.timeout` —
     /// turn and token budgets have no CLI equivalent.
     pub async fn run_stdio_task(&self, task: StdioTask) -> Result<StdioRun> {
+        self.run_stdio_task_with_bridge(task, None).await
+    }
+
+    pub(super) async fn run_stdio_task_with_bridge(&self, task: StdioTask, bridge: Option<&super::tool_bridge::ToolBridge>) -> Result<StdioRun> {
         let argv = &self.config.command;
         if argv.is_empty() {
             anyhow::bail!("no pi command configured; set [subagent].command in portal.toml");
@@ -632,6 +636,10 @@ impl PiDaemon {
         let mut cmd = TokioCommand::new(&argv[0]);
         cmd.args(&argv[1..]);
         cmd.args(["--print", "--mode", "json"]);
+        if let Some(bridge) = bridge {
+            cmd.args(["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"])
+                .arg(&bridge.extension);
+        }
         if let Some(provider) = task.provider.as_deref() {
             cmd.args(["--provider", provider]);
         }
@@ -650,6 +658,9 @@ impl PiDaemon {
 
         cmd.env_clear();
         cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key)));
+        if let Some(bridge) = bridge {
+            cmd.env("PORTAL_TOOL_PORT", bridge.port.to_string()).env("PORTAL_TOOL_TOKEN", &bridge.token);
+        }
         cmd.env("PI_CODING_AGENT_DIR", self.agent_dir())
             .env("PORTAL_SUBAGENT_API_KEY", task.api_key.as_deref().or(self.config.api_key.as_deref()).unwrap_or("portal-keyless"))
             .env("PRIME_AGENT_CODING_AGENT_DIR", self.agent_dir())
@@ -661,8 +672,7 @@ impl PiDaemon {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
+        let (mut child, owner) = crate::mcp::ProcessOwner::spawn_exec(&mut cmd)
             .with_context(|| format!("spawning a pi task: {}", argv.join(" ")))?;
         let stdout = child
             .stdout
@@ -682,7 +692,11 @@ impl PiDaemon {
         let stdout_reader = tokio::spawn(fold_stdout(stdout, task.transcript.clone()));
         let stderr_reader = tokio::spawn(read_stderr_tail(stderr, STDIO_STDERR_TAIL_BYTES));
 
-        let (exit_code, timed_out) = match time::timeout(task.timeout, child.wait()).await {
+        let (exit_code, timed_out) = match time::timeout(task.timeout, async {
+            #[cfg(unix)]
+            { owner.wait_unreaped().await?; owner.terminate(); }
+            child.wait().await
+        }).await {
             Ok(Ok(status)) => (status.code(), false),
             Ok(Err(e)) => {
                 warn!("waiting for the pi task failed: {e}");
@@ -696,6 +710,7 @@ impl PiDaemon {
             }
         };
 
+        drop(owner);
         // The readers end at EOF, which the exit above guarantees — but a
         // grandchild holding the pipe open must not hang the task forever.
         let result = time::timeout(STDIO_KILL_GRACE, stdout_reader)

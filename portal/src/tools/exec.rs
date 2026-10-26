@@ -2,7 +2,7 @@
 
 use crate::config::PortalConfig;
 use crate::exec_policy::{
-    configure_shell_command, validate_exec_allowlist, validate_shell_command, ExecShell,
+    validate_exec_allowlist, validate_shell_command, ExecShell,
 };
 use crate::process_manager::ProcessManager;
 use crate::tools::text::{OutputDecoder, OutputEncoding};
@@ -11,7 +11,6 @@ use serde_json::Value;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 use tracing::debug;
 
 pub async fn execute(
@@ -81,8 +80,7 @@ pub async fn execute(
         command, workdir, timeout_secs
     );
 
-    let mut cmd = Command::new(shell.program());
-    configure_shell_command(&mut cmd, command, config, &workdir, shell);
+    let mut cmd = crate::sandbox::shell_command(config, command, &workdir, shell)?;
 
     // Drain both pipes concurrently, retaining bounded UTF-8 output while counting all bytes.
     // kill_on_drop also covers cancellation of the tool call or its timeout future.

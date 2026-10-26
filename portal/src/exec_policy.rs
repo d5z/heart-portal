@@ -76,7 +76,7 @@ pub(crate) fn validate_shell_command(shell: ExecShell, command: &str) -> Result<
 }
 
 #[cfg(any(windows, test))]
-fn powershell_encoded_command(command: &str) -> String {
+pub(crate) fn powershell_encoded_command(command: &str) -> String {
     use base64::Engine;
     // -EncodedCommand transports source as UTF-16LE; the launched shell's
     // redirected output and common text cmdlets use UTF-8 explicitly.
