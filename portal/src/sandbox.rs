@@ -28,6 +28,8 @@ pub fn shell_command(config: &PortalConfig, source: &str, workdir: &str, shell: 
         command.creation_flags(0x08000000);
         return Ok(command);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return crate::macos_sandbox::shell_command(config, source, workdir);
+    #[cfg(not(any(windows, target_os = "macos")))]
     anyhow::bail!("OS sandbox is not available on this platform; no unsandboxed fallback")
 }

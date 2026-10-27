@@ -645,12 +645,12 @@ impl ToolHost {
             security::Decision::Allow => {},
             security::Decision::Deny => anyhow::bail!("Tool denied by permission mode; change permissions in Desktop settings if intended"),
             security::Decision::Ask => {
-                let sandboxed_shell = tool_name == "portal_exec" && cfg!(windows)
+                let sandboxed_shell = tool_name == "portal_exec" && cfg!(any(windows, target_os = "macos"))
                     && !arguments.get("command").and_then(Value::as_str)
                         .is_some_and(|command| command.trim_start().starts_with('@'));
                 let request = serde_json::json!({"tool": tool_name, "arguments": &arguments,
                     "workspace": self.config.security.workspace_root,
-                    "isolation": if sandboxed_shell { "windows-lpac-offline" } else { "host-tool" }});
+                    "isolation": if !sandboxed_shell { "host-tool" } else if cfg!(windows) { "windows-lpac-offline" } else { "macos-seatbelt-offline" }});
                 let request = serde_json::to_string(&request)?;
                 anyhow::ensure!(request.len() <= 16000, "Approval request too large; split the operation");
                 let approved = self.client_handler.handle_client_command("security-approve", &request, scene_id).await;

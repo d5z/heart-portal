@@ -12,6 +12,8 @@ mod config;
 mod connection_status;
 mod exec_policy;
 mod sandbox;
+#[cfg(target_os = "macos")]
+mod macos_sandbox;
 #[cfg(windows)]
 mod windows_sandbox;
 mod heart_callback;

@@ -76,7 +76,7 @@ mod tests {
         let requests = approver.requests.lock().unwrap();
         let shell: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
         let client: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
-        assert_eq!(shell["isolation"], if cfg!(windows) { "windows-lpac-offline" } else { "host-tool" });
+        assert_eq!(shell["isolation"], if cfg!(windows) { "windows-lpac-offline" } else if cfg!(target_os = "macos") { "macos-seatbelt-offline" } else { "host-tool" });
         assert_eq!(client["isolation"], "host-tool");
     }
 
