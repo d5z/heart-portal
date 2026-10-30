@@ -2667,11 +2667,23 @@ Write-Output '{"type":"agent_end","messages":[]}'
             };
             manager.shutdown().await;
             let launch = std::fs::read(workspace.join("launch.json"));
-            std::fs::remove_dir_all(workspace).unwrap();
             run.unwrap();
             // Report the subprocess error before looking for its output file.
             assert_eq!(status, TaskStatus::Done, "{mode:?}: {error:?}");
             let launch: Value = serde_json::from_slice(&launch.unwrap()).unwrap();
+            drop(task);
+            drop(manager);
+            // Windows may retain a sharing lock briefly after process exit.
+            // Retry only sharing violations/directory-not-empty, with a bound.
+            for attempt in 0..20 {
+                match std::fs::remove_dir_all(&workspace) {
+                    Ok(()) => break,
+                    Err(error) if attempt < 19 && matches!(error.raw_os_error(), Some(32 | 145)) => {
+                        time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("{mode:?}: cleanup {}: {error}", workspace.display()),
+                }
+            }
             let restricted = mode != PermissionMode::FullAccess;
             assert_eq!(launch["broker"], restricted);
             for flag in ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"] {
