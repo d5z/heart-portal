@@ -2644,8 +2644,11 @@ Write-Output '{"type":"agent_end","messages":[]}'
             config.security.permission_mode = mode;
             config.subagent.auto_install = false;
             config.subagent.state_dir = Some(workspace.join("state").display().to_string());
+            // This generated local fixture must run even when the Windows host
+            // defaults to Restricted. Scope the policy to this process only.
             config.subagent.command = Some(vec![powershell.display().to_string(), "-NoProfile".into(),
-                "-NonInteractive".into(), "-File".into(), script.display().to_string()]);
+                "-NonInteractive".into(), "-ExecutionPolicy".into(), "Bypass".into(),
+                "-File".into(), script.display().to_string()]);
             config.subagent.model.provider = Some("openai".into());
             config.subagent.model.api_key = Some("test-key".into());
             config.prepare_workspace().unwrap();
@@ -2658,12 +2661,17 @@ Write-Output '{"type":"agent_end","messages":[]}'
             let task = manager.register_task("policy-task".into(), &request.session, &request.brief, &workspace, &request).await;
             let run = time::timeout(Duration::from_secs(20), manager.clone().run_task_stdio(
                 session, task.clone(), request.brief.clone(), manager.model_choice(&request))).await;
-            let status = task.inner.lock().await.status;
+            let (status, error) = {
+                let inner = task.inner.lock().await;
+                (inner.status, inner.error.clone())
+            };
             manager.shutdown().await;
-            let launch: Value = serde_json::from_slice(&std::fs::read(workspace.join("launch.json")).unwrap()).unwrap();
+            let launch = std::fs::read(workspace.join("launch.json"));
             std::fs::remove_dir_all(workspace).unwrap();
             run.unwrap();
-            assert_eq!(status, TaskStatus::Done);
+            // Report the subprocess error before looking for its output file.
+            assert_eq!(status, TaskStatus::Done, "{mode:?}: {error:?}");
+            let launch: Value = serde_json::from_slice(&launch.unwrap()).unwrap();
             let restricted = mode != PermissionMode::FullAccess;
             assert_eq!(launch["broker"], restricted);
             for flag in ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"] {
