@@ -2630,25 +2630,24 @@ mod tests {
         use crate::config::PermissionMode;
         for mode in [PermissionMode::FullAccess, PermissionMode::Supervised, PermissionMode::ReadOnly] {
             let workspace = temp_workspace("stdio-policy");
-            let script = workspace.join("fake-pi.ps1");
-            std::fs::write(&script, r###"
-$record = @{ args = @($args); broker = [bool]$env:PORTAL_TOOL_TOKEN }
-[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'launch.json'), (ConvertTo-Json -InputObject $record -Compress))
-Write-Output '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"## Result\nDone"}],"stopReason":"stop"}}'
-Write-Output '{"type":"agent_end","messages":[]}'
-"###).unwrap();
-            let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-                .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+            let script = workspace.join("fake-pi.cmd");
+            // Use only CMD built-ins: this fixture records argv/environment and
+            // emits Pi's stdio protocol, without PowerShell module initialization.
+            std::fs::write(&script, r###"@echo off
+> "%~dp0launch.args" echo %*
+if defined PORTAL_TOOL_TOKEN (> "%~dp0broker.txt" echo true) else (> "%~dp0broker.txt" echo false)
+echo {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"## Result\nDone"}],"stopReason":"stop"}}
+echo {"type":"agent_end","messages":[]}
+exit /b 0
+"###.replace('\n', "\r\n")).unwrap();
             let mut config = PortalConfig::default();
             config.security.workspace_root = workspace.clone();
             config.security.permission_mode = mode;
             config.subagent.auto_install = false;
             config.subagent.state_dir = Some(workspace.join("state").display().to_string());
-            // This generated local fixture must run even when the Windows host
-            // defaults to Restricted. Scope the policy to this process only.
-            config.subagent.command = Some(vec![powershell.display().to_string(), "-NoProfile".into(),
-                "-NonInteractive".into(), "-ExecutionPolicy".into(), "Bypass".into(),
-                "-File".into(), script.display().to_string()]);
+            let mut command = test_shell_command();
+            command.extend(["/D".into(), "/C".into(), script.display().to_string()]);
+            config.subagent.command = Some(command);
             config.subagent.model.provider = Some("openai".into());
             config.subagent.model.api_key = Some("test-key".into());
             config.prepare_workspace().unwrap();
@@ -2666,11 +2665,12 @@ Write-Output '{"type":"agent_end","messages":[]}'
                 (inner.status, inner.error.clone())
             };
             manager.shutdown().await;
-            let launch = std::fs::read(workspace.join("launch.json"));
-            run.unwrap();
+            let launch = std::fs::read_to_string(workspace.join("launch.args"));
+            let broker = std::fs::read_to_string(workspace.join("broker.txt"));
+            assert!(run.is_ok(), "{mode:?}: timed out; status={status:?}, error={error:?}, argv={launch:?}");
             // Report the subprocess error before looking for its output file.
             assert_eq!(status, TaskStatus::Done, "{mode:?}: {error:?}");
-            let launch: Value = serde_json::from_slice(&launch.unwrap()).unwrap();
+            let launch = launch.unwrap();
             drop(task);
             drop(manager);
             // Windows may retain a sharing lock briefly after process exit.
@@ -2685,9 +2685,9 @@ Write-Output '{"type":"agent_end","messages":[]}'
                 }
             }
             let restricted = mode != PermissionMode::FullAccess;
-            assert_eq!(launch["broker"], restricted);
+            assert_eq!(broker.unwrap().trim(), if restricted { "true" } else { "false" });
             for flag in ["--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-session", "--extension"] {
-                assert_eq!(launch["args"].as_array().unwrap().iter().any(|arg| arg == flag), restricted, "{mode:?}: {flag}");
+                assert_eq!(launch.split_whitespace().any(|arg| arg == flag), restricted, "{mode:?}: {flag}: {launch}");
             }
         }
     }
