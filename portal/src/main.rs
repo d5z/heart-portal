@@ -12,6 +12,7 @@ mod config;
 mod connection_status;
 mod exec_policy;
 mod sandbox;
+mod sensitive_paths;
 #[cfg(target_os = "macos")]
 mod macos_sandbox;
 #[cfg(windows)]

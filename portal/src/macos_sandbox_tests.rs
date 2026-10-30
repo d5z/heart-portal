@@ -76,6 +76,21 @@ async fn protected_paths_cannot_be_modified_or_renamed_and_secrets_cannot_be_rea
 }
 
 #[tokio::test]
+async fn cloud_and_auth_secrets_match_file_tool_boundaries() {
+    let f = Fixture::new();
+    for path in [".aws/credentials", ".azure/accessTokens.json", ".gnupg/private.key", "auth.json"] {
+        let target = f.root.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "DUMMY_CREDENTIAL").unwrap();
+        let read = f.run(&format!("cat {}", quote(&target))).await;
+        assert!(!read.status.success());
+        assert!(!String::from_utf8_lossy(&read.stdout).contains("DUMMY_CREDENTIAL"));
+        assert!(!f.run(&format!("echo changed > {}", quote(&target))).await.status.success());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "DUMMY_CREDENTIAL");
+    }
+}
+
+#[tokio::test]
 async fn active_custom_config_and_ancestors_cannot_be_moved() {
     let mut f = Fixture::new();
     fs::create_dir(f.root.join("settings")).unwrap();

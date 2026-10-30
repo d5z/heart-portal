@@ -66,6 +66,28 @@ pub(super) fn read(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     read_handle(open(path)?, limit)
 }
 
+/// A path check cannot establish which other names refer to a hard-linked object.
+pub(super) fn read_single_link(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let file = open(path)?;
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata()?.nlink()
+    };
+    #[cfg(windows)]
+    let links = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return Err(io::Error::last_os_error()); }
+        info.nNumberOfLinks as u64
+    };
+    #[cfg(not(any(unix, windows)))]
+    let links = 0;
+    if links != 1 { return Err(io::Error::other("Hard-linked files require full access; use an ordinary copy instead")); }
+    read_handle(file, limit)
+}
+
 /// Only ordinary relative components are accepted. Unix walks directory handles
 /// with NOFOLLOW so swapping an intermediate directory cannot redirect the read.
 pub(super) fn read_beneath(root: &Path, relative: &Path, limit: usize) -> io::Result<Vec<u8>> {

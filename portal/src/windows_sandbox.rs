@@ -230,7 +230,7 @@ pub fn run(request: &Request) -> Result<u32> {
             let metadata = std::fs::symlink_metadata(&path)?;
             anyhow::ensure!(objects.len() < 20000, "Workspace exceeds sandbox ACL budget; select a smaller workspace");
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            let hidden = matches!(name.as_str(), ".ssh" | ".portal-client.json" | "connection.json") || name.starts_with(".env");
+            let hidden = crate::sensitive_paths::is_secret_name(&name) || protected_paths.contains(&path);
             let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             if metadata.is_file() && !reparse {
                 let file = std::fs::File::open(&path)?;

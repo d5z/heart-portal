@@ -38,7 +38,10 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
     // Keep both paths in canonical form. This is especially important on
     // Windows, where canonicalization may use the verbatim-path prefix.
     let workspace = canonical_workspace_root(config)?;
+    let workspace = if root.starts_with(&workspace) { workspace }
+        else if root.is_dir() { root.clone() } else { root.parent().unwrap().to_path_buf() };
     let max_file = config.security.max_file_size;
+    let policy = config.clone();
 
     debug!(
         "portal_search: pattern={:?} under {}",
@@ -47,13 +50,14 @@ pub async fn search(config: &PortalConfig, arguments: Value) -> Result<Value> {
     );
 
     let matches = tokio::task::spawn_blocking(move || {
-        grep_workspace(
+        grep_workspace_with_policy(
             &workspace,
             &root,
             &re,
             max_matches,
             max_file,
             include_ignored,
+            Some(&policy),
         )
     })
     .await
@@ -96,18 +100,28 @@ fn ignored_directory(name: &str) -> bool {
     )
 }
 
-fn grep_workspace(
+#[cfg(test)]
+fn grep_workspace(workspace_root: &Path, search_root: &Path, re: &Regex, max_matches: usize,
+    max_file_bytes: usize, include_ignored: bool) -> Result<SearchResults> {
+    grep_workspace_with_policy(workspace_root, search_root, re, max_matches, max_file_bytes, include_ignored, None)
+}
+
+fn grep_workspace_with_policy(
     workspace_root: &Path,
     search_root: &Path,
     re: &Regex,
     max_matches: usize,
     max_file_bytes: usize,
     include_ignored: bool,
+    policy: Option<&PortalConfig>,
 ) -> Result<SearchResults> {
     let mut result = SearchResults::default();
     let mut out = Vec::new();
     let mut output_bytes = 2usize;
     let mut skipped_directories = 0;
+    let restricted = policy.is_some_and(|c| c.security.permission_mode != crate::config::PermissionMode::FullAccess);
+    let explicit_secret = restricted && policy.is_some_and(|c| c.security.approved_file.as_deref() == Some(search_root)
+        && super::file::sensitive_read(c, search_root).unwrap_or(false));
 
     for entry in WalkDir::new(search_root)
         .follow_links(false)
@@ -140,6 +154,7 @@ fn grep_workspace(
             Ok(path) if path.starts_with(workspace_root) => path,
             _ => continue,
         };
+        if restricted && !explicit_secret && super::file::sensitive_read(policy.unwrap(), &canonical)? { continue; }
 
         let meta = match std::fs::metadata(&canonical) {
             Ok(m) => m,
@@ -155,7 +170,8 @@ fn grep_workspace(
         };
 
         result.files_scanned += 1;
-        let bytes = match crate::bounded_file::read(&canonical, max_file_bytes) {
+        let bytes = match if restricted { crate::bounded_file::read_single_link(&canonical, max_file_bytes) }
+            else { crate::bounded_file::read(&canonical, max_file_bytes) } {
             Ok(b) => b,
             Err(_) => continue,
         };

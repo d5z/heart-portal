@@ -197,7 +197,7 @@ impl ToolHost {
                     "explicit_reload_changes": ["code", "dependencies"],
                     "restarts_portal": false,
                     "activation": "next-tool-call",
-                    "eager_prewarm": "portal-startup",
+                    "eager_prewarm": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "portal-startup" } else { "disabled-until-approved-call" },
                 },
                 "tools_reload": {
                     "tool": "portal_tools_reload",
@@ -231,11 +231,22 @@ impl ToolHost {
             },
             "authorization": {
                 "permission_mode": format!("{:?}", config.security.permission_mode),
-                "os_sandbox": cfg!(windows) && config.security.permission_mode != crate::config::PermissionMode::FullAccess,
+                "os_sandbox": cfg!(any(windows, target_os = "macos")) && !matches!(config.security.permission_mode, crate::config::PermissionMode::FullAccess | crate::config::PermissionMode::ReadOnly),
                 "command_backend": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "host" }
                     else if config.security.permission_mode == crate::config::PermissionMode::ReadOnly { "disabled" }
-                    else if cfg!(windows) { "windows-lpac" } else { "unavailable" },
-                "command_network": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "host-policy" } else { "denied" },
+                    else if cfg!(windows) { "windows-lpac" } else if cfg!(target_os = "macos") { "macos-seatbelt" } else { "unavailable" },
+                "command_network": match config.security.permission_mode {
+                    crate::config::PermissionMode::FullAccess => "host-policy",
+                    crate::config::PermissionMode::ReadOnly => "disabled",
+                    _ => "explicit-host-execution-approval-required",
+                },
+                "file_access": match config.security.permission_mode {
+                    crate::config::PermissionMode::FullAccess => "host-file-access",
+                    crate::config::PermissionMode::ReadOnly => "legacy-workspace-read-only",
+                    _ => "ordinary-reads; workspace-writes; external-or-protected-writes-require-approval",
+                },
+                "approval_reviewer": if config.security.permission_mode == crate::config::PermissionMode::AutoReview { "desktop-conservative-rules-with-user-fallback" } else { "user" },
+                "custom_mcp_startup": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "automatic" } else { "explicit-tools-reload-approval-required" },
                 "subagent_tools": "portal-broker-in-restricted-mode",
                 "approval_scope": "single-call",
             },

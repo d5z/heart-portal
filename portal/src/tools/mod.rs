@@ -166,7 +166,9 @@ impl ToolHost {
     /// Load custom tools from workspace/tools/mcp.toml
     pub async fn load_custom_tools(&self) -> Result<usize> {
         let _guard = self.custom_reload_lock.lock().await;
-        if !self.config.tools.custom_tools_enabled {
+        // Workspace code must not execute merely because a restricted Portal starts.
+        // portal_tools_reload supplies the explicit host-operation approval instead.
+        if !self.config.tools.custom_tools_enabled || self.config.security.permission_mode != crate::config::PermissionMode::FullAccess {
             return Ok(0);
         }
         let count = self
@@ -182,7 +184,9 @@ impl ToolHost {
     /// Pre-spawn eager kits (manifest.eager == true) so the first call has
     /// no cold-start latency. Failures are logged, not fatal.
     pub async fn warmup_kits(&self) {
-        self.kits.warmup().await;
+        if self.config.security.permission_mode == crate::config::PermissionMode::FullAccess {
+            self.kits.warmup().await;
+        }
         self.subagent.warmup().await;
     }
 
@@ -328,6 +332,11 @@ impl ToolHost {
                             "type": "string",
                             "description": "Working directory (optional)"
                         },
+                        "sandbox_permissions": {
+                            "type": "string", "enum": ["use_default", "require_escalated"],
+                            "description": "Default runs autonomously inside the offline workspace sandbox. Request require_escalated with justification when the command needs network, external files or host-installed tools. The user must approve this exact foreground command; approval grants host file/network access for this invocation only. Never retry outside the sandbox without this explicit request."
+                        },
+                        "justification": { "type": "string", "description": "Why this command needs to run outside the sandbox; required with require_escalated." },
                         "timeout_secs": {
                             "type": "integer",
                             "description": "Timeout in seconds (default: 30, sync mode only)"
@@ -399,7 +408,7 @@ impl ToolHost {
                         "max_bytes": {"type":"integer","minimum":1,"maximum":100000,"description":"Text output budget (default 100000); applies to full and partial reads."},
                         "path": {
                             "type": "string",
-                            "description": "File path (relative to workspace root)"
+                            "description": "Absolute or workspace-relative file path; outside/protected writes require approval in restricted modes"
                         },
                         "offset": {
                             "type": "integer",
@@ -423,7 +432,7 @@ impl ToolHost {
                         "expected_sha256": {"type":"string","description":"Optional sha256 from file_read; reject overwriting a changed file."},
                         "path": {
                             "type": "string",
-                            "description": "File path (relative to workspace root)"
+                            "description": "Absolute or workspace-relative file path; outside/protected writes require approval in restricted modes"
                         },
                         "content": {
                             "type": "string",
@@ -456,7 +465,7 @@ impl ToolHost {
                         "edits": {"type":"array","minItems":1,"maxItems":64,"description":"Ordered replacements applied to the same file in memory, then saved once. Use instead of top-level old_text/new_text.","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"},"count":{"type":"integer"},"unescape":{"type":"boolean"}},"required":["old_text","new_text"]}},
                         "path": {
                             "type": "string",
-                            "description": "File path (relative to workspace root)"
+                            "description": "Absolute or workspace-relative file path; outside/protected writes require approval in restricted modes"
                         },
                         "old_text": {
                             "type": "string",
@@ -488,7 +497,7 @@ impl ToolHost {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Directory path (relative to workspace root)"
+                            "description": "Absolute or workspace-relative directory path"
                         }
                     },
                     "required": ["path"]
@@ -534,7 +543,7 @@ impl ToolHost {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Subdirectory or file to search under workspace root (default: entire workspace)"
+                            "description": "Absolute or workspace-relative directory/file to search (default: workspace); broad searches omit sensitive files in restricted modes"
                         },
                         "max_matches": {
                             "type": "integer",
@@ -569,7 +578,7 @@ impl ToolHost {
         // Always include tools_reload
         tools.push(ToolInfo {
             name: "portal_tools_reload".to_string(),
-            description: "Reload custom tools from workspace/tools/mcp.toml. Kit changes use portal_kits_reload. Connected clients are notified; Portal stays running.".to_string(),
+            description: "Load/discover or reload custom tools from workspace/tools/mcp.toml. In restricted modes these servers do not start automatically: request this tool and user approval first. Kit changes use portal_kits_reload. Connected clients are notified; Portal stays running.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {},
@@ -639,18 +648,23 @@ impl ToolHost {
         arguments: Value,
         scene_id: Option<&str>,
     ) -> Result<Value> {
-        let decision = security::decide(self.config.security.permission_mode, tool_name);
+        match tool_name {
+            "portal_exec" | "portal_process" => anyhow::ensure!(self.config.tools.exec, "Execution tools are disabled"),
+            "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" => anyhow::ensure!(self.config.tools.file, "File tools are disabled"),
+            "portal_search" => anyhow::ensure!(self.config.tools.search, "Search is disabled"),
+            "portal_web_fetch" => anyhow::ensure!(self.config.tools.web_fetch, "Web fetch is disabled"),
+            _ => {},
+        }
+        let plan = security::plan(&self.config, tool_name, &arguments)?;
+        let decision = &plan.decision;
         info!(tool = tool_name, decision = ?decision, "tool authorization");
         match decision {
             security::Decision::Allow => {},
             security::Decision::Deny => anyhow::bail!("Tool denied by permission mode; change permissions in Desktop settings if intended"),
             security::Decision::Ask => {
-                let sandboxed_shell = tool_name == "portal_exec" && cfg!(any(windows, target_os = "macos"))
-                    && !arguments.get("command").and_then(Value::as_str)
-                        .is_some_and(|command| command.trim_start().starts_with('@'));
                 let request = serde_json::json!({"tool": tool_name, "arguments": &arguments,
                     "workspace": self.config.security.workspace_root,
-                    "isolation": if !sandboxed_shell { "host-tool" } else if cfg!(windows) { "windows-lpac-offline" } else { "macos-seatbelt-offline" }});
+                    "isolation": plan.isolation, "target": plan.file, "reason": plan.reason});
                 let request = serde_json::to_string(&request)?;
                 anyhow::ensure!(request.len() <= 16000, "Approval request too large; split the operation");
                 let approved = self.client_handler.handle_client_command("security-approve", &request, scene_id).await;
@@ -659,6 +673,14 @@ impl ToolHost {
                 anyhow::ensure!(allowed, "Tool approval denied, expired, or Desktop unavailable");
             }
         }
+        // Capabilities are local to this invocation and never mutate the shared host.
+        let mut invocation_config = self.config.clone();
+        let mut arguments = arguments;
+        if let Some(target) = plan.file {
+            arguments["path"] = serde_json::to_value(&target)?;
+            invocation_config.security.approved_file = Some(target);
+        }
+        if plan.host_command { invocation_config.security.permission_mode = crate::config::PermissionMode::FullAccess; }
         // Reserve the diagnostic endpoint: an installed server must not replace
         // a read-only status query with an arbitrary custom or kit operation.
         if tool_name == "portal_status" {
@@ -707,7 +729,7 @@ impl ToolHost {
                         .await?;
                     return Ok(serde_json::json!({"content": [{"type": "text", "text": text}]}));
                 }
-                exec::execute(&self.config, &self.process_manager, arguments).await
+                exec::execute(&invocation_config, &self.process_manager, arguments).await
             }
             "portal_process" => {
                 if !self.config.tools.exec {
@@ -715,17 +737,17 @@ impl ToolHost {
                 }
                 process::handle(&self.process_manager, arguments).await
             }
-            "portal_file_read" => file::read(&self.config, arguments).await,
-            "portal_file_write" => file::write(&self.config, arguments).await,
-            "portal_file_list" => file::list(&self.config, arguments).await,
-            "portal_file_edit" => file::edit(&self.config, arguments).await,
+            "portal_file_read" => file::read(&invocation_config, arguments).await,
+            "portal_file_write" => file::write(&invocation_config, arguments).await,
+            "portal_file_list" => file::list(&invocation_config, arguments).await,
+            "portal_file_edit" => file::edit(&invocation_config, arguments).await,
             "portal_screenshot" => {
                 if !self.config.tools.screenshot {
                     anyhow::bail!("portal_screenshot is disabled in configuration");
                 }
                 screenshot::capture(&self.config, arguments).await
             }
-            "portal_search" => search::search(&self.config, arguments).await,
+            "portal_search" => search::search(&invocation_config, arguments).await,
             "portal_web_fetch" => web::fetch(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             name if subagent::is_subagent_tool(name) => {

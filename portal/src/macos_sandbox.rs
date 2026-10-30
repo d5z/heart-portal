@@ -66,7 +66,7 @@ pub fn shell_command(config: &PortalConfig, source: &str, workdir: &str) -> Resu
     }).collect();
     for (index, (operation, names)) in [
         ("file-write*", &[".git", ".codex", ".agents", "portal.toml", "desktop-portal.toml", "mcp.toml"][..]),
-        ("file-read* file-write*", &[".ssh", ".portal-client.json", "connection.json"][..]),
+        ("file-read* file-write*", crate::sensitive_paths::SECRET_NAMES),
     ].into_iter().enumerate() {
         let key = format!("PROTECTED_{index}");
         let names = names.iter().map(|name| insensitive(name)).collect::<Vec<_>>().join("|");

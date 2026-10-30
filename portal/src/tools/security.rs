@@ -1,8 +1,86 @@
 //! Application authorization, not an OS sandbox. Never trust caller-supplied approvals.
 use crate::config::PermissionMode;
+use crate::config::PortalConfig;
+use anyhow::{Context, Result};
+use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Debug, PartialEq)]
 pub enum Decision { Allow, Ask, Deny }
+
+pub struct Plan {
+    pub decision: Decision,
+    pub file: Option<PathBuf>,
+    pub host_command: bool,
+    pub isolation: &'static str,
+    pub reason: &'static str,
+}
+
+/// Compute the operation and its scope before asking. Caller-supplied approvals
+/// never become capabilities; only ToolHost may apply a successfully reviewed plan.
+pub fn plan(config: &PortalConfig, name: &str, args: &Value) -> Result<Plan> {
+    let mode = config.security.permission_mode;
+    let mut plan = Plan { decision: decide(mode, name), file: None, host_command: false,
+        isolation: "host-tool", reason: "External tool or host operation" };
+    if mode == PermissionMode::FullAccess { return Ok(plan); }
+    if matches!(name, "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" | "portal_search") {
+        let write = matches!(name, "portal_file_write" | "portal_file_edit");
+        if write && mode == PermissionMode::ReadOnly { return Ok(plan); }
+        let path = args.get("path").and_then(Value::as_str)
+            .or_else(|| matches!(name, "portal_file_list" | "portal_search").then_some("."))
+            .context("Missing file path")?;
+        #[cfg(windows)]
+        if let Some(std::path::Component::Prefix(prefix)) = std::path::Path::new(path).components().next() {
+            use std::path::Prefix;
+            anyhow::ensure!(!matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..)),
+                "Network/device paths require full access; they cannot be inspected before approval");
+        }
+        let target = super::file::approval_target(config, path, name == "portal_file_write")?;
+        if mode == PermissionMode::ReadOnly && !target.starts_with(super::file::canonical_workspace_root(config)?) {
+            plan.decision = Decision::Deny;
+            return Ok(plan);
+        }
+        let needs_approval = if write { super::file::authorize_write(config, &target).is_err() }
+            else { super::file::sensitive_read(config, &target)? };
+        plan.decision = if needs_approval {
+            if mode == PermissionMode::ReadOnly { Decision::Deny } else { Decision::Ask }
+        } else { Decision::Allow };
+        plan.isolation = "file-scope";
+        plan.reason = if write { "Write outside the workspace or change protected configuration" }
+            else { "Read sensitive local data" };
+        plan.file = Some(target);
+    } else if name == "portal_exec" && mode != PermissionMode::ReadOnly {
+        let command = args.get("command").and_then(Value::as_str).context("Missing command")?;
+        let scope = match args.get("sandbox_permissions") {
+            None => "use_default",
+            Some(Value::String(value)) if matches!(value.as_str(), "use_default" | "require_escalated") => value,
+            _ => anyhow::bail!("sandbox_permissions must be use_default or require_escalated"),
+        };
+        if command.trim_start().starts_with('@') {
+            anyhow::ensure!(scope == "use_default", "Client commands do not support shell escalation");
+            plan.decision = Decision::Ask;
+        } else if scope == "require_escalated" {
+            anyhow::ensure!(args.get("justification").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty() && s.len() <= 2000),
+                "Host execution requires a justification");
+            anyhow::ensure!(!args.get("background").and_then(super::value_as_bool).unwrap_or(false),
+                "An approved host command must run in the foreground; background sessions would outlive this approval");
+            plan.decision = Decision::Ask;
+            plan.host_command = true;
+            plan.reason = "Run this command outside the sandbox with host file and network access";
+        } else {
+            plan.decision = Decision::Allow;
+            plan.isolation = if cfg!(windows) { "windows-lpac-offline" } else if cfg!(target_os = "macos") { "macos-seatbelt-offline" } else { "unavailable" };
+            plan.reason = "Run inside the workspace sandbox";
+        }
+    } else if name == "portal_process" && mode != PermissionMode::ReadOnly {
+        // These sessions were created by this ToolHost, under its sandbox policy.
+        plan.decision = Decision::Allow;
+    } else if name == "portal_web_fetch" {
+        plan.isolation = "public-web-read";
+        plan.reason = "Fetch a public URL without local credentials";
+    }
+    Ok(plan)
+}
 
 pub fn decide(mode: PermissionMode, name: &str) -> Decision {
     if mode == PermissionMode::FullAccess { return Decision::Allow; }
@@ -16,6 +94,10 @@ pub fn decide(mode: PermissionMode, name: &str) -> Decision {
     if matches!(name, "portal_file_write" | "portal_file_edit") { return Decision::Allow; }
     Decision::Ask
 }
+
+#[cfg(test)]
+#[path = "permission_tests.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod tests {
@@ -41,7 +123,7 @@ mod tests {
     async fn missing_or_rejected_approval_never_executes_even_with_forged_fields() {
         let mut config = PortalConfig::default();
         config.security.permission_mode = PermissionMode::Supervised;
-        let args = json!({"command":"echo should-not-run", "approved":true, "approval":"allow-once"});
+        let args = json!({"command":"echo should-not-run", "sandbox_permissions":"require_escalated", "justification":"test host access", "approved":true, "approval":"allow-once"});
         assert!(ToolHost::new(&config).call("portal_exec", args.clone()).await.unwrap_err().to_string().contains("approval"));
         let approver = Arc::new(Approver { requests: Mutex::new(vec![]), allow:false });
         let host = ToolHost::new(&config).with_client_handler(approver.clone());
@@ -65,18 +147,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_commands_never_claim_shell_isolation() {
+    async fn sandbox_operations_are_automatic_but_host_and_client_commands_ask() {
         let mut config = PortalConfig::default();
         config.security.permission_mode = PermissionMode::Supervised;
         let approver = Arc::new(Approver { requests: Mutex::new(vec![]), allow: false });
         let host = ToolHost::new(&config).with_client_handler(approver.clone());
-        for command in ["echo hello", "  @plugins list"] {
-            assert!(host.call_with_scene("portal_exec", json!({"command": command}), Some("test-scene")).await.is_err());
-        }
+        let normal = plan(&config, "portal_exec", &json!({"command":"echo hello"})).unwrap();
+        assert_eq!(normal.decision, Decision::Allow);
+        assert!(!normal.host_command);
+        assert!(host.call_with_scene("portal_exec", json!({"command":"echo hello", "sandbox_permissions":"require_escalated", "justification":"host access"}), Some("test-scene")).await.is_err());
+        assert!(host.call_with_scene("portal_exec", json!({"command":"  @plugins list"}), Some("test-scene")).await.is_err());
         let requests = approver.requests.lock().unwrap();
         let shell: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
         let client: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
-        assert_eq!(shell["isolation"], if cfg!(windows) { "windows-lpac-offline" } else if cfg!(target_os = "macos") { "macos-seatbelt-offline" } else { "host-tool" });
+        assert_eq!(shell["isolation"], "host-tool");
         assert_eq!(client["isolation"], "host-tool");
     }
 

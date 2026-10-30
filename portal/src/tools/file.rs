@@ -25,9 +25,12 @@ fn mutation_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
-async fn bounded_bytes(path: &Path, limit: usize) -> Result<Vec<u8>> {
+async fn bounded_bytes(config: &PortalConfig, path: &Path, limit: usize) -> Result<Vec<u8>> {
     let path = path.to_path_buf();
-    Ok(tokio::task::spawn_blocking(move || crate::bounded_file::read(&path, limit)).await??)
+    let unrestricted = config.security.permission_mode == crate::config::PermissionMode::FullAccess;
+    Ok(tokio::task::spawn_blocking(move || if unrestricted {
+        crate::bounded_file::read(&path, limit)
+    } else { crate::bounded_file::read_single_link(&path, limit) }).await??)
 }
 
 fn checksum(bytes: &[u8]) -> String {
@@ -138,7 +141,8 @@ pub(crate) fn resolve_path_logical(config: &PortalConfig, path_str: &str) -> Res
     }
 
     // Verify the normalized path is within workspace root
-    if !normalized.starts_with(root) {
+    if config.security.permission_mode != crate::config::PermissionMode::FullAccess
+        && config.security.approved_file.is_none() && !normalized.starts_with(root) {
         anyhow::bail!(
             "Path outside workspace: {} (resolved to {})",
             path_str,
@@ -163,7 +167,7 @@ pub(crate) fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Re
             e
         )
     })?;
-    if !c.starts_with(&root_canon) {
+    if !path_authorized(config, &c, &root_canon) {
         anyhow::bail!(
             "Path outside workspace: {} (resolved to {})",
             logical.display(),
@@ -177,6 +181,26 @@ pub(crate) fn resolve_existing_path(config: &PortalConfig, path_str: &str) -> Re
 /// (prevents `create_dir_all` from following a symlink that escapes the workspace).
 pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Result<PathBuf> {
     let logical = resolve_path_logical(config, path_str)?;
+    if config.security.permission_mode == crate::config::PermissionMode::FullAccess || config.security.approved_file.is_some() {
+        // Canonicalize the nearest existing ancestor before creating any parents.
+        // A broken symlink is an error, not a new directory to follow later.
+        let mut ancestor = logical.as_path();
+        let mut suffix = Vec::new();
+        loop {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    suffix.push(ancestor.file_name().ok_or_else(|| anyhow::anyhow!("Invalid file path"))?.to_owned());
+                    ancestor = ancestor.parent().ok_or_else(|| anyhow::anyhow!("Invalid file path"))?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut resolved = ancestor.canonicalize()?;
+        for part in suffix.into_iter().rev() { resolved.push(part); }
+        anyhow::ensure!(path_authorized(config, &resolved, &canonical_workspace_root(config)?), "File target changed after approval");
+        return Ok(resolved);
+    }
     let root = prepared_workspace_root(config)?;
     let root_canon = canonical_workspace_root(config)?;
     let rel = logical
@@ -202,16 +226,39 @@ pub(crate) fn resolve_write_path(config: &PortalConfig, path_str: &str) -> Resul
     Ok(cur)
 }
 
-fn authorize_write(config: &PortalConfig, path: &Path) -> Result<()> {
+fn path_authorized(config: &PortalConfig, path: &Path, root: &Path) -> bool {
+    if config.security.permission_mode == crate::config::PermissionMode::FullAccess { return true; }
+    if let Some(approved) = &config.security.approved_file { return path == approved; }
+    path.starts_with(root)
+}
+
+/// Resolve an approval target without granting access or performing any writes.
+pub(crate) fn approval_target(config: &PortalConfig, path: &str, create: bool) -> Result<PathBuf> {
+    let mut probe = config.clone();
+    probe.security.permission_mode = crate::config::PermissionMode::FullAccess;
+    probe.security.approved_file = None;
+    if create { resolve_write_path(&probe, path) } else { resolve_existing_path(&probe, path) }
+}
+
+pub(crate) fn sensitive_read(config: &PortalConfig, path: &Path) -> Result<bool> {
+    let root = canonical_workspace_root(config)?;
+    let relative = path.strip_prefix(&root).unwrap_or(path);
+    let secret = relative.components().any(|part|
+        crate::sensitive_paths::is_secret_name(&part.as_os_str().to_string_lossy()));
+    Ok(secret || config.config_path.as_ref().map(|p| p.canonicalize()).transpose()?.as_deref() == Some(path))
+}
+
+pub(crate) fn authorize_write(config: &PortalConfig, path: &Path) -> Result<()> {
     use crate::config::PermissionMode;
     if config.security.permission_mode == PermissionMode::FullAccess { return Ok(()); }
     anyhow::ensure!(config.security.permission_mode != PermissionMode::ReadOnly, "Read-only permission mode");
+    if config.security.approved_file.as_deref() == Some(path) { return Ok(()); }
     let root = canonical_workspace_root(config)?;
     let relative = path.strip_prefix(&root)?;
     for part in relative.components() {
         let raw = part.as_os_str().to_string_lossy().to_ascii_lowercase();
         let name = raw.trim_end_matches(['.', ' ']);
-        anyhow::ensure!(!name.contains(':') && !matches!(name, ".git" | ".codex" | ".agents" | ".ssh" | ".portal-client.json" | "connection.json" | "portal.toml" | "desktop-portal.toml" | "mcp.toml") && !name.starts_with(".env"),
+        anyhow::ensure!(!name.contains(':') && !matches!(name, ".git" | ".codex" | ".agents" | "portal.toml" | "desktop-portal.toml" | "mcp.toml") && !crate::sensitive_paths::is_secret_name(name),
             "Protected configuration cannot be changed in supervised mode");
     }
     if let Some(config_path) = &config.config_path {
@@ -304,7 +351,7 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     // SVG is text: apply the same output budget, partial reads and revision hash.
     if let Some(mime) = image_mime_type(ext).filter(|mime| *mime != "image/svg+xml") {
         // Binary read + base64 for images
-        let bytes = bounded_bytes(&path, MAX_IMAGE_SIZE.min(config.security.max_file_size))
+        let bytes = bounded_bytes(config, &path, MAX_IMAGE_SIZE.min(config.security.max_file_size))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
 
@@ -333,7 +380,7 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     }
 
     // Text file path
-    let content = String::from_utf8(bounded_bytes(&path, config.security.max_file_size).await?)
+    let content = String::from_utf8(bounded_bytes(config, &path, config.security.max_file_size).await?)
         .map_err(|e| anyhow::anyhow!("File is not UTF-8 text ({}): {}", path.display(), e))?;
 
     if content.len() > config.security.max_file_size {
@@ -483,7 +530,7 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
     if arguments.get("expected_sha256").is_some() {
         check_revision(
             &arguments,
-            &bounded_bytes(&path, config.security.max_file_size).await?,
+            &bounded_bytes(config, &path, config.security.max_file_size).await?,
         )?;
     }
     let mode_label = if append { "append" } else { "write" };
@@ -591,7 +638,7 @@ pub async fn edit(config: &PortalConfig, arguments: Value) -> Result<Value> {
     authorize_write(config, &path)?;
     let lock = mutation_lock(&path);
     let _guard = lock.lock().await;
-    let bytes = bounded_bytes(&path, config.security.max_file_size).await?;
+    let bytes = bounded_bytes(config, &path, config.security.max_file_size).await?;
     check_revision(&arguments, &bytes)?;
     let mut content = String::from_utf8(bytes)?;
     let edits = match arguments.get("edits") {
@@ -705,6 +752,7 @@ mod tests {
 
     fn test_config() -> PortalConfig {
         let mut config = PortalConfig::default();
+        config.security.permission_mode = crate::config::PermissionMode::Supervised;
         config.security.workspace_root = if cfg!(windows) {
             std::path::PathBuf::from(r"C:\workspace")
         } else {

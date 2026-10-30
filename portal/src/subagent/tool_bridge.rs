@@ -104,7 +104,7 @@ mod tests {
         let result = request(&bridge,&bridge.token,"portal_file_write", args.clone()).await.unwrap();
         assert_ne!(result["isError"], true);
         assert_eq!(std::fs::read_to_string(config.security.workspace_root.join("notes.txt")).unwrap(),"child");
-        let result = request(&bridge,&bridge.token,"portal_exec",json!({"command":"echo forbidden", "approved":true})).await.unwrap();
+        let result = request(&bridge,&bridge.token,"portal_exec",json!({"command":"echo forbidden", "sandbox_permissions":"require_escalated", "justification":"test host operation", "approved":true})).await.unwrap();
         assert_eq!(result["isError"],true);
         assert!(request(&bridge,&bridge.token,"portal_subagent_spawn",json!({})).await.is_none());
         let extension = bridge.extension.clone(); drop(bridge);

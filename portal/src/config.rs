@@ -461,12 +461,13 @@ pub struct ToolsConfig {
     ignored_fields: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
 }
 
-/// Standalone legacy configs retain their behavior; Desktop explicitly selects supervised.
+/// Standalone legacy configs retain their behavior; Desktop explicitly selects its saved approval policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     ReadOnly,
     Supervised,
+    AutoReview,
     #[default]
     FullAccess,
 }
@@ -474,6 +475,8 @@ pub enum PermissionMode {
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
     pub permission_mode: PermissionMode,
+    /// Invocation-local capability issued by ToolHost, never deserialized from a tool/config.
+    pub(crate) approved_file: Option<PathBuf>,
     /// Local administrator opt-in for host paths/PID in portal_status.
     pub expose_host_details: bool,
     pub exec_allowlist: Vec<String>,
@@ -518,6 +521,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             permission_mode: PermissionMode::default(),
+            approved_file: None,
             expose_host_details: false,
             exec_allowlist: vec![],
             workspace_root: default_workspace_root(),
@@ -558,6 +562,7 @@ impl PortalConfig {
 
         let security = SecurityConfig {
             permission_mode: raw.security.as_ref().map(|s| s.permission_mode).unwrap_or_default(),
+            approved_file: None,
             expose_host_details: raw.security.as_ref().is_some_and(|s| s.expose_host_details),
             exec_allowlist: raw
                 .security
@@ -1045,6 +1050,7 @@ kits_enabled = false
         let path = temp.join("portal.toml");
         std::fs::write(&path, "workspace = './workspace'\n").unwrap();
         let mut config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        config.security.permission_mode = PermissionMode::Supervised;
         assert!(
             !config.security.workspace_root.exists(),
             "loading config must not create directories"
@@ -1092,7 +1098,7 @@ kits_enabled = false
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Path outside workspace"));
+        assert!(error.to_string().contains("approval"));
         assert!(!outside.exists());
         assert!(host
             .call(
