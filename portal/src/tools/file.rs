@@ -559,6 +559,11 @@ pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
         file.write_all(&bytes)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to append to {}: {}", path.display(), e))?;
+        // Tokio can finish write_all while the blocking file write is still pending.
+        // Complete it before releasing the path lock or reporting success.
+        file.flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to flush {}: {}", path.display(), e))?;
     } else {
         atomic_write(&path, &bytes)
             .await
