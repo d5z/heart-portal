@@ -447,6 +447,14 @@ async fn main() -> Result<()> {
         );
     }
     connect_link = connect_link.or_else(|| config.connect_link.clone());
+    let instance_identity = match connect_link.as_deref() {
+        Some(link) => {
+            let (host, being_id, _) = relay_client::parse_loom_link(link)?;
+            format!("{}/{being_id}", host.to_ascii_lowercase())
+        }
+        None => format!("standalone/{}:{}", config.bind_host, config.bind_port),
+    };
+    config.subagent.scope_state_dir(&instance_identity, &location.path)?;
 
     if let Ok(t) = std::env::var("PORTAL_MCP_TOKEN") {
         if !t.is_empty() {
@@ -468,8 +476,7 @@ async fn main() -> Result<()> {
         anyhow::ensure!(bytes.len() <= 16384, "Subagent configuration too large");
         let args: serde_json::Value = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(args.is_object(), "Expected a configuration object");
-        // The explicit setup tool performs the one installation attempt.
-        config.subagent.auto_install = false;
+        // Manager construction is read-only; setup performs the installation.
         let host = ToolHost::new_with_runtime(&config, tools::status::RuntimeStatus::capture(&config, location, config_loaded, config.name.clone(), false, runtime_started));
         let result = host.call("portal_subagent_setup", args).await?;
         println!("DESKTOP_SUBAGENT_RESULT={}", result);
@@ -490,13 +497,6 @@ async fn main() -> Result<()> {
     let startup_guard = windows_upgrade::startup_guard()?;
     #[cfg(target_os = "macos")]
     let startup_guard = macos_upgrade::startup_guard()?;
-    let instance_identity = match connect_link.as_deref() {
-        Some(link) => {
-            let (host, being_id, _) = relay_client::parse_loom_link(link)?;
-            format!("{}/{being_id}", host.to_ascii_lowercase())
-        }
-        None => format!("standalone/{}:{}", config.bind_host, config.bind_port),
-    };
     let _single_instance =
         single_instance::acquire(Some(&instance_identity)).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -546,6 +546,7 @@ async fn main() -> Result<()> {
         runtime_started,
     );
     let mut tool_host = ToolHost::new_with_runtime(&config, runtime);
+    tool_host.subagent.publish_desktop_status();
     if let (Ok(file), Some(link)) = (
         std::env::var("HEART_PORTAL_CLIENT_FILE"),
         connect_link.as_deref(),

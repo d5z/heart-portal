@@ -488,14 +488,7 @@ impl SubagentManager {
     pub fn new(config: &PortalConfig, callback: HeartCallback) -> Arc<Self> {
         let sub = config.subagent.clone();
         let state_dir = sub.resolved_state_dir();
-        let mut command = PiDaemon::resolve_command(sub.command.as_deref());
-
-        // No pi anywhere (or Portal's own copy at the wrong version): install
-        // the pinned one. Best effort — every failure mode leaves `command`
-        // as it was and Portal carries on without the sub-agent.
-        if sub.enabled && sub.command.is_none() && sub.auto_install {
-            command = Self::provision_at_startup(command);
-        }
+        let command = PiDaemon::resolve_command(sub.command.as_deref());
 
         if sub.enabled {
             match &command {
@@ -549,34 +542,35 @@ impl SubagentManager {
         })
     }
 
-    /// Startup half of auto-provisioning: decide whether the resolved
-    /// `command` calls for an install, run it (with backoff), and re-resolve.
-    fn provision_at_startup(resolved: Option<Vec<String>>) -> Option<Vec<String>> {
+    /// Optional installation runs after Portal becomes locally ready.
+    pub async fn initialize(self: &Arc<Self>) {
+        if !self.config.enabled || self.config.command.is_some() || !self.config.auto_install { return; }
         let Some(root) = pi_daemon::bundled_pi_root() else {
-            return resolved;
+            return;
         };
+        let resolved = self.command();
         if !pi_daemon::bundled_pi_wants_provisioning(resolved.as_deref(), &root) {
-            return resolved;
+            return;
         }
-        // Provisioning is an optional capability. Even an unexpected installer
-        // panic must leave the main Portal alive with subagent unavailable.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = tokio::task::spawn_blocking(|| {
             pi_daemon::auto_provision_pi(false)
-        }));
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                warn!("subagent pi auto-install panicked; continuing without subagent");
-                return resolved;
-            }
-        };
-        match outcome {
-            Provision::Ready(_) => PiDaemon::resolve_command(None).or(resolved),
-            // Each of these already logged why; the sub-agent stays as it was.
-            Provision::NoNpm
-            | Provision::Deferred
-            | Provision::Failed(_)
-            | Provision::Unsupported => resolved,
+        }).await;
+        if matches!(outcome, Ok(Provision::Ready(_))) {
+            if let Some(command) = PiDaemon::resolve_command(None) { self.adopt_command(command).await; }
+        }
+    }
+
+    /// A public capability snapshot from the running engine, never credentials.
+    pub fn publish_desktop_status(&self) {
+        let (Some(file), Ok(nonce)) = (std::env::var_os("HEART_PORTAL_READY_FILE"), std::env::var("HEART_PORTAL_READY_NONCE")) else { return; };
+        let configured = !self.needs_setup();
+        let status = json!({"pid": std::process::id(), "nonce": nonce,
+            "enabled": self.config.enabled, "configured": configured,
+            "ready": self.is_available() && configured,
+            "state_dir": self.config.resolved_state_dir()});
+        let path = PathBuf::from(file).with_file_name(".portal-subagent-status.json");
+        if let Err(error) = std::fs::write(path, status.to_string()) {
+            warn!("Could not publish subagent status: {error}");
         }
     }
 
@@ -662,10 +656,6 @@ impl SubagentManager {
                  yourself and put it on PATH"
             ),
             Provision::Failed(reason) => anyhow::bail!("could not auto-install pi: {reason}"),
-            Provision::Unsupported => anyhow::bail!(
-                "auto-installing pi is not supported on this platform; install pi and \
-                 set [subagent].command"
-            ),
             // `force` disables the backoff, so this cannot come back; treat it
             // like a failure rather than trusting that.
             Provision::Deferred => anyhow::bail!("pi auto-install was deferred; try again"),
@@ -697,6 +687,7 @@ impl SubagentManager {
             *slot = fresh;
         }
         *self.pump_generation.lock().await = None;
+        self.publish_desktop_status();
     }
 
     // ── model configuration ─────────────────────────────────────────
@@ -785,6 +776,7 @@ impl SubagentManager {
             next.thinking.as_deref().unwrap_or("-"),
             if next.api_key.is_some() { "set" } else { "unset" }
         );
+        self.publish_desktop_status();
         Ok(ModelConfigOutcome {
             model: next,
             daemon_restarted,
@@ -1490,6 +1482,8 @@ impl SubagentManager {
         });
 
         let spec = StdioTask {
+            max_turns: task.budget.max_turns,
+            max_tokens: task.budget.max_tokens,
             prompt: message,
             workdir: task.workdir.clone(),
             provider: choice.provider,
@@ -1578,6 +1572,7 @@ impl SubagentManager {
             // handing back; the status is what says it was cut short.
             return (TaskStatus::Timeout, outcome);
         }
+        if run.budget_exhausted && outcome.error.is_none() { return (TaskStatus::BudgetExhausted, outcome); }
         // `classify` reads the accounting an autonomous daemon would report,
         // so budget exhaustion is judged by one rule in one place.
         let reported = json!({

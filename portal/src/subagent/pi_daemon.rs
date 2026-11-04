@@ -628,8 +628,8 @@ impl PiDaemon {
     /// noise on stderr is appended to the same `daemon.log`.
     ///
     /// Cancellation is by drop: the child is `kill_on_drop`, so aborting the
-    /// future kills pi. The only deadline enforced here is `task.timeout` —
-    /// turn and token budgets have no CLI equivalent.
+    /// future kills pi. Reported turns and tokens stop the process at the
+    /// budget limit; the wall-clock timeout also bounds silent processes.
     pub async fn run_stdio_task(&self, task: StdioTask) -> Result<StdioRun> {
         self.run_stdio_task_with_bridge(task, None).await
     }
@@ -697,28 +697,48 @@ impl PiDaemon {
             task.workdir.display()
         );
 
-        let stdout_reader = tokio::spawn(fold_stdout(stdout, task.transcript.clone()));
+        let (max_turns, max_tokens) = (task.max_turns, task.max_tokens);
+        let (budget_tx, budget_rx) = tokio::sync::oneshot::channel();
+        let stdout_reader = tokio::spawn(async move {
+            let mut result = StdioResult::default();
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                result.fold_line(&line);
+                if let Some(tx) = task.transcript.as_ref() {
+                    if let Some(rendered) = render_stdio_line(&line) { let _ = tx.send(rendered); }
+                }
+                if (max_turns > 0 && result.turns >= max_turns) || (max_tokens > 0 && result.usage.total >= max_tokens) {
+                    let _ = budget_tx.send(());
+                    break;
+                }
+            }
+            result
+        });
         let stderr_reader = tokio::spawn(read_stderr_tail(stderr, STDIO_STDERR_TAIL_BYTES));
 
-        let (exit_code, timed_out) = match time::timeout(task.timeout, async {
+        let wait = time::timeout(task.timeout, async {
             #[cfg(unix)]
             { owner.wait_unreaped().await?; owner.terminate(); }
             child.wait().await
-        }).await {
-            Ok(Ok(status)) => (status.code(), false),
+        });
+        let (exit_code, timed_out, budget_exhausted) = tokio::select! {
+            Ok(()) = budget_rx => (None, false, true),
+            status = wait => match status {
+            Ok(Ok(status)) => (status.code(), false, false),
             Ok(Err(e)) => {
                 warn!("waiting for the pi task failed: {e}");
-                (None, false)
+                (None, false, false)
             }
             Err(_) => {
                 warn!("pi task exceeded {:?}; terminating", task.timeout);
-                let _ = child.start_kill();
-                let _ = time::timeout(STDIO_KILL_GRACE, child.wait()).await;
-                (None, true)
+                (None, true, false)
             }
+            },
         };
-
-        drop(owner);
+        owner.terminate();
+        if timed_out || budget_exhausted {
+            let _ = time::timeout(STDIO_KILL_GRACE, child.wait()).await;
+        }
         // The readers end at EOF, which the exit above guarantees — but a
         // grandchild holding the pipe open must not hang the task forever.
         let result = time::timeout(STDIO_KILL_GRACE, stdout_reader)
@@ -735,10 +755,13 @@ impl PiDaemon {
             append_log(&self.log_path(), &stderr_tail);
         }
 
+        let budget_exhausted = budget_exhausted || (max_turns > 0 && result.turns >= max_turns)
+            || (max_tokens > 0 && result.usage.total >= max_tokens);
         Ok(StdioRun {
             result,
             exit_code,
             timed_out,
+            budget_exhausted,
             stderr_tail,
         })
     }
@@ -771,22 +794,22 @@ impl PiDaemon {
             } else {
                 find_on_path(&argv[0]).map(|p| p.display().to_string())
             }?;
-            let mut out = vec![resolved];
+            let mut out = pi_command(Path::new(&resolved))?;
             out.extend(argv[1..].iter().cloned());
             return Some(out);
         }
 
         if let Some(root) = bundled_root {
             let bundled = bundled_pi_binary(root);
-            if bundled.exists() {
-                return Some(vec![bundled.display().to_string()]);
+            if let Some(command) = pi_command(&bundled) {
+                return Some(command);
             }
         }
 
         PI_BINARY_CANDIDATES
             .iter()
             .find_map(|name| find_on_path(name))
-            .map(|p| vec![p.display().to_string()])
+            .and_then(|p| pi_command(&p))
     }
 }
 
@@ -800,7 +823,30 @@ pub fn bundled_pi_root() -> Option<PathBuf> {
 
 /// `<root>/bin/pi` — the path `resolve_command` looks at.
 pub fn bundled_pi_binary(root: &Path) -> PathBuf {
-    root.join("bin").join("pi")
+    #[cfg(windows)]
+    { root.join("node_modules/@mariozechner/pi-coding-agent/dist/cli.js") }
+    #[cfg(not(windows))]
+    { root.join("bin").join("pi") }
+}
+
+/// Resolve npm's JS entry point through Node instead of executing a Unix shim
+/// or passing a potentially long prompt through cmd.exe.
+fn pi_command(program: &Path) -> Option<Vec<String>> {
+    #[cfg(windows)]
+    {
+        let cli = if program.extension().is_some_and(|ext| ext == "js") {
+            Some(program.to_path_buf())
+        } else if program.file_name().is_some_and(|name| name == "pi.cmd") {
+            program.parent().map(|dir| dir.join("node_modules/@mariozechner/pi-coding-agent/dist/cli.js"))
+                .filter(|path| path.is_file())
+        } else { None };
+        if let Some(cli) = cli {
+            if !cli.is_file() { return None; }
+            let node = find_on_path("node")?;
+            return Some(vec![node.display().to_string(), cli.display().to_string()]);
+        }
+    }
+    is_executable(program).then(|| vec![program.display().to_string()])
 }
 
 /// `<root>/VERSION` — which pinned version the install under `root` is.
@@ -809,6 +855,7 @@ pub fn bundled_pi_version_file(root: &Path) -> PathBuf {
 }
 
 /// Where npm puts the launcher for the package's `bin` entry.
+#[cfg(unix)]
 fn npm_bin_pi(root: &Path) -> PathBuf {
     root.join("node_modules").join(".bin").join("pi")
 }
@@ -832,8 +879,6 @@ pub enum Provision {
     /// npm ran and did not produce a working binary. The string is the
     /// human-readable reason (npm's stderr tail, a timeout, …).
     Failed(String),
-    /// Auto-provisioning is not implemented for this platform.
-    Unsupported,
 }
 
 impl Provision {
@@ -863,7 +908,7 @@ pub fn bundled_pi_wants_provisioning(resolved: Option<&[String]>, root: &Path) -
         None => true,
         Some(argv) => {
             let bundled = bundled_pi_binary(root);
-            argv.first().is_some_and(|p| Path::new(p) == bundled) && !bundled_pi_is_current(root)
+            argv.iter().any(|p| Path::new(p) == bundled) && !bundled_pi_is_current(root)
         }
     }
 }
@@ -897,11 +942,6 @@ pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provis
         return Provision::NoNpm;
     };
 
-    if !cfg!(unix) {
-        warn!("auto-installing pi is only supported on unix; install pi manually");
-        return Provision::Unsupported;
-    }
-
     if !force && attempted_recently(root) {
         info!(
             "skipping pi auto-install: the last attempt failed less than {}h ago",
@@ -930,7 +970,10 @@ pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provis
         return Provision::Failed(reason);
     }
 
+    #[cfg(unix)]
     let target = npm_bin_pi(root);
+    #[cfg(windows)]
+    let target = bundled_pi_binary(root);
     if !target.exists() {
         let reason = format!(
             "npm finished but {} does not exist; the package layout may have changed",
@@ -941,6 +984,7 @@ pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provis
     }
 
     let binary = bundled_pi_binary(root);
+    #[cfg(unix)]
     if let Err(e) = link_binary(&target, &binary) {
         let reason = format!("linking {} -> {}: {e}", binary.display(), target.display());
         warn!("Could not auto-install pi: {reason}; sub-agent will be unavailable");
@@ -962,8 +1006,13 @@ pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provis
 /// [`NPM_INSTALL_TIMEOUT`]. `Err` carries a one-line reason.
 fn run_npm_install(npm: &Path, root: &Path) -> std::result::Result<(), String> {
     let spec = format!("{PI_NPM_PACKAGE}@{PI_PINNED_VERSION}");
-    let mut child = std::process::Command::new(npm)
-        .arg("install")
+    let mut command = std::process::Command::new(npm);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.arg("install")
         .arg("--prefix")
         .arg(root)
         .arg("--no-fund")
@@ -1033,14 +1082,6 @@ fn link_binary(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
-#[cfg(not(unix))]
-fn link_binary(_target: &Path, _link: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "auto-provisioning pi is unix-only",
-    ))
-}
-
 fn attempted_recently(root: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(last_attempt_file(root)) else {
         return false;
@@ -1085,6 +1126,8 @@ fn child_environment(
 /// One task to run as its own pi process ([`PiDaemon::run_stdio_task`]).
 #[derive(Debug, Clone)]
 pub struct StdioTask {
+    pub max_turns: u32,
+    pub max_tokens: u64,
     /// The full prompt, exactly as a daemon session would have received it.
     pub prompt: String,
     /// cwd for the process; the sub-agent's working directory.
@@ -1109,6 +1152,7 @@ pub struct StdioRun {
     /// `None` when pi was killed (timeout) or never reported a code.
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    pub budget_exhausted: bool,
     /// Tail of pi's stderr, for explaining a failure in the callback.
     pub stderr_tail: String,
 }
@@ -1120,6 +1164,7 @@ impl StdioRun {
         if let Some(message) = self.result.error_message.clone() {
             return Some(message);
         }
+        if self.budget_exhausted { return None; }
         if self.result.failed() {
             return Some(format!(
                 "pi stopped with '{}'",
@@ -1140,25 +1185,6 @@ impl StdioRun {
             }),
         }
     }
-}
-
-/// Fold pi's stdout JSONL, mirroring anything worth showing into the
-/// transcript as it arrives so `portal_subagent_log` still works.
-async fn fold_stdout(
-    stdout: tokio::process::ChildStdout,
-    transcript: Option<mpsc::UnboundedSender<String>>,
-) -> StdioResult {
-    let mut result = StdioResult::default();
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        result.fold_line(&line);
-        if let Some(tx) = transcript.as_ref() {
-            if let Some(rendered) = render_stdio_line(&line) {
-                let _ = tx.send(rendered);
-            }
-        }
-    }
-    result
 }
 
 /// pi's `--mode json` lines are shaped like daemon session events, so the
@@ -1293,7 +1319,13 @@ pub fn home_dir() -> Option<PathBuf> {
 pub fn find_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
+        .flat_map(|dir| {
+            #[cfg(windows)]
+            { if Path::new(program).extension().is_none() {
+                return ["exe", "com", "cmd", "bat"].iter().map(|ext| dir.join(format!("{program}.{ext}"))).collect::<Vec<_>>();
+            } }
+            vec![dir.join(program)]
+        })
         .find(|candidate| is_executable(candidate))
 }
 
@@ -1307,7 +1339,8 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
-    path.is_file()
+    path.is_file() && path.extension().is_some_and(|ext|
+        matches!(ext.to_string_lossy().to_ascii_lowercase().as_str(), "exe" | "com" | "cmd" | "bat"))
 }
 
 #[cfg(test)]
@@ -1342,6 +1375,70 @@ mod tests {
         {
             "/bin/sh".to_string()
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_provisioning_and_resolution_use_node_not_the_posix_shim() {
+        let root = std::env::temp_dir().join(format!("pi install {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let install = root.join("installed pi");
+        let npm = root.join("npm.cmd");
+        std::fs::write(&npm, "@echo off\r\nmkdir \"node_modules\\@mariozechner\\pi-coding-agent\\dist\"\r\necho console.log('installed'); > \"node_modules\\@mariozechner\\pi-coding-agent\\dist\\cli.js\"\r\n").unwrap();
+        let binary = bundled_pi_binary(&install);
+        assert_eq!(provision_pi_into(&install, Some(&npm), false), Provision::Ready(binary.clone()));
+        assert!(bundled_pi_is_current(&install));
+        let resolved = PiDaemon::resolve_command_with_bundled(None, Some(&install)).unwrap();
+        assert_eq!(Path::new(&resolved[0]).file_name().unwrap().to_string_lossy().to_lowercase(), "node.exe");
+        assert_eq!(Path::new(&resolved[1]), binary);
+        assert!(!bundled_pi_wants_provisioning(Some(&resolved), &install));
+        std::fs::write(install.join("pi"), "#!/bin/sh\n").unwrap();
+        assert!(pi_command(&install.join("pi")).is_none());
+        std::fs::write(install.join("pi.cmd"), "@echo off").unwrap();
+        assert_eq!(pi_command(&install.join("pi.cmd")).unwrap(), resolved);
+        assert!(find_on_path("cmd").unwrap().ends_with("cmd.exe"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_budget_stops_before_the_next_turn() {
+        for (max_turns, max_tokens) in [(1, 0), (0, 10)] {
+            let root = temp_dir("budget");
+            let event = r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":8,"output":2}}}"#;
+            #[cfg(windows)]
+            let command = {
+                let script = root.join("pi.cmd");
+                std::fs::write(&script, format!("@echo off\r\necho {event}\r\necho {{\"type\":\"turn_end\"}}\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 6 127.0.0.1 >nul\r\necho ran > next-turn\r\n")).unwrap();
+                vec![script.display().to_string()]
+            };
+            #[cfg(unix)]
+            let command = vec!["/bin/sh".into(), "-c".into(), format!("printf '%s\\n' '{event}' '{{\"type\":\"turn_end\"}}'; sleep 5; touch next-turn")];
+            let daemon = PiDaemon::new(PiDaemonConfig {
+                command, state_dir: root.join("s"), workspace_root: root.clone(),
+                env_passthrough: vec!["PATH".into()], api_key: None, provider: None,
+            });
+            let started = time::Instant::now();
+            let run = daemon.run_stdio_task(StdioTask {
+                max_turns, max_tokens, prompt: "test".into(), workdir: root.clone(),
+                provider: None, model: None, thinking: None, api_key: None,
+                timeout: Duration::from_secs(15), transcript: None,
+            }).await.unwrap();
+            assert!(run.budget_exhausted, "{run:?}");
+            assert!(!run.timed_out);
+            assert!(run.error().is_none());
+            assert!(started.elapsed() < Duration::from_secs(4));
+            assert!(!root.join("next-turn").exists());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn budget_termination_does_not_hide_a_reported_provider_error() {
+        let run = StdioRun {
+            result: StdioResult { error_message: Some("provider refused request".into()), ..Default::default() },
+            exit_code: None, timed_out: false, budget_exhausted: true, stderr_tail: String::new(),
+        };
+        assert_eq!(run.error().as_deref(), Some("provider refused request"));
     }
 
     #[test]
@@ -1785,6 +1882,8 @@ JSON
         let (tx, mut rx) = mpsc::unbounded_channel();
         let run = d
             .run_stdio_task(StdioTask {
+                max_turns: 40,
+                max_tokens: 400_000,
                 prompt: "# Task sub_1\nrefactor the thing".to_string(),
                 workdir: workdir.clone(),
                 provider: Some("openrouter".to_string()),
@@ -1844,6 +1943,8 @@ JSON
         let started = time::Instant::now();
         let run = d
             .run_stdio_task(StdioTask {
+                max_turns: 40,
+                max_tokens: 400_000,
                 prompt: "take too long".to_string(),
                 workdir: root.clone(),
                 provider: None,
@@ -1883,6 +1984,8 @@ JSON
 
         let run = d
             .run_stdio_task(StdioTask {
+                max_turns: 40,
+                max_tokens: 400_000,
                 prompt: "anything".to_string(),
                 workdir: root.clone(),
                 provider: None,

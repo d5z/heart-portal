@@ -155,7 +155,8 @@ pub struct SubagentConfig {
     pub auto_install: bool,
 
     /// Ledger, daemon socket, pi agent dir and pi sessions.
-    /// Default `~/.heart-portal/subagent`. Sensitive: holds auth + transcripts.
+    /// Default `~/.heart-portal/subagent/<Portal identity hash>`.
+    /// Sensitive: holds auth + transcripts; never shared across Being identities.
     #[serde(default)]
     pub state_dir: Option<String>,
 
@@ -420,6 +421,17 @@ impl Default for BudgetConfig {
 }
 
 impl SubagentConfig {
+    pub fn scope_state_dir(&mut self, identity: &str, config_path: &std::path::Path) -> Result<()> {
+        let directory = self.resolved_state_dir();
+        let directory = if self.state_dir.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            use sha2::{Digest, Sha256};
+            let hash = format!("{:x}", Sha256::digest(identity.as_bytes()));
+            directory.join(&hash[..16])
+        } else { crate::paths::resolve_relative(&directory, config_path)? };
+        self.state_dir = Some(directory.to_string_lossy().into_owned());
+        Ok(())
+    }
+
     /// `state_dir` with `~` expanded, or the default under Portal's home.
     pub fn resolved_state_dir(&self) -> PathBuf {
         let raw = self
@@ -740,6 +752,23 @@ fn default_env_passthrough() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_state_is_scoped_by_identity_and_explicit_paths_are_preserved() {
+        let config = test_config_path("scope");
+        let mut first = SubagentConfig::default();
+        let mut same = first.clone();
+        let mut other = first.clone();
+        first.scope_state_dir("host/being-a", &config).unwrap();
+        same.scope_state_dir("host/being-a", &config).unwrap();
+        other.scope_state_dir("host/being-b", &config).unwrap();
+        assert_eq!(first.state_dir, same.state_dir);
+        assert_ne!(first.state_dir, other.state_dir);
+        assert!(first.resolved_state_dir().is_absolute());
+        let mut explicit = SubagentConfig { state_dir: Some("custom-state".into()), ..Default::default() };
+        explicit.scope_state_dir("host/being-a", &config).unwrap();
+        assert_eq!(explicit.resolved_state_dir(), config.parent().unwrap().join("custom-state"));
+    }
 
     fn test_config_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("heart-portal-{tag}-{}.toml", uuid::Uuid::new_v4()))

@@ -184,6 +184,8 @@ impl ToolHost {
     /// Pre-spawn eager kits (manifest.eager == true) so the first call has
     /// no cold-start latency. Failures are logged, not fatal.
     pub async fn warmup_kits(&self) {
+        self.subagent.initialize().await;
+        self.notify_tools_changed();
         if self.config.security.permission_mode == crate::config::PermissionMode::FullAccess {
             self.kits.warmup().await;
         }
