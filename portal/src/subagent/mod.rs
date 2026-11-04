@@ -2626,7 +2626,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn stdio_subagent_keeps_native_tools_only_in_full_access() {
+    async fn windows_subagent_falls_back_without_hello_and_preserves_tool_policy() {
         use crate::config::PermissionMode;
         for mode in [PermissionMode::FullAccess, PermissionMode::Supervised, PermissionMode::ReadOnly] {
             let workspace = temp_workspace("stdio-policy");
@@ -2634,10 +2634,16 @@ mod tests {
             // Use only CMD built-ins: this fixture records argv/environment and
             // emits Pi's stdio protocol, without PowerShell module initialization.
             std::fs::write(&script, r###"@echo off
+if "%~1"=="--mode" goto rpc
 > "%~dp0launch.args" echo %*
 if defined PORTAL_TOOL_TOKEN (> "%~dp0broker.txt" echo true) else (> "%~dp0broker.txt" echo false)
 echo {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"## Result\nDone"}],"stopReason":"stop"}}
 echo {"type":"agent_end","messages":[]}
+exit /b 0
+:rpc
+>> "%~dp0rpc-probes.txt" echo probe
+set /p received=
+if defined received (> "%~dp0unexpected-command.txt" echo received)
 exit /b 0
 "###.replace('\n', "\r\n")).unwrap();
             let mut config = PortalConfig::default();
@@ -2654,9 +2660,13 @@ exit /b 0
             let manager = SubagentManager::new(&config, HeartCallback::new());
             let request = SpawnRequest { brief: "Check launch policy".into(), session: "policy-test".into(),
                 workdir: None, budget: manager.default_budget(), model: None, thinking: None, scene_id: None };
-            // Exercise the per-task fallback directly; the fake process does not
-            // implement the independent long-lived daemon/RPC protocol.
-            let (session, _) = manager.ensure_session(&Transport::Stdio, &request.session, &workspace, &request).await.unwrap();
+            // Stock RPC waits for input without sending daemon_hello. Full access
+            // must detect that before sending any daemon command; restricted
+            // modes already select the broker-backed per-task transport.
+            let transport = manager.transport().await.unwrap();
+            assert_eq!(transport.mode(), TransportMode::Stdio, "{mode:?}");
+            assert_eq!(manager.transport().await.unwrap().mode(), TransportMode::Stdio);
+            let (session, _) = manager.ensure_session(&transport, &request.session, &workspace, &request).await.unwrap();
             let task = manager.register_task("policy-task".into(), &request.session, &request.brief, &workspace, &request).await;
             let run = time::timeout(Duration::from_secs(20), manager.clone().run_task_stdio(
                 session, task.clone(), request.brief.clone(), manager.model_choice(&request))).await;
@@ -2671,6 +2681,9 @@ exit /b 0
             // Report the subprocess error before looking for its output file.
             assert_eq!(status, TaskStatus::Done, "{mode:?}: {error:?}");
             let launch = launch.unwrap();
+            assert!(!workspace.join("unexpected-command.txt").exists(), "daemon commands reached stock RPC");
+            let probes = std::fs::read_to_string(workspace.join("rpc-probes.txt")).unwrap_or_default();
+            assert_eq!(probes.lines().count(), usize::from(mode == PermissionMode::FullAccess), "RPC must be probed at most once");
             drop(task);
             drop(manager);
             // Windows may retain a sharing lock briefly after process exit.

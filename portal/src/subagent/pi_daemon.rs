@@ -315,7 +315,7 @@ impl PiDaemon {
         }
         match self.ensure_running().await {
             Ok(client) => Ok(Transport::Daemon(client)),
-            // `await_socket_ready` latches the mode when the failure *was*
+            // The readiness probe latches the mode when the failure *was*
             // "this pi has no daemon mode"; any other failure is still one.
             Err(e) if self.transport_mode().await == TransportMode::Stdio => {
                 warn!(
@@ -405,8 +405,8 @@ impl PiDaemon {
         }
         #[cfg(not(unix))]
         {
-            // Windows named pipes are Phase 4; until then pi is driven over
-            // piped stdio, which the same PiClient speaks.
+            // Only use daemon commands if this process announces that protocol.
+            // Stock RPC does not; await_stdio_ready selects per-task JSON instead.
             cmd.args(["--mode", "rpc"]);
         }
 
@@ -548,7 +548,7 @@ impl PiDaemon {
         }
     }
 
-    /// Degraded transport for platforms without a Unix socket client.
+    /// Probe stdio for daemon support; stock RPC does not send daemon_hello.
     #[cfg(not(unix))]
     async fn await_stdio_ready(
         &self,
@@ -560,8 +560,16 @@ impl PiDaemon {
             .child_stdin
             .take()
             .ok_or_else(|| anyhow::anyhow!("pi stdin was not piped"))?;
-        warn!("using the experimental stdio transport for pi; named-pipe support is pending");
-        PiClient::connect_io(stdout, stdin, "pi stdio".to_string(), ConnectPolicy::LENIENT).await
+        let client = match PiClient::connect_io(stdout, stdin, "pi stdio".to_string(), ConnectPolicy::PROBE).await {
+            Ok(client) => client,
+            Err(error) => {
+                state.mode = TransportMode::Stdio;
+                return Err(error);
+            }
+        };
+        // A received but incompatible greeting is a protocol error, not stock RPC.
+        client.hello().check_protocol()?;
+        Ok(client)
     }
 
     /// Ask the daemon to stop, then escalate. Adopted daemons get the request

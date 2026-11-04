@@ -37,8 +37,6 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// How strict [`PiClient::connect_io`] is about the greeting.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectPolicy {
-    /// Fail if no `daemon_hello` arrives within [`HELLO_TIMEOUT`].
-    pub require_hello: bool,
     /// Fail on a protocol name/version Portal does not implement.
     pub strict_protocol: bool,
 }
@@ -46,19 +44,11 @@ pub struct ConnectPolicy {
 impl ConnectPolicy {
     /// Normal use: a usable v7 daemon or nothing.
     pub const STRICT: Self = Self {
-        require_hello: true,
         strict_protocol: true,
     };
     /// Adoption probe: get the greeting, let the caller judge the version so a
     /// wrong-version daemon can be shut down instead of merely rejected.
     pub const PROBE: Self = Self {
-        require_hello: true,
-        strict_protocol: false,
-    };
-    /// Degraded stdio transport that may never greet.
-    #[allow(dead_code)] // only reachable on the non-unix stdio fallback
-    pub const LENIENT: Self = Self {
-        require_hello: false,
         strict_protocol: false,
     };
 }
@@ -149,13 +139,9 @@ impl PiClient {
                 }
                 hello
             }
-            Ok(Err(e)) if policy.require_hello => return Err(e),
-            Err(_) if policy.require_hello => {
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
                 anyhow::bail!("pi daemon at {label} sent no daemon_hello within {HELLO_TIMEOUT:?}")
-            }
-            _ => {
-                warn!("pi at {label} sent no greeting; continuing unverified");
-                DaemonHello::unverified()
             }
         };
 
@@ -503,11 +489,20 @@ mod tests {
 
     #[tokio::test]
     async fn greeting_is_parsed_and_capabilities_exposed() {
-        let (client, _daemon) = connect_pair(Some(HELLO_LINE)).await;
+        let (client, mut daemon) = connect_pair(Some(HELLO_LINE)).await;
         assert!(client.is_connected());
         assert_eq!(client.hello().app_version.as_deref(), Some("0.7.2"));
         assert_eq!(client.hello().supervisor_pid, Some(4242));
         assert!(client.hello().supports("session_input_admission"));
+
+        client.notify(Command::Shutdown { force: false }).await;
+        // Inspect the actual wire format before FakeDaemon unwraps it.
+        let mut line = String::new();
+        daemon.reader.read_line(&mut line).await.unwrap();
+        let message: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(message["type"], "command");
+        assert_eq!(message["protocol"]["version"], 7);
+        assert_eq!(message["command"]["type"], "shutdown");
     }
 
     #[tokio::test]

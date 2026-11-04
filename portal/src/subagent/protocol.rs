@@ -89,21 +89,6 @@ impl DaemonHello {
     pub fn supports(&self, capability: &str) -> bool {
         self.server_capabilities.iter().any(|c| c == capability)
     }
-
-    /// A stdio/degraded transport that never sent a hello.
-    pub fn unverified() -> Self {
-        Self {
-            protocol: ProtocolInfo {
-                name: DAEMON_PROTOCOL_NAME.to_string(),
-                version: DAEMON_PROTOCOL_VERSION,
-            },
-            schema_id: None,
-            app_version: None,
-            supervisor_pid: None,
-            client_id: None,
-            server_capabilities: Vec::new(),
-        }
-    }
 }
 
 // ── inbound ─────────────────────────────────────────────────────────
