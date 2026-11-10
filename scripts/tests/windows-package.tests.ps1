@@ -214,6 +214,27 @@ try {
     Assert ($runtimeCommand -notlike '*synthetic-rotated-token*') 'runtime process argv excludes connection token'
     Assert (($result.output + $result.error) -notlike '*synthetic-rotated-token*') 'connection change output excludes token'
     Write-Output 'PASS: delegated connection overrides saved launch without token-bearing child argv'
+
+    $result = Run-Portal @('stop')
+    Assert ($result.code -eq 0) 'stop before changing runtime permissions'
+    $result = Run-Portal @('--permission-mode','read-only','--exec-enabled','false','--kits-enabled','false')
+    Assert ($result.code -eq 0) "delegated runtime overrides start successfully: $($result.error)"
+    $launch = Read-PortalJson (Join-Path $testRoot '.portal-launch.json')
+    $arguments = $launch.arguments -join ' '
+    foreach ($expected in @('--permission-mode read-only','--exec-enabled false','--kits-enabled false')) {
+        Assert ($arguments.Contains($expected)) "saved launch preserves $expected"
+    }
+    $before = Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')
+    $process = Get-Process -Id $before.pid
+    try { $process.Kill(); Assert ($process.WaitForExit(5000)) 'runtime killed to verify permission-preserving recovery' }
+    finally { $process.Dispose() }
+    Wait-Until { (Test-PortalReady $testRoot $version) -and (Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid -ne $before.pid } 'recovery with runtime overrides' 30
+    $runtimePid = (Read-PortalJson (Join-Path $testRoot '.portal-runtime.json')).pid
+    $runtimeCommand = (Get-CimInstance Win32_Process -Filter "ProcessId=$runtimePid").CommandLine
+    Assert ($runtimeCommand -like '*--permission-mode*read-only*') 'restarted process retains the restricted permission mode'
+    Assert ($runtimeCommand -like '*--exec-enabled*false*') 'restarted process retains disabled exec'
+    Assert ($runtimeCommand -like '*--kits-enabled*false*') 'restarted process retains disabled kits'
+    Write-Output 'PASS: permission and tool overrides survive download delegation and supervisor recovery'
 } catch {
     $testFailure = $_
     Write-Output ("FAILED: " + $_.ToString() + "`n" + $_.ScriptStackTrace)

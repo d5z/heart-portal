@@ -28,6 +28,15 @@ impl ClientHandler for Approver {
 }
 
 #[tokio::test]
+async fn remote_subagent_setup_still_requires_approval() {
+    for mode in [PermissionMode::ReadOnly, PermissionMode::Supervised, PermissionMode::AutoReview] {
+        let (_f, config) = fixture(mode);
+        let error = ToolHost::new(&config).call("portal_subagent_setup", json!({})).await.unwrap_err();
+        assert!(error.to_string().contains(if mode == PermissionMode::ReadOnly { "denied by permission mode" } else { "approval denied" }));
+    }
+}
+
+#[tokio::test]
 async fn external_writes_require_exact_single_call_approval_and_reads_do_not() {
     for mode in [PermissionMode::Supervised, PermissionMode::AutoReview] {
         let (f, config) = fixture(mode);

@@ -2,6 +2,14 @@
 use anyhow::{Context, Result};
 use std::{future::Future, path::PathBuf, pin::Pin};
 
+// Reserve only the desktop protocol verbs. Other @ prefixes are shell syntax
+// (cmd's @echo, PowerShell arrays/hashtables), including in client-managed runs.
+pub fn parse_command(command: &str) -> Option<(&str, &str)> {
+    let command = command.trim_start().strip_prefix('@')?;
+    let (verb, args) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
+    matches!(verb, "context" | "scenes" | "plugins" | "security-approve").then_some((verb, args.trim()))
+}
+
 pub trait ClientHandler: Send + Sync {
     fn handle_client_command<'a>(
         &'a self,
@@ -93,6 +101,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_at_prefixes_work_with_and_without_a_desktop_handler() {
+        for command in ["@echo marker", "@(1,2) | Write-Output", "@{key=1}", "@unknown"] {
+            assert!(parse_command(command).is_none());
+        }
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::temp_dir();
+        for host in [ToolHost::new(&config), ToolHost::new(&config).with_client_handler(Arc::new(Echo))] {
+            let command = if cfg!(windows) { "@echo shell-marker" } else { "@not-a-command 2>/dev/null || printf shell-marker" };
+            let result = host.call("portal_exec", json!({"command":command})).await.unwrap();
+            assert_eq!(result["isError"], false);
+            assert!(result["content"][0]["text"].as_str().unwrap().contains("shell-marker"));
+            #[cfg(windows)] {
+                let result = host.call("portal_exec", json!({"command":"@(1,2) | Write-Output", "shell":"powershell"})).await.unwrap();
+                assert_eq!(result["isError"], false);
+                assert!(result["content"][0]["text"].as_str().unwrap().contains("1"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn dispatches_client_commands_and_preserves_metadata() {
         let config = PortalConfig::default();
         let host = ToolHost::new(&config).with_client_handler(Arc::new(Echo));
@@ -102,8 +130,8 @@ mod tests {
             ("@scenes", "scenes||scene-a"),
             ("@context", "context||scene-a"),
             (
-                "@unknown ; echo forbidden",
-                "unknown|; echo forbidden|scene-a",
+                "@plugins ; echo forbidden",
+                "plugins|; echo forbidden|scene-a",
             ),
         ] {
             let request = serde_json::from_value(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",

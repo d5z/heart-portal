@@ -83,8 +83,32 @@ class PublicDiagnosticsTests(fixture.KitLifecycleTests):
             self.assertNotIn(url, json.dumps(setup))
 
 
+class StandalonePermissionsTests(fixture.KitLifecycleTests):
+    tools_enabled = True
+
+    def test_standalone_defaults_to_full_access_without_client_registration(self):
+        authorization = self.value('portal_status')['authorization']
+        self.assertEqual(authorization['permission_mode'], 'FullAccess')
+        self.assertEqual(authorization['command_backend'], 'host')
+        self.assertEqual(authorization['custom_mcp_startup'], 'automatic')
+        self.assertFalse(authorization['os_sandbox'])
+        outside = self.root / 'outside.txt'
+        for tool, arguments in [
+            ('portal_file_write', {'path': str(outside), 'content': 'standalone-marker'}),
+            ('portal_file_edit', {'path': str(outside), 'old_text': 'standalone', 'new_text': 'edited'}),
+        ]:
+            result = self.call(tool, arguments)
+            self.assertFalse(result.get('isError'), result)
+        self.assertEqual(outside.read_text(), 'edited-marker')
+        self.assertIn('edited-marker', json.dumps(self.call('portal_file_read', {'path': str(outside)})))
+        self.assertIn('edited-marker', json.dumps(self.call('portal_search', {'path': str(outside), 'pattern': 'marker'})))
+        result = self.call('portal_exec', {'command': 'echo host-marker > shell.txt', 'workdir': str(self.root)})
+        self.assertFalse(result.get('isError'), result)
+        self.assertEqual((self.root / 'shell.txt').read_text().strip(), 'host-marker')
+
+
 if __name__ == '__main__':
-    suite = unittest.TestSuite(cls(name) for cls in (MetadataTests, PublicDiagnosticsTests)
+    suite = unittest.TestSuite(cls(name) for cls in (MetadataTests, PublicDiagnosticsTests, StandalonePermissionsTests)
                                for name in cls.__dict__ if name.startswith('test_'))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(not result.wasSuccessful())

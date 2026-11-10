@@ -13,7 +13,7 @@ mod screenshot;
 mod search;
 mod security;
 pub(crate) mod status;
-mod subagent;
+pub(crate) mod subagent;
 pub(crate) mod text;
 #[cfg(test)]
 mod utf8_tests;
@@ -640,6 +640,7 @@ impl ToolHost {
     }
 
     /// Execute a tool call (built-in or custom)
+    #[cfg(test)]
     pub async fn call(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         self.call_with_scene(tool_name, arguments, None).await
     }
@@ -715,15 +716,11 @@ impl ToolHost {
                 if !self.config.tools.exec {
                     anyhow::bail!("portal_exec is disabled in configuration");
                 }
-                if let Some(command) = arguments
+                if let Some((verb, args)) = arguments
                     .get("command")
                     .and_then(Value::as_str)
-                    .and_then(|s| s.trim_start().strip_prefix('@'))
+                    .and_then(client::parse_command)
                 {
-                    let (verb, args) = command
-                        .split_once(char::is_whitespace)
-                        .unwrap_or((command, ""));
-                    anyhow::ensure!(!verb.is_empty(), "Missing client command after @");
                     anyhow::ensure!(verb != "security-approve", "Reserved client command");
                     let text = self
                         .client_handler

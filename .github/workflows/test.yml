@@ -33,6 +33,7 @@ jobs:
       - name: Runtime security regressions
         run: |
           python scripts/tests/runtime-security.tests.py
+          python scripts/tests/runtime-compat.tests.py
           python scripts/tests/kit-isolation.tests.py test_host_secrets_are_not_inherited_and_dotenv_values_remain_literal test_metadata_limits_reject_bad_files_without_losing_a_working_kit
       - name: Configuration path compatibility and migration
         run: python scripts/tests/config-layout.tests.py

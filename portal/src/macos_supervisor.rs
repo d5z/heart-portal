@@ -13,7 +13,7 @@ pub fn attached() -> bool {
     TOKEN.get().is_some()
 }
 
-pub async fn start(config: &str, connect: Option<&str>, name: Option<&str>) -> Result<()> {
+pub async fn start(config: &str, connect: Option<&str>, name: Option<&str>, overrides: &[String]) -> Result<()> {
     if std::env::var("HEART_PORTAL_SUPERVISED").as_deref() == Ok("1") {
         return Ok(());
     }
@@ -27,6 +27,7 @@ pub async fn start(config: &str, connect: Option<&str>, name: Option<&str>) -> R
     if let Some(name) = name {
         arguments.extend(["--name".to_owned(), name.to_owned()]);
     }
+    arguments.extend_from_slice(overrides);
     let token = run("start", arguments, connect).await?;
     TOKEN.set(token.trim().to_owned()).ok();
     Ok(())

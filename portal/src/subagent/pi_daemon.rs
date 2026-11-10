@@ -74,8 +74,6 @@ pub const NPM_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// machine without network does not pay 30 s on every Portal start. An
 /// explicit request (`portal_subagent_setup`) ignores the backoff.
 const PROVISION_RETRY_BACKOFF: Duration = Duration::from_secs(60 * 60);
-/// Poll interval while waiting for npm.
-const NPM_POLL: Duration = Duration::from_millis(200);
 /// How long `ensure_running` waits for a freshly spawned daemon to greet.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Interval of the readiness loop.
@@ -920,19 +918,19 @@ pub fn bundled_pi_wants_provisioning(resolved: Option<&[String]>, root: &Path) -
 /// `force` skips the retry backoff — for an explicit request from the being,
 /// as opposed to Portal's own startup check.
 ///
-/// Blocks for up to [`NPM_INSTALL_TIMEOUT`]; call it from a blocking
-/// context (`spawn_blocking`) when inside the runtime.
-pub fn auto_provision_pi(force: bool) -> Provision {
+/// Runs asynchronously for up to [`NPM_INSTALL_TIMEOUT`]. Dropping the future
+/// cancels npm and its descendants, including during Portal shutdown.
+pub async fn auto_provision_pi(force: bool) -> Provision {
     let Some(root) = bundled_pi_root() else {
         return Provision::Failed("no home directory to install pi under".to_string());
     };
     let npm = find_on_path(if cfg!(windows) { "npm.cmd" } else { "npm" });
-    provision_pi_into(&root, npm.as_deref(), force)
+    provision_pi_into(&root, npm.as_deref(), force).await
 }
 
 /// The testable core of [`auto_provision_pi`]: `root` and the npm program are
 /// explicit. `npm = None` models a machine without npm.
-pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provision {
+pub async fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provision {
     if bundled_pi_is_current(root) {
         return Provision::Ready(bundled_pi_binary(root));
     }
@@ -965,7 +963,7 @@ pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provis
             root.display()
         ),
     }
-    if let Err(reason) = run_npm_install(npm, root) {
+    if let Err(reason) = run_npm_install(npm, root).await {
         warn!("Could not auto-install pi: {reason}; sub-agent will be unavailable");
         return Provision::Failed(reason);
     }
@@ -1004,15 +1002,10 @@ pub fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> Provis
 
 /// `npm install --prefix <root> <package>@<version>`, killed after
 /// [`NPM_INSTALL_TIMEOUT`]. `Err` carries a one-line reason.
-fn run_npm_install(npm: &Path, root: &Path) -> std::result::Result<(), String> {
+async fn run_npm_install(npm: &Path, root: &Path) -> std::result::Result<(), String> {
     let spec = format!("{PI_NPM_PACKAGE}@{PI_PINNED_VERSION}");
-    let mut command = std::process::Command::new(npm);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    let mut child = command.arg("install")
+    let mut command = TokioCommand::new(npm);
+    command.arg("install")
         .arg("--prefix")
         .arg(root)
         .arg("--no-fund")
@@ -1023,43 +1016,24 @@ fn run_npm_install(npm: &Path, root: &Path) -> std::result::Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .kill_on_drop(true);
+    // Dropping this future (shutdown/cancellation) terminates the entire
+    // installer tree through the same ownership used by shell and pi tasks.
+    let (mut child, owner) = crate::mcp::ProcessOwner::spawn_exec(&mut command)
         .map_err(|e| format!("spawning {}: {e}", npm.display()))?;
-
-    // Drain stderr on a helper thread so a chatty npm cannot block on a
-    // full pipe while we wait for it.
-    let stderr = child.stderr.take();
-    let stderr_reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_end(&mut buf);
-        }
-        buf
-    });
-
-    let deadline = std::time::Instant::now() + NPM_INSTALL_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(format!("npm install did not finish within {NPM_INSTALL_TIMEOUT:?}"));
-            }
-            Ok(None) => std::thread::sleep(NPM_POLL),
-            Err(e) => break Err(format!("waiting for npm: {e}")),
-        }
-    };
-    let stderr_tail = stderr_reader
-        .join()
-        .map(|buf| {
-            let from = buf.len().saturating_sub(STDIO_STDERR_TAIL_BYTES);
-            String::from_utf8_lossy(&buf[from..]).trim().to_string()
-        })
-        .unwrap_or_default();
-
-    match status? {
+    let stderr = child.stderr.take().expect("piped installer stderr");
+    let (status, stderr_tail) = time::timeout(NPM_INSTALL_TIMEOUT, async {
+        let wait = async {
+            #[cfg(unix)]
+            { owner.wait_unreaped().await?; owner.terminate(); }
+            let status = child.wait().await;
+            #[cfg(windows)]
+            owner.terminate();
+            status
+        };
+        tokio::join!(wait, read_stderr_tail(stderr, STDIO_STDERR_TAIL_BYTES))
+    }).await.map_err(|_| format!("npm install did not finish within {NPM_INSTALL_TIMEOUT:?}"))?;
+    match status.map_err(|e| format!("waiting for npm: {e}"))? {
         s if s.success() => Ok(()),
         s => Err(match stderr_tail.is_empty() {
             true => format!("npm install exited {s}"),
@@ -1378,15 +1352,15 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn windows_provisioning_and_resolution_use_node_not_the_posix_shim() {
+    #[tokio::test]
+    async fn windows_provisioning_and_resolution_use_node_not_the_posix_shim() {
         let root = std::env::temp_dir().join(format!("pi install {}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let install = root.join("installed pi");
         let npm = root.join("npm.cmd");
         std::fs::write(&npm, "@echo off\r\nmkdir \"node_modules\\@mariozechner\\pi-coding-agent\\dist\"\r\necho console.log('installed'); > \"node_modules\\@mariozechner\\pi-coding-agent\\dist\\cli.js\"\r\n").unwrap();
         let binary = bundled_pi_binary(&install);
-        assert_eq!(provision_pi_into(&install, Some(&npm), false), Provision::Ready(binary.clone()));
+        assert_eq!(provision_pi_into(&install, Some(&npm), false).await, Provision::Ready(binary.clone()));
         assert!(bundled_pi_is_current(&install));
         let resolved = PiDaemon::resolve_command_with_bundled(None, Some(&install)).unwrap();
         assert_eq!(Path::new(&resolved[0]).file_name().unwrap().to_string_lossy().to_lowercase(), "node.exe");
@@ -1621,13 +1595,13 @@ chmod 755 "$prefix/node_modules/.bin/pi"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn provisioning_builds_the_documented_layout_and_pins_the_version() {
+    #[tokio::test]
+    async fn provisioning_builds_the_documented_layout_and_pins_the_version() {
         let root = temp_dir("prov");
         let npm = fake_npm(&root, "");
         let install = root.join("pi");
 
-        let outcome = provision_pi_into(&install, Some(&npm), false);
+        let outcome = provision_pi_into(&install, Some(&npm), false).await;
         let binary = bundled_pi_binary(&install);
         assert_eq!(outcome, Provision::Ready(binary.clone()));
         assert_eq!(outcome.binary(), Some(binary.as_path()));
@@ -1653,7 +1627,7 @@ chmod 755 "$prefix/node_modules/.bin/pi"
         assert!(argv.contains(&format!("{PI_NPM_PACKAGE}@{PI_PINNED_VERSION}")), "{argv}");
 
         // Current ⇒ a second call is a no-op: npm is not run again.
-        let again = provision_pi_into(&install, Some(&npm), false);
+        let again = provision_pi_into(&install, Some(&npm), false).await;
         assert_eq!(again, Provision::Ready(binary));
         assert_eq!(
             std::fs::read_to_string(root.join("npm-argv.log")).unwrap().matches("install").count(),
@@ -1664,8 +1638,8 @@ chmod 755 "$prefix/node_modules/.bin/pi"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn resolve_command_finds_the_bundled_binary_after_provisioning() {
+    #[tokio::test]
+    async fn resolve_command_finds_the_bundled_binary_after_provisioning() {
         let root = temp_dir("provres");
         let install = root.join("pi");
 
@@ -1674,7 +1648,7 @@ chmod 755 "$prefix/node_modules/.bin/pi"
         assert!(bundled_pi_wants_provisioning(None, &install));
 
         let npm = fake_npm(&root, "");
-        assert!(matches!(provision_pi_into(&install, Some(&npm), false), Provision::Ready(_)));
+        assert!(matches!(provision_pi_into(&install, Some(&npm), false).await, Provision::Ready(_)));
 
         let resolved = PiDaemon::resolve_command_with_bundled(None, Some(&install)).unwrap();
         assert_eq!(resolved, vec![bundled_pi_binary(&install).display().to_string()]);
@@ -1689,8 +1663,8 @@ chmod 755 "$prefix/node_modules/.bin/pi"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_version_mismatch_reinstalls_over_the_old_link() {
+    #[tokio::test]
+    async fn a_version_mismatch_reinstalls_over_the_old_link() {
         let root = temp_dir("provver");
         let install = root.join("pi");
         let npm = fake_npm(&root, "");
@@ -1703,7 +1677,7 @@ chmod 755 "$prefix/node_modules/.bin/pi"
         std::fs::write(bundled_pi_version_file(&install), "0.60.0\n").unwrap();
         assert!(!bundled_pi_is_current(&install));
 
-        assert!(matches!(provision_pi_into(&install, Some(&npm), false), Provision::Ready(_)));
+        assert!(matches!(provision_pi_into(&install, Some(&npm), false).await, Provision::Ready(_)));
         assert_eq!(
             std::fs::read_link(bundled_pi_binary(&install)).unwrap(),
             install.join("node_modules/.bin/pi"),
@@ -1713,12 +1687,12 @@ chmod 755 "$prefix/node_modules/.bin/pi"
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn without_npm_provisioning_degrades_gracefully() {
+    #[tokio::test]
+    async fn without_npm_provisioning_degrades_gracefully() {
         let root = temp_dir("provnonpm");
         let install = root.join("pi");
-        assert_eq!(provision_pi_into(&install, None, false), Provision::NoNpm);
-        assert_eq!(provision_pi_into(&install, None, true), Provision::NoNpm);
+        assert_eq!(provision_pi_into(&install, None, false).await, Provision::NoNpm);
+        assert_eq!(provision_pi_into(&install, None, true).await, Provision::NoNpm);
         assert!(!bundled_pi_binary(&install).exists());
         assert!(!bundled_pi_version_file(&install).exists());
         // Nothing was even attempted, so nothing is on disk to back off from.
@@ -1727,13 +1701,13 @@ chmod 755 "$prefix/node_modules/.bin/pi"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_failing_npm_is_reported_and_backed_off_until_forced() {
+    #[tokio::test]
+    async fn a_failing_npm_is_reported_and_backed_off_until_forced() {
         let root = temp_dir("provfail");
         let install = root.join("pi");
         let npm = fake_npm(&root, "echo 'npm ERR! network unreachable' >&2; exit 1");
 
-        match provision_pi_into(&install, Some(&npm), false) {
+        match provision_pi_into(&install, Some(&npm), false).await {
             Provision::Failed(reason) => {
                 assert!(reason.contains("network unreachable"), "{reason}");
             }
@@ -1744,23 +1718,23 @@ chmod 755 "$prefix/node_modules/.bin/pi"
         assert!(last_attempt_file(&install).exists());
 
         // Startup does not hammer npm after a fresh failure…
-        assert_eq!(provision_pi_into(&install, Some(&npm), false), Provision::Deferred);
+        assert_eq!(provision_pi_into(&install, Some(&npm), false).await, Provision::Deferred);
         let runs = || std::fs::read_to_string(root.join("npm-argv.log")).unwrap().matches("install").count();
         assert_eq!(runs(), 1);
         // …but an explicit request (portal_subagent_setup) tries again now.
-        assert!(matches!(provision_pi_into(&install, Some(&npm), true), Provision::Failed(_)));
+        assert!(matches!(provision_pi_into(&install, Some(&npm), true).await, Provision::Failed(_)));
         assert_eq!(runs(), 2);
 
         // An old marker no longer defers.
         std::fs::write(last_attempt_file(&install), "1\n").unwrap();
-        assert!(matches!(provision_pi_into(&install, Some(&npm), false), Provision::Failed(_)));
+        assert!(matches!(provision_pi_into(&install, Some(&npm), false).await, Provision::Failed(_)));
         assert_eq!(runs(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn npm_that_leaves_no_binary_is_a_failure_not_a_dangling_link() {
+    #[tokio::test]
+    async fn npm_that_leaves_no_binary_is_a_failure_not_a_dangling_link() {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_dir("provempty");
         let install = root.join("pi");
@@ -1769,7 +1743,7 @@ chmod 755 "$prefix/node_modules/.bin/pi"
         std::fs::write(&npm, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        match provision_pi_into(&install, Some(&npm), true) {
+        match provision_pi_into(&install, Some(&npm), true).await {
             Provision::Failed(reason) => assert!(reason.contains("does not exist"), "{reason}"),
             other => panic!("expected Failed, got {other:?}"),
         }

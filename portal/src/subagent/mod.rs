@@ -552,10 +552,8 @@ impl SubagentManager {
         if !pi_daemon::bundled_pi_wants_provisioning(resolved.as_deref(), &root) {
             return;
         }
-        let outcome = tokio::task::spawn_blocking(|| {
-            pi_daemon::auto_provision_pi(false)
-        }).await;
-        if matches!(outcome, Ok(Provision::Ready(_))) {
+        let outcome = pi_daemon::auto_provision_pi(false).await;
+        if matches!(outcome, Provision::Ready(_)) {
             if let Some(command) = PiDaemon::resolve_command(None) { self.adopt_command(command).await; }
         }
     }
@@ -645,9 +643,7 @@ impl SubagentManager {
             );
         }
 
-        let outcome = tokio::task::spawn_blocking(|| pi_daemon::auto_provision_pi(true))
-            .await
-            .map_err(|e| anyhow::anyhow!("the pi installer panicked: {e}"))?;
+        let outcome = pi_daemon::auto_provision_pi(true).await;
         match outcome {
             Provision::Ready(_) => {}
             Provision::NoNpm => anyhow::bail!(

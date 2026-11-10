@@ -56,7 +56,7 @@ pub fn plan(config: &PortalConfig, name: &str, args: &Value) -> Result<Plan> {
             Some(Value::String(value)) if matches!(value.as_str(), "use_default" | "require_escalated") => value,
             _ => anyhow::bail!("sandbox_permissions must be use_default or require_escalated"),
         };
-        if command.trim_start().starts_with('@') {
+        if super::client::parse_command(command).is_some() {
             anyhow::ensure!(scope == "use_default", "Client commands do not support shell escalation");
             plan.decision = Decision::Ask;
         } else if scope == "require_escalated" {
@@ -105,6 +105,18 @@ mod tests {
     use crate::{config::PortalConfig, tools::{ToolHost, client::ClientHandler}};
     use serde_json::json;
     use std::{sync::{Arc, Mutex}, future::Future, pin::Pin};
+
+    #[test]
+    fn only_desktop_verbs_require_client_command_approval() {
+        let mut config = PortalConfig::default();
+        config.security.permission_mode = PermissionMode::Supervised;
+        for command in ["@echo marker", "@(1,2) | Write-Output", "@{key=1}"] {
+            assert_eq!(plan(&config, "portal_exec", &json!({"command":command})).unwrap().decision, Decision::Allow);
+        }
+        for command in ["@context", "@scenes", "@plugins list", "@security-approve"] {
+            assert_eq!(plan(&config, "portal_exec", &json!({"command":command})).unwrap().decision, Decision::Ask);
+        }
+    }
 
     struct Approver { requests: Mutex<Vec<String>>, allow: bool }
     impl ClientHandler for Approver {

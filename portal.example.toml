@@ -24,6 +24,9 @@ search = true
 custom_tools_enabled = true
 
 [security]
+# Standalone releases use full host access. Town-Client overrides this with
+# --permission-mode according to the user's saved approval policy.
+permission_mode = "full-access"
 # An empty allowlist permits any portal_exec command. Set this list when the
 # connected Being should be restricted to specific executables.
 exec_allowlist = []

@@ -257,6 +257,7 @@ if plist.exists():
 
 pub fn delegate(target: &Path, cli: &crate::Cli) -> Result<()> {
     let mut command = std::process::Command::new(target);
+    command.args(cli.runtime_overrides());
     let explicit_config = cli.config.as_deref().or(cli.config_positional.as_deref());
     // Explicit configs retain their caller's working directory: legacy relative
     // kit paths are resolved there, and these configs are not migrated/frozen.

@@ -52,6 +52,12 @@ service authorization.
 
 ## Setup
 
+The `main` branch builds the same Portal for standalone releases and Town-Client.
+Standalone runs default to **full access** (`security.permission_mode = "full-access"`):
+files can be accessed outside the workspace and commands run on the host without
+desktop approval. Town-Client explicitly selects the user's saved permission mode
+at launch. See [Town-Client integration](docs/town-client.md) for the launch contract.
+
 New Windows installations and direct macOS/Linux launches default to
 `~/.heart-portal/portal.toml` (Windows:
 `%USERPROFILE%\.heart-portal\portal.toml`). Existing explicit configs and saved

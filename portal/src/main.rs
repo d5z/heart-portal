@@ -106,6 +106,22 @@ struct Cli {
     permission_mode: Option<config::PermissionMode>,
 }
 
+impl Cli {
+    // Keep overrides identical across installation delegation and OS restarts.
+    #[cfg(any(windows, target_os = "macos", test))]
+    fn runtime_overrides(&self) -> Vec<String> {
+        use clap::ValueEnum;
+        let mut arguments = Vec::new();
+        for (flag, value) in [("--exec-enabled", self.exec_enabled), ("--kits-enabled", self.kits_enabled)] {
+            if let Some(value) = value { arguments.extend([flag.to_owned(), value.to_string()]); }
+        }
+        if let Some(mode) = self.permission_mode {
+            arguments.extend(["--permission-mode".to_owned(), mode.to_possible_value().unwrap().get_name().to_owned()]);
+        }
+        arguments
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     #[cfg(windows)]
@@ -187,6 +203,8 @@ async fn main() -> Result<()> {
     }
     let runtime_started = std::time::Instant::now();
     let cli = Cli::parse();
+    #[cfg(any(windows, target_os = "macos"))]
+    let runtime_overrides = cli.runtime_overrides();
     #[cfg(windows)]
     if let Some(Commands::SandboxRun { payload }) = &cli.command {
         match windows_sandbox::run_payload(payload) {
@@ -366,6 +384,7 @@ async fn main() -> Result<()> {
             None,
             None,
             false,
+            &[],
         )
         .await;
         #[cfg(target_os = "macos")]
@@ -386,6 +405,7 @@ async fn main() -> Result<()> {
             cli.connect.as_deref(),
             cli.name.as_deref(),
             cli.logs,
+            &runtime_overrides,
         )
         .await;
     }
@@ -476,9 +496,14 @@ async fn main() -> Result<()> {
         anyhow::ensure!(bytes.len() <= 16384, "Subagent configuration too large");
         let args: serde_json::Value = serde_json::from_slice(&bytes)?;
         anyhow::ensure!(args.is_object(), "Expected a configuration object");
-        // Manager construction is read-only; setup performs the installation.
+        // This explicit local CLI operation is authorized by its invoker. Remote
+        // portal_subagent_setup calls still pass through ToolHost approval.
         let host = ToolHost::new_with_runtime(&config, tools::status::RuntimeStatus::capture(&config, location, config_loaded, config.name.clone(), false, runtime_started));
-        let result = host.call("portal_subagent_setup", args).await?;
+        let result = tokio::select! {
+            _ = tokio::signal::ctrl_c() => anyhow::bail!("Subagent setup cancelled"),
+            _ = wait_sigterm() => anyhow::bail!("Subagent setup cancelled"),
+            result = tools::subagent::handle(&host.subagent, "portal_subagent_setup", args) => result?,
+        };
         println!("DESKTOP_SUBAGENT_RESULT={}", result);
         return Ok(());
     }
@@ -511,6 +536,7 @@ async fn main() -> Result<()> {
         &config_path,
         connect_link.as_deref(),
         cli_portal_name.as_deref(),
+        &runtime_overrides,
     )
     .await?;
 
@@ -1361,6 +1387,18 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_overrides_round_trip_without_changing_standalone_defaults() {
+        assert!(Cli::parse_from(["heart-portal"]).runtime_overrides().is_empty());
+        for mode in ["read-only", "supervised", "auto-review", "full-access"] {
+            let cli = Cli::parse_from(["heart-portal", "--permission-mode", mode, "--exec-enabled", "false", "--kits-enabled", "false"]);
+            let forwarded = Cli::parse_from(std::iter::once("heart-portal".to_owned()).chain(cli.runtime_overrides()));
+            assert_eq!(forwarded.permission_mode, cli.permission_mode);
+            assert_eq!(forwarded.exec_enabled, Some(false));
+            assert_eq!(forwarded.kits_enabled, Some(false));
+        }
+    }
 
     #[test]
     fn relay_portal_name_prefers_cli_name() {

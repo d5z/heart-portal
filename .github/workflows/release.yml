@@ -52,6 +52,13 @@ jobs:
         if: runner.os == 'Windows'
         run: cp target/${{ matrix.target }}/release/heart-portal.exe ${{ matrix.name }}
 
+      - name: Verify standalone permissions in the release binary
+        env:
+          PORTAL_TEST_BINARY: ${{ github.workspace }}/${{ matrix.name }}
+        run: |
+          python scripts/tests/runtime-security.tests.py
+          python scripts/tests/runtime-compat.tests.py
+
       - name: Verify Windows recovery and upgrade lifecycle
         if: runner.os == 'Windows'
         shell: powershell

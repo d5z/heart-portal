@@ -35,11 +35,13 @@ class SupervisorTests(unittest.TestCase):
         self.target = self.root / 'heart-portal'
         shutil.copy2(BINARY, self.target)
         self.config = self.root / 'custom-config.toml'
-        self.config.write_text('workspace = "./custom-workspace"\nkits_enabled = false\nbind = "127.0.0.1:0"\n')
+        self.config.write_text('workspace = "./custom-workspace"\nkits_enabled = false\nbind = "127.0.0.1:0"\n'
+                               '[subagent]\nenabled=false\n[tools]\nexec=false\n[security]\npermission_mode="read-only"\n')
         self.relay = e2e.Relay()
         self.link = f'http://127.0.0.1:{self.relay.port}/supervised/?token=private-fixture'
         self.log = open(self.root / 'foreground.log', 'ab')
-        self.process = subprocess.Popen([str(self.target), '--config', str(self.config), '--connect', self.link, '--name', 'kept-name'],
+        self.process = subprocess.Popen([str(self.target), '--config', str(self.config), '--connect', self.link, '--name', 'kept-name',
+                                         '--permission-mode', 'full-access', '--exec-enabled', 'true', '--kits-enabled', 'false'],
                                         cwd=self.root, stdout=self.log, stderr=self.log)
         self.hello = self.relay.connect()
         self.before = self.relay.tool('portal_permissions')['status']
@@ -54,6 +56,9 @@ class SupervisorTests(unittest.TestCase):
 
     def test_adopts_original_pid_and_recovers_without_permission_owner_switch(self):
         self.assertEqual(self.before['pid'], self.process.pid)
+        before = json.loads(self.relay.tool('portal_status')['content'][0]['text'])
+        self.assertEqual(before['authorization']['permission_mode'], 'FullAccess')
+        self.assertTrue(before['tools']['exec'])
         state = manager.supervisor_state(self.root)
         self.assertTrue(state)
         self.assertEqual(state['runtime']['pid'], self.process.pid)
@@ -67,11 +72,15 @@ class SupervisorTests(unittest.TestCase):
         self.process.wait(timeout=10)
         self.assertEqual(self.relay.connect(), self.hello)
         after = self.relay.tool('portal_permissions')['status']
+        after_status = json.loads(self.relay.tool('portal_status')['content'][0]['text'])
+        self.assertEqual(after_status['authorization']['permission_mode'], 'FullAccess')
+        self.assertTrue(after_status['tools']['exec'])
         self.assertNotEqual(after['pid'], self.before['pid'])
         self.assertEqual(after['permissions'], self.before['permissions'])
         self.relay.tool('portal_restart')
         self.assertEqual(self.relay.connect(), self.hello)
         restarted = self.relay.tool('portal_permissions')['status']
+        self.assertEqual(json.loads(self.relay.tool('portal_status')['content'][0]['text'])['authorization']['permission_mode'], 'FullAccess')
         self.assertNotEqual(restarted['pid'], after['pid'])
         self.assertEqual(restarted['permissions'], self.before['permissions'])
         self.assertEqual(manager.checkout_pids(self.root), [restarted['pid']])

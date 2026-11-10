@@ -775,6 +775,28 @@ mod tests {
     }
 
     #[test]
+    fn standalone_configs_default_to_full_access_and_preserve_explicit_modes() {
+        assert_eq!(PortalConfig::default().security.permission_mode, PermissionMode::FullAccess);
+        let path = test_config_path("permission-modes");
+        for source in ["", "[security]\nexec_allowlist = []", include_str!("../../portal.example.toml")] {
+            std::fs::write(&path, source).unwrap();
+            let config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+            assert_eq!(config.security.permission_mode, PermissionMode::FullAccess);
+            assert!(config.tools.exec && config.tools.file && config.tools.custom_tools_enabled);
+        }
+        for (value, expected) in [
+            ("read-only", PermissionMode::ReadOnly),
+            ("supervised", PermissionMode::Supervised),
+            ("auto-review", PermissionMode::AutoReview),
+            ("full-access", PermissionMode::FullAccess),
+        ] {
+            std::fs::write(&path, format!("[security]\npermission_mode = '{value}'")).unwrap();
+            assert_eq!(PortalConfig::load(path.to_str().unwrap()).unwrap().security.permission_mode, expected);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn test_parse_bind_host_port() {
         let (h, p) = parse_bind("0.0.0.0:9100").unwrap();
         assert_eq!(h, "0.0.0.0");

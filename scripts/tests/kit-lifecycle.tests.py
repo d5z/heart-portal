@@ -55,7 +55,8 @@ class KitLifecycleTests(unittest.TestCase):
             reserve.bind(('127.0.0.1', 0))
             self.port = reserve.getsockname()[1]
         config = self.root / 'portal.toml'
-        config.write_text(f"name='fixture'\nbind='127.0.0.1:{self.port}'\nworkspace='./workspace'\nkits_dir='./kits'\nkits_enabled=true\n[tools]\nexec=false\nfile=false\n[custom_tools]\nconfig_path='private-ignored-path'\ntoken='private-ignored-token'\n", encoding='utf-8')
+        tools_enabled = str(getattr(self, 'tools_enabled', False)).lower()
+        config.write_text(f"name='fixture'\nbind='127.0.0.1:{self.port}'\nworkspace='./workspace'\nkits_dir='./kits'\nkits_enabled=true\n[subagent]\nenabled=false\n[tools]\nexec={tools_enabled}\nfile={tools_enabled}\n[custom_tools]\nconfig_path='private-ignored-path'\ntoken='private-ignored-token'\n", encoding='utf-8')
         if getattr(self, 'expose_host_details', True):
             with config.open('a') as stream:
                 stream.write('[security]\nexpose_host_details=true\n')

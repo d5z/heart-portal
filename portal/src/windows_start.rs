@@ -17,6 +17,7 @@ pub async fn run(
     connect: Option<&str>,
     name: Option<&str>,
     logs: bool,
+    overrides: &[String],
 ) -> Result<()> {
     if action == "start" {
         println!("Heart Portal {}", crate::upgrade::PORTAL_VERSION);
@@ -35,12 +36,12 @@ pub async fn run(
         std::env::var("PORTAL_CONNECT_LINK").ok().filter(|value| !value.trim().is_empty())
     });
     let connect = connect_override.as_deref();
-    let explicit = config.is_some() || connect.is_some() || name.is_some();
+    let explicit = config.is_some() || connect.is_some() || name.is_some() || !overrides.is_empty();
     let saved = root.join(".portal-launch.json");
     let (launch, initialize_config) = if action != "start" || (!explicit && saved.is_file()) {
         (Value::Null, false)
     } else {
-        make_launch(&root, config, connect, name)?
+        make_launch(&root, config, connect, name, overrides)?
     };
     if action == "start" {
         let effective = if launch.is_null() {
@@ -279,6 +280,7 @@ fn make_launch(
     config: Option<&str>,
     connect: Option<&str>,
     name: Option<&str>,
+    overrides: &[String],
 ) -> Result<(Value, bool)> {
     // Changing only --name/--connect must retain the saved explicit config.
     let config_path =
@@ -344,12 +346,36 @@ fn make_launch(
     .collect();
     // The relay credential is passed through the child's environment, not argv.
     environment.insert("PORTAL_CONNECT_LINK".into(), connection.unwrap_or_default());
+    let mut arguments = vec!["--config".to_owned(), config_path.to_string_lossy().into_owned(), "--name".to_owned(), portal_name.clone()];
+    arguments.extend_from_slice(overrides);
     Ok((
         json!({
             "protocol": 1, "identity": identity, "name": portal_name,
-            "arguments": ["--config", config_path, "--name", portal_name],
+            "arguments": arguments,
             "working_directory": std::env::current_dir()?, "environment": environment,
         }),
         initialize_config,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_launch_preserves_runtime_overrides_for_supervisor_restarts() {
+        let root = std::env::temp_dir().join(format!("portal-launch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("portal.toml");
+        std::fs::write(&config, "[security]\npermission_mode='full-access'\n").unwrap();
+        for mode in ["read-only", "supervised", "auto-review", "full-access"] {
+            let overrides = vec!["--permission-mode".into(), mode.into(), "--exec-enabled".into(), "false".into(), "--kits-enabled".into(), "false".into()];
+            let (launch, initialize) = make_launch(&root, config.to_str(), None, Some("fixture"), &overrides).unwrap();
+            assert!(!initialize);
+            let arguments: Vec<String> = serde_json::from_value(launch["arguments"].clone()).unwrap();
+            assert_eq!(&arguments[4..], overrides);
+            assert_eq!(arguments[1], config.to_str().unwrap());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
