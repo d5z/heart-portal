@@ -215,6 +215,11 @@ pub fn run(request: &Request) -> Result<u32> {
     let cwd_native = cwd_text.strip_prefix(r"\\?\").unwrap_or(&cwd_text);
     anyhow::ensure!(!cwd_native.starts_with("UNC\\"), "Network workspaces are not supported by the offline sandbox");
     let _acl_lock = AclLock::acquire()?;
+    let mut config = crate::config::PortalConfig::default();
+    config.security.workspace_root = root.clone();
+    config.security.permission_mode = crate::config::PermissionMode::Supervised;
+    config.config_path = request.protected_paths.first().cloned();
+    let task_environment = crate::task_environment::prepare(&config)?;
     let mut profile = Profile::create()?;
     // Resolve once and fail closed if an explicitly protected configuration is
     // missing. Silently dropping it would turn its old location into writable data.
@@ -248,13 +253,25 @@ pub fn run(request: &Request) -> Result<u32> {
             if metadata.is_dir() && !hidden && !reparse { directories.push((path, protected)); }
         }
     }
+    let workspace_objects = objects.len();
+    if let Some(runtime) = &task_environment.runtime {
+        anyhow::ensure!(!runtime.root.starts_with(&root), "Bundled runtime must be outside the writable workspace");
+        // Grant this invocation read/execute only. Keep handles for this separate
+        // tree so cleanup also works when it lives on another volume.
+        for entry in walkdir::WalkDir::new(&runtime.root).follow_links(false) {
+            let entry = entry.context("Inspect bundled runtime")?;
+            let metadata = entry.metadata()?;
+            anyhow::ensure!(!metadata.file_type().is_symlink(), "Bundled runtime must contain ordinary files");
+            objects.push((entry.path().to_owned(), metadata.is_dir(), 0x001200a9));
+        }
+    }
     // Protect every existing child from inheritance BEFORE granting inheritable
     // access on ordinary directories. New objects can inherit the package SID,
     // while metadata, secrets and junctions never receive that grant.
     // Capture all descriptors before changing any inheritance settings.
     for (path, _, _) in &objects { profile.capture(path)?; }
     let root_handle = profile.acls[0].handle.as_ref().unwrap().as_raw_handle();
-    for acl in &profile.acls { drop(acl.reopen(root_handle).context("Sandbox requires file-ID based ACL restoration")?); }
+    for acl in profile.acls.iter().take(workspace_objects) { drop(acl.reopen(root_handle).context("Sandbox requires file-ID based ACL restoration")?); }
     profile.modified = true;
     for acl in &profile.acls { acl.apply(acl.dacl, PROTECTED_DACL_SECURITY_INFORMATION)?; }
     for ((path, directory, access), acl) in objects.iter().zip(&profile.acls) {
@@ -265,7 +282,7 @@ pub fn run(request: &Request) -> Result<u32> {
     }
     // Open descendant handles can block directory renames on Windows even with
     // FILE_SHARE_DELETE. Retain only the immovable root and restore by file ID.
-    for acl in profile.acls.iter_mut().skip(1) { acl.handle = None; }
+    for acl in profile.acls.iter_mut().take(workspace_objects).skip(1) { acl.handle = None; }
     let system = PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot unavailable")?);
     let exe = if request.powershell { system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe") } else { system.join(r"System32\cmd.exe") };
     let source = if request.powershell {
@@ -298,10 +315,7 @@ pub fn run(request: &Request) -> Result<u32> {
     startup.lpAttributeList = attributes.pointer;
     // No credentials, client capability paths, proxy configuration or host PATH.
     let mut environment = std::collections::BTreeMap::new();
-    for key in ["USERPROFILE", "LOCALAPPDATA", "APPDATA", "ALLUSERSPROFILE", "ProgramData", "TEMP", "TMP"] {
-        if let Ok(value) = std::env::var(key) { environment.insert(key.to_uppercase(), value); }
-    }
-    environment.insert("PATH".into(), format!("{};{}", system.join("System32").display(), system.display()));
+    for (key, value) in task_environment.variables { environment.insert(key.to_uppercase(), value); }
     environment.insert("SYSTEMROOT".into(), system.display().to_string());
     environment.insert("WINDIR".into(), system.display().to_string());
     environment.insert("COMSPEC".into(), system.join(r"System32\cmd.exe").display().to_string());

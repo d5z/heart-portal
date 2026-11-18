@@ -992,7 +992,8 @@ mod tests {
             "alice-laptop".to_string(),
         );
 
-        let config = PortalConfig::default();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::current_dir().unwrap();
         let info = pm
             .spawn(&config, "echo portal_callback_test", ".", &[])
             .await
@@ -1024,7 +1025,8 @@ mod tests {
         // Deliberately unconfigured HeartCallback — standalone mode.
         let pm = ProcessManager::new(HeartCallback::new());
 
-        let config = PortalConfig::default();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::current_dir().unwrap();
         pm.spawn(&config, "echo standalone", ".", &[]).await.unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(2)).await, 0);
@@ -1039,7 +1041,8 @@ mod tests {
         let pm = ProcessManager::new(cb.clone());
         cb.set(server.url.clone(), "tok".to_string(), "p".to_string());
 
-        let config = PortalConfig::default();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::current_dir().unwrap();
         let info = pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
         pm.kill(&info.session_id).await.unwrap();
 
@@ -1055,7 +1058,8 @@ mod tests {
         let pm = ProcessManager::new(cb.clone());
         cb.set(server.url.clone(), "tok".to_string(), "p".to_string());
 
-        let config = PortalConfig::default();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::current_dir().unwrap();
         pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
         pm.kill_all().await;
 
@@ -1071,7 +1075,8 @@ mod tests {
         let pm = ProcessManager::new(cb.clone());
         cb.set(server.url.clone(), "bad".to_string(), "p".to_string());
 
-        let config = PortalConfig::default();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = std::env::current_dir().unwrap();
         pm.spawn(&config, "echo nope", ".", &[]).await.unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(10)).await, 1);

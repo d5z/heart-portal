@@ -12,6 +12,7 @@ mod config;
 mod connection_status;
 mod exec_policy;
 mod sandbox;
+mod task_environment;
 mod sensitive_paths;
 #[cfg(target_os = "macos")]
 mod macos_sandbox;
@@ -1314,13 +1315,14 @@ async fn handle_request(
                         "⚡ {} → fail ({:?}); details returned to caller",
                         tool_name, elapsed
                     );
-                    let message = format!("Tool error: {}", e);
+                    let message = format!("Tool error: {e:#}");
                     JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
                         id,
                         result: Some(serde_json::json!({
                             "content": [{"type": "text", "text": message}],
-                            "isError": true
+                            "isError": true,
+                            "next_action": "查看错误详情并修正原因后再试；不要原样反复调用。审批未完成时，操作尚未执行。"
                         })),
                         error: None,
                     }

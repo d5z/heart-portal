@@ -45,6 +45,14 @@ impl ClientHandler for DesktopClientHandler {
         scene_id: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
+            // Queue before opening the transport, with a total approval budget
+            // below the cloud's 120s deadline, including parallel tool wait time.
+            static APPROVAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(70);
+            let _approval = if verb == "security-approve" {
+                Some(tokio::time::timeout_at(deadline, APPROVAL.lock()).await
+                    .context("Approval queue exceeded 70s; operation was not executed. Retry when ready to approve.")?)
+            } else { None };
             let bytes = tokio::fs::read(&self.file)
                 .await
                 .context("Desktop client unavailable")?;
@@ -59,7 +67,7 @@ impl ClientHandler for DesktopClientHandler {
                 .context("Missing client token")?;
             let response = reqwest::Client::builder()
                 .no_proxy().redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(if verb == "security-approve" { 125 } else { 10 })).build()?
+                .timeout(if verb == "security-approve" { deadline.saturating_duration_since(tokio::time::Instant::now()) } else { std::time::Duration::from_secs(10) }).build()?
                 .post(format!("http://127.0.0.1:{port}/command"))
                 .bearer_auth(token)
                 .json(&serde_json::json!({"verb": verb, "args": args, "sceneId": scene_id, "endpoint": self.endpoint}))
@@ -160,6 +168,45 @@ mod tests {
             .to_string()
             .contains("disabled"));
     }
+    #[tokio::test]
+    async fn approval_queue_waits_before_starting_transport_and_does_not_block_reads() {
+        use axum::{routing::post, Json, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (arrived, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = release.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/command", post(move |Json(body): Json<serde_json::Value>| {
+                let arrived = arrived.clone(); let gate = gate.clone();
+                async move {
+                    let verb = body["verb"].as_str().unwrap().to_owned();
+                    arrived.send(verb.clone()).unwrap();
+                    if verb == "security-approve" { gate.acquire().await.unwrap().forget(); }
+                    Json(json!({"text":"allow-once"}))
+                }
+            }))).await.unwrap();
+        });
+        let file = std::env::temp_dir().join(format!("portal-approval-{}.json", uuid::Uuid::new_v4()));
+        tokio::fs::write(&file, json!({"port":port,"token":"fixture"}).to_string()).await.unwrap();
+        let handler = Arc::new(DesktopClientHandler { file: file.clone(), endpoint: "https://fixture.test/a".into() });
+        let first_handler = handler.clone();
+        let first = tokio::spawn(async move { first_handler.handle_client_command("security-approve", "{}", None).await });
+        assert_eq!(requests.recv().await.unwrap(), "security-approve");
+        let second_handler = handler.clone();
+        let second = tokio::spawn(async move { second_handler.handle_client_command("security-approve", "{}", None).await });
+        handler.handle_client_command("context", "", None).await.unwrap();
+        assert_eq!(requests.recv().await.unwrap(), "context");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), requests.recv()).await.is_err());
+        release.add_permits(1);
+        assert_eq!(first.await.unwrap().unwrap(), "allow-once");
+        assert_eq!(requests.recv().await.unwrap(), "security-approve");
+        release.add_permits(1);
+        assert_eq!(second.await.unwrap().unwrap(), "allow-once");
+        tokio::fs::remove_file(file).await.unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn desktop_transport_authenticates_and_reloads_registration() {
         use axum::{http::HeaderMap, routing::post, Json, Router};

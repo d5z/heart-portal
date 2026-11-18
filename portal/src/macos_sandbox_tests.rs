@@ -34,8 +34,37 @@ async fn workspace_shell_and_children_work_with_a_clean_environment() {
     assert!(text.starts_with("approved\n"));
     for line in text.lines().skip(1) {
         let key = line.split('=').next().unwrap();
-        assert!(["PATH", "HOME", "TMPDIR", "LANG", "PWD", "SHLVL", "_"].contains(&key), "Unexpected inherited variable: {key}");
+        assert!(crate::task_environment::prepare(&f.config).unwrap().variables.contains_key(key) || ["PWD", "SHLVL", "_"].contains(&key), "Unexpected inherited variable: {key}");
     }
+}
+
+#[tokio::test]
+async fn standard_runtime_has_writable_temp_and_cache_without_a_launcher() {
+    let f = Fixture::new();
+    let output = f.run("python3 -c 'import os, tempfile, pathlib; p = pathlib.Path(os.environ[\"MPLCONFIGDIR\"])/\"probe\"; p.write_text(\"cache-ok\"); print(p.read_text()); print(tempfile.gettempdir()); print(os.environ[\"PORTAL_OUTPUTS\"])'").await;
+    success(&output);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("cache-ok"));
+    assert!(text.contains(".portal-runtime/tmp"));
+    assert!(text.contains("outputs"));
+    assert!(!f.run("cat $HOME/../../secret").await.status.success());
+}
+
+#[tokio::test]
+async fn relative_workdirs_resolve_from_workspace_for_foreground_and_background() {
+    use crate::{heart_callback::HeartCallback, process_manager::ProcessManager};
+    let f = Fixture::new();
+    fs::create_dir(f.root.join("nested")).unwrap();
+    let out = crate::sandbox::shell_command(&f.config, "pwd; echo relative > result", "nested", ExecShell::Default)
+        .unwrap().output().await.unwrap();
+    success(&out);
+    assert_eq!(fs::read_to_string(f.root.join("nested/result")).unwrap(), "relative\n");
+    let manager = ProcessManager::new(HeartCallback::new());
+    let session = manager.spawn(&f.config, "echo background > background.txt", "nested", &[]).await.unwrap();
+    let result = manager.poll(&session.session_id, 0, 2000).await.unwrap();
+    assert!(!String::from_utf8_lossy(&result.output).contains("error"));
+    assert_eq!(fs::read_to_string(f.root.join("nested/background.txt")).unwrap(), "background\n");
+    assert!(crate::sandbox::shell_command(&f.config, "echo forbidden", "..", ExecShell::Default).is_err());
 }
 
 #[tokio::test]

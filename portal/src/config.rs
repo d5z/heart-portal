@@ -128,6 +128,7 @@ pub struct PortalConfig {
 /// max_turns = 40
 /// max_tokens = 400000
 /// timeout_secs = 1800
+/// max_continuations = 3
 ///
 /// [subagent.model]
 /// provider = "anthropic"
@@ -153,6 +154,10 @@ pub struct SubagentConfig {
     /// sub-agent simply stays unavailable). Set false to never run npm.
     #[serde(default = "default_true")]
     pub auto_install: bool,
+
+    /// Desktop owns the model; reload it before each new task.
+    #[serde(default)]
+    pub inherit_model: bool,
 
     /// Ledger, daemon socket, pi agent dir and pi sessions.
     /// Default `~/.heart-portal/subagent/<Portal identity hash>`.
@@ -215,7 +220,7 @@ pub struct BudgetConfig {
     pub max_continuations: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct SubagentModelConfig {
     #[serde(default)]
     pub base_url: Option<String>,
@@ -394,6 +399,7 @@ impl Default for SubagentConfig {
             enabled: true,
             command: None,
             auto_install: true,
+            inherit_model: false,
             state_dir: None,
             eager: false,
             max_concurrent: default_max_concurrent(),
@@ -478,8 +484,9 @@ pub struct ToolsConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     ReadOnly,
+    #[serde(alias = "auto-review")]
+    #[value(alias = "auto-review")]
     Supervised,
-    AutoReview,
     #[default]
     FullAccess,
 }
@@ -787,7 +794,7 @@ mod tests {
         for (value, expected) in [
             ("read-only", PermissionMode::ReadOnly),
             ("supervised", PermissionMode::Supervised),
-            ("auto-review", PermissionMode::AutoReview),
+            ("auto-review", PermissionMode::Supervised),
             ("full-access", PermissionMode::FullAccess),
         ] {
             std::fs::write(&path, format!("[security]\npermission_mode = '{value}'")).unwrap();
@@ -1111,12 +1118,12 @@ kits_enabled = false
         config.kits_enabled = false;
         let host = crate::tools::ToolHost::new(&config);
         let absolute = config.security.workspace_root.join("中文.txt");
-        host.call(
+        assert!(host.call(
             "portal_file_write",
             serde_json::json!({"path": absolute, "content": "中文正常"}),
-        )
-        .await
-        .unwrap();
+        ).await.unwrap_err().to_string().contains("approval"));
+        assert!(!absolute.exists());
+        std::fs::write(&absolute, "中文正常").unwrap();
         let read = host
             .call("portal_file_read", serde_json::json!({"path": "中文.txt"}))
             .await

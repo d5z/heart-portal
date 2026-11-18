@@ -4,7 +4,7 @@
 pub mod client;
 pub mod custom;
 mod exec;
-mod file;
+pub(crate) mod file;
 mod oauth;
 #[cfg(target_os = "macos")]
 mod permissions;
@@ -316,7 +316,7 @@ impl ToolHost {
         if self.config.tools.exec {
             tools.push(ToolInfo {
                 name: "portal_exec".to_string(),
-                description: "Execute a shell command, or a client command: @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. Client commands never run in a shell. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
+                description: "Execute a shell command. Client releases bundle Python and Node on PATH; sandbox HOME, temp and caches are prepared automatically. Use python3/python or node directly without an environment setup tool. Or execute a client command: @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. Client commands never run in a shell. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -332,11 +332,11 @@ impl ToolHost {
                         },
                         "workdir": {
                             "type": "string",
-                            "description": "Working directory (optional)"
+                            "description": "Working directory, absolute or relative to the workspace (default: workspace root)"
                         },
                         "sandbox_permissions": {
                             "type": "string", "enum": ["use_default", "require_escalated"],
-                            "description": "Default runs autonomously inside the offline workspace sandbox. Request require_escalated with justification when the command needs network, external files or host-installed tools. The user must approve this exact foreground command; approval grants host file/network access for this invocation only. Never retry outside the sandbox without this explicit request."
+                            "description": "Default runs inside the offline workspace sandbox; ask-every-time mode requires consent for every command. Request require_escalated with justification when the command needs network, external files or host-installed tools. The user must approve this exact foreground command; approval grants host file/network access for this invocation only. Never retry outside the sandbox without this explicit request."
                         },
                         "justification": { "type": "string", "description": "Why this command needs to run outside the sandbox; required with require_escalated." },
                         "timeout_secs": {
@@ -401,6 +401,14 @@ impl ToolHost {
         }
 
         if self.config.tools.file {
+            tools.push(ToolInfo {
+                name: "portal_file_copy".into(),
+                description: "Stage a local input file into the workspace without shell commands or sending binary contents through the model. Copies one regular file up to 128 MiB, never overwrites an existing destination, and returns its path and sha256. Sensitive reads require approval. Default destination is inputs/<filename>.".into(),
+                input_schema: serde_json::json!({"type":"object","properties":{
+                    "path":{"type":"string","description":"Source file path"},
+                    "destination":{"type":"string","description":"Workspace-relative destination, default inputs/<filename>; must not exist"}
+                },"required":["path"]}),
+            });
             tools.push(ToolInfo {
                 name: "portal_file_read".to_string(),
                 description: "Read file contents and return sha256 for conflict-aware edits. Returns text for text files, base64 for images. Text output is bounded even with offset/limit; use max_bytes for a smaller context budget. For large files, use offset (0-based line number) and limit to read specific sections instead of portal_exec head/tail.".to_string(),
@@ -653,7 +661,7 @@ impl ToolHost {
     ) -> Result<Value> {
         match tool_name {
             "portal_exec" | "portal_process" => anyhow::ensure!(self.config.tools.exec, "Execution tools are disabled"),
-            "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" => anyhow::ensure!(self.config.tools.file, "File tools are disabled"),
+            "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" | "portal_file_copy" => anyhow::ensure!(self.config.tools.file, "File tools are disabled"),
             "portal_search" => anyhow::ensure!(self.config.tools.search, "Search is disabled"),
             "portal_web_fetch" => anyhow::ensure!(self.config.tools.web_fetch, "Web fetch is disabled"),
             _ => {},
@@ -671,9 +679,18 @@ impl ToolHost {
                 let request = serde_json::to_string(&request)?;
                 anyhow::ensure!(request.len() <= 16000, "Approval request too large; split the operation");
                 let approved = self.client_handler.handle_client_command("security-approve", &request, scene_id).await;
-                let allowed = approved.as_ref().is_ok_and(|answer| answer == "allow-once");
-                info!(tool = tool_name, allowed, "tool approval resolved");
-                anyhow::ensure!(allowed, "Tool approval denied, expired, or Desktop unavailable");
+                match approved {
+                    Ok(answer) if answer == "allow-once" => info!(tool = tool_name, allowed = true, outcome = "allowed", "tool approval resolved"),
+                    Ok(answer) if answer == "deny" => {
+                        info!(tool = tool_name, allowed = false, outcome = "denied", "tool approval resolved");
+                        anyhow::bail!("Tool approval denied by user; operation was not executed. Ask again only if the user wants to proceed.");
+                    }
+                    Ok(_) => anyhow::bail!("Invalid Desktop approval response; operation was not executed. Restart Desktop and retry."),
+                    Err(error) => {
+                        warn!(tool = tool_name, outcome = "unavailable_or_cancelled", error = %error, "tool approval unresolved");
+                        return Err(error.context("Tool approval did not complete; operation was not executed"));
+                    }
+                }
             }
         }
         // Capabilities are local to this invocation and never mutate the shared host.
@@ -712,6 +729,7 @@ impl ToolHost {
 
         // Built-in tools
         match tool_name {
+            "portal_file_copy" => file::copy(&invocation_config, arguments).await,
             "portal_exec" => {
                 if !self.config.tools.exec {
                     anyhow::bail!("portal_exec is disabled in configuration");

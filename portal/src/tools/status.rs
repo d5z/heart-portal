@@ -134,6 +134,16 @@ impl ToolHost {
         let runtime = &self.runtime;
         let config = &self.config;
         let details = config.security.expose_host_details;
+        let task_environment = match crate::task_environment::bundled_runtime() {
+            Ok(Some(runtime)) => json!({
+                "python": {"version":runtime.python.version,"path":if details {json!(runtime.root.join(runtime.python.path))} else {Value::Null}},
+                "node": {"version":runtime.node.version,"path":if details {json!(runtime.root.join(runtime.node.path))} else {Value::Null}},
+                "preparation":"automatic-before-exec", "writable_layout":"workspace/.portal-runtime",
+                "inputs":"inputs", "outputs":"outputs"
+            }),
+            Ok(None) => json!({"bundled":false,"preparation":"automatic-before-sandbox-exec"}),
+            Err(error) => json!({"error":if details {format!("{error:#}")} else {"bundled-runtime-unavailable; repair the Portal package".into()}}),
+        };
         // Do not use refresh_kits/list_healthy_tools here: both can change state.
         // Never include raw config, manifests, defaults, commands or error text.
         let statuses = self.kits.statuses().await;
@@ -230,6 +240,7 @@ impl ToolHost {
                 },
             },
             "authorization": {
+                "task_environment": task_environment,
                 "permission_mode": format!("{:?}", config.security.permission_mode),
                 "os_sandbox": cfg!(any(windows, target_os = "macos")) && !matches!(config.security.permission_mode, crate::config::PermissionMode::FullAccess | crate::config::PermissionMode::ReadOnly),
                 "command_backend": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "host" }
@@ -243,9 +254,9 @@ impl ToolHost {
                 "file_access": match config.security.permission_mode {
                     crate::config::PermissionMode::FullAccess => "host-file-access",
                     crate::config::PermissionMode::ReadOnly => "legacy-workspace-read-only",
-                    _ => "ordinary-reads; workspace-writes; external-or-protected-writes-require-approval",
+                    _ => "ordinary-reads; every-write-and-copy-requires-approval",
                 },
-                "approval_reviewer": if config.security.permission_mode == crate::config::PermissionMode::AutoReview { "desktop-conservative-rules-with-user-fallback" } else { "user" },
+                "approval_reviewer": "user",
                 "custom_mcp_startup": if config.security.permission_mode == crate::config::PermissionMode::FullAccess { "automatic" } else { "explicit-tools-reload-approval-required" },
                 "subagent_tools": "portal-broker-in-restricted-mode",
                 "approval_scope": "single-call",

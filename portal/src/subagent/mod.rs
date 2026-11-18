@@ -19,6 +19,7 @@
 //! [`transcript`] the pullable progress log.
 
 pub mod ledger;
+mod activity;
 pub mod pi_client;
 pub mod pi_daemon;
 pub mod protocol;
@@ -64,6 +65,9 @@ pub const MAX_BRIEF_BYTES: usize = 64 * 1024;
 pub const MAX_SESSION_KEY_BYTES: usize = 64;
 /// Slack over the task's own budget before Portal stops waiting on the daemon.
 const PROMPT_TIMEOUT_SLACK: Duration = Duration::from_secs(120);
+const MIN_TASK_TIMEOUT_SECS: u64 = 30;
+const MAX_TASK_TIMEOUT_SECS: u64 = 21_600;
+const MIN_TASK_TOKENS: u64 = 1_000;
 /// How long a finished task stays visible in `portal_subagent_status`.
 const TASK_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// How long `cancel` waits for the session to go idle before answering.
@@ -124,9 +128,14 @@ pub struct Budget {
 impl Budget {
     fn from_config(cfg: &SubagentConfig) -> Self {
         Self {
-            max_turns: cfg.budget.max_turns,
-            max_tokens: cfg.budget.max_tokens,
-            timeout_secs: cfg.budget.timeout_secs,
+            // Config files are user-edited input. Keep zero values from
+            // accidentally turning a bounded task into an unbounded one.
+            max_turns: cfg.budget.max_turns.max(1),
+            max_tokens: cfg.budget.max_tokens.max(MIN_TASK_TOKENS),
+            timeout_secs: cfg
+                .budget
+                .timeout_secs
+                .clamp(MIN_TASK_TIMEOUT_SECS, MAX_TASK_TIMEOUT_SECS),
             max_continuations: cfg.budget.max_continuations,
         }
     }
@@ -146,6 +155,7 @@ impl Budget {
             "max_turns": self.max_turns,
             "max_tokens": self.max_tokens,
             "timeout_secs": self.timeout_secs,
+            "max_continuations": self.max_continuations,
         })
     }
 }
@@ -254,6 +264,11 @@ impl TaskState {
 struct SessionInner {
     active_session_id: Option<String>,
     session_file: Option<String>,
+    /// Pi receives autonomous limits on `create`; remember which task budget
+    /// the loaded session currently carries so later spawns can refresh it.
+    budget: Option<Budget>,
+    /// Last cumulative `get_session_stats` value observed for this session.
+    session_usage: Option<Usage>,
     busy_task: Option<String>,
     last_used: time::Instant,
     tasks_total: u64,
@@ -431,6 +446,7 @@ pub struct SubagentManager {
     config: SubagentConfig,
     /// The live `[subagent.model]`. Read through [`Self::model`].
     model: StdMutex<SubagentModelConfig>,
+    inherited_spawn: AsyncMutex<()>,
     /// Where `[subagent.model]` is written back; `None` when Portal started
     /// from in-memory defaults.
     config_path: Option<PathBuf>,
@@ -527,6 +543,7 @@ impl SubagentManager {
             workspace_root: config.security.workspace_root.clone(),
             command: StdMutex::new(command),
             daemon: StdMutex::new(daemon),
+            inherited_spawn: AsyncMutex::new(()),
             sessions: AsyncMutex::new(HashMap::new()),
             tasks: AsyncMutex::new(HashMap::new()),
             ledger: AsyncMutex::new(ledger),
@@ -861,7 +878,7 @@ impl SubagentManager {
         }
         // Restricted runs use a task-private broker; never adopt an older daemon
         // that may still have unmediated built-in tools or third-party extensions.
-        if self.portal_config.security.permission_mode != crate::config::PermissionMode::FullAccess {
+        if self.config.inherit_model || self.portal_config.security.permission_mode != crate::config::PermissionMode::FullAccess {
             return Ok(Transport::Stdio);
         }
         // `ensure_transport` would start a fresh pi daemon; during shutdown
@@ -908,12 +925,14 @@ impl SubagentManager {
     }
 
     /// `[subagent.model]` with this task's overrides applied.
+    pub fn inherits_model(&self) -> bool { self.config.inherit_model }
+
     fn model_choice(&self, req: &SpawnRequest) -> ModelChoice {
         let model = self.model();
         ModelChoice {
             provider: model.provider,
-            model: req.model.clone().or(model.model),
-            thinking: req.thinking.clone().or(model.thinking),
+            model: if self.config.inherit_model { model.model } else { req.model.clone().or(model.model) },
+            thinking: if self.config.inherit_model { model.thinking } else { req.thinking.clone().or(model.thinking) },
             api_key: model.api_key,
         }
     }
@@ -988,12 +1007,9 @@ impl SubagentManager {
             return;
         };
         let digest = session.transcript.record(event).await;
-        if digest == transcript::EventDigest::default() {
-            return;
-        }
-
         let busy = session.inner.lock().await.busy_task.clone();
         let Some(task_id) = busy else { return };
+        activity::record(&self.config.resolved_state_dir().join(format!("task-{task_id}.jsonl")), &event.event);
         let Some(task) = self.tasks.lock().await.get(&task_id).cloned() else {
             return;
         };
@@ -1037,7 +1053,35 @@ impl SubagentManager {
 
     /// Delegate a task. Returns as soon as the prompt is in flight; the result
     /// is delivered to Heart's callback inbox (PRD §4.3).
-    pub async fn spawn(self: &Arc<Self>, req: SpawnRequest) -> Result<SpawnReceipt> {
+    async fn reload_inherited_model(self: &Arc<Self>) -> Result<()> {
+        let path = self.config_path.as_ref().context("Desktop model configuration is missing")?;
+        let loaded = crate::config::PortalConfig::load(path.to_str().context("Invalid config path")?)
+            .map_err(|_| anyhow::anyhow!("Cannot read Desktop model configuration; refresh model settings"))?;
+        let next = ModelConfigUpdate::default().apply_to(&loaded.subagent.model)?;
+        let current = self.model();
+        if next == current { return Ok(()); }
+        let credentials_changed = next.provider != current.provider || next.api_key != current.api_key
+            || next.base_url != current.base_url || next.api != current.api;
+        if credentials_changed && self.has_running_tasks().await {
+            anyhow::bail!("The Being model endpoint changed while subagent tasks are running; wait for them to finish before starting a new task");
+        }
+        *self.model.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
+        if credentials_changed { self.replace_daemon(&next).await; }
+        self.publish_desktop_status();
+        Ok(())
+    }
+
+    pub async fn spawn(self: &Arc<Self>, mut req: SpawnRequest) -> Result<SpawnReceipt> {
+        if let Some(thinking) = req.thinking.as_mut() {
+            *thinking = thinking.to_ascii_lowercase();
+        }
+        // Keep model activation and task registration together so parallel spawns
+        // cannot replace a daemon before the first task becomes visible.
+        let _inherited = if self.config.inherit_model {
+            let guard = self.inherited_spawn.lock().await;
+            self.reload_inherited_model().await?;
+            Some(guard)
+        } else { None };
         self.ensure_available()?;
         if self.shutting_down.load(Ordering::SeqCst) {
             anyhow::bail!("Portal is shutting down");
@@ -1056,6 +1100,14 @@ impl SubagentManager {
                 "brief is {} bytes (max {MAX_BRIEF_BYTES}); put the detail in a file and reference it",
                 brief.len()
             );
+        }
+        if let Some(model) = req.model.as_deref() {
+            anyhow::ensure!(!model.trim().is_empty(), "model override must not be empty");
+            anyhow::ensure!(!model.chars().any(char::is_whitespace), "model id must not contain whitespace");
+        }
+        if let Some(thinking) = req.thinking.as_deref() {
+            anyhow::ensure!(SUBAGENT_THINKING_LEVELS.contains(&thinking.to_ascii_lowercase().as_str()),
+                "unknown thinking level '{thinking}'; one of: {}", SUBAGENT_THINKING_LEVELS.join(", "));
         }
         let key = normalize_session_key(&req.session)?;
         let workdir = self.resolve_workdir(req.workdir.as_deref())?;
@@ -1103,6 +1155,8 @@ impl SubagentManager {
         let task = self
             .register_task(task_id, &key, &brief, &workdir, &req)
             .await;
+        activity::append(&self.config.resolved_state_dir().join(format!("task-{}.jsonl", task.task_id)),
+            json!({"kind":"started", "input":brief}));
         {
             let mut ledger = self.ledger.lock().await;
             ledger.start_task(
@@ -1225,8 +1279,25 @@ impl SubagentManager {
                     workdir.display()
                 );
             }
-            if session.inner.lock().await.active_session_id.is_some() {
+            let (loaded, budget_changed, busy_task) = {
+                let inner = session.inner.lock().await;
+                (
+                    inner.active_session_id.is_some(),
+                    inner.budget.is_some_and(|budget| budget != req.budget),
+                    inner.busy_task.clone(),
+                )
+            };
+            if loaded && !budget_changed {
                 return Ok((session, true));
+            }
+            if let Some(task_id) = busy_task {
+                anyhow::bail!(
+                    "session '{key}' is busy with task {task_id}; wait for it to finish \
+                     or use a different session key"
+                );
+            }
+            if loaded {
+                self.unload_session(&session).await?;
             }
             let resumed = self.open_pi_session(transport, &session, req).await?;
             return Ok((session, resumed));
@@ -1244,6 +1315,8 @@ impl SubagentManager {
                     .await
                     .session(key)
                     .and_then(|s| s.session_file.clone()),
+                budget: None,
+                session_usage: None,
                 busy_task: None,
                 last_used: time::Instant::now(),
                 tasks_total: 0,
@@ -1268,7 +1341,7 @@ impl SubagentManager {
     ) -> Result<bool> {
         let client = match transport {
             Transport::Daemon(client) => client,
-            Transport::Stdio => return self.open_stdio_session(session).await,
+            Transport::Stdio => return self.open_stdio_session(session, req).await,
         };
 
         let session_path = {
@@ -1331,10 +1404,26 @@ impl SubagentManager {
         {
             let mut inner = session.inner.lock().await;
             inner.active_session_id = Some(summary.active_session_id.clone());
+            inner.budget = Some(req.budget);
             if let Some(file) = summary.session_file.clone() {
                 inner.session_file = Some(file);
             }
             inner.last_used = time::Instant::now();
+        }
+        // A disk-resumed session already contains historical counters. Seed the
+        // legacy cumulative-usage baseline before this task adds its prompt.
+        if resumed {
+            if let Ok(value) = client
+                .request(
+                    Command::GetSessionStats {
+                        active_session_id: summary.active_session_id.clone(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                session.inner.lock().await.session_usage = Some(Usage::from_value(&value));
+            }
         }
         {
             let mut ledger = self.ledger.lock().await;
@@ -1377,10 +1466,11 @@ impl SubagentManager {
     /// each task brings its own process. The session still exists as Portal
     /// bookkeeping — a cwd, a transcript, a busy flag, a ledger row — so
     /// everything the being can ask about a task keeps working.
-    async fn open_stdio_session(self: &Arc<Self>, session: &Arc<SessionState>) -> Result<bool> {
+    async fn open_stdio_session(self: &Arc<Self>, session: &Arc<SessionState>, req: &SpawnRequest) -> Result<bool> {
         {
             let mut inner = session.inner.lock().await;
             inner.active_session_id = Some(format!("{STDIO_SESSION_PREFIX}{}", session.key));
+            inner.budget = Some(req.budget);
             inner.attached = false;
             inner.last_used = time::Instant::now();
         }
@@ -1488,6 +1578,7 @@ impl SubagentManager {
             thinking: choice.thinking,
             timeout: Duration::from_secs(task.budget.timeout_secs),
             transcript: Some(lines_tx),
+            activity_file: Some(self.config.resolved_state_dir().join(format!("task-{}.jsonl", task.task_id))),
         };
 
         let daemon = self.daemon();
@@ -1495,7 +1586,7 @@ impl SubagentManager {
         let handler = self.approval_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let scene = task.scene_id.clone();
         let mut handle = tokio::spawn(async move {
-            if config.security.permission_mode == crate::config::PermissionMode::FullAccess {
+            if !config.subagent.inherit_model && config.security.permission_mode == crate::config::PermissionMode::FullAccess {
                 return daemon.run_stdio_task(spec).await;
             }
             let bridge = tool_bridge::ToolBridge::start(config, handler, scene, daemon.agent_dir().join("portal-tools")).await?;
@@ -1588,6 +1679,9 @@ impl SubagentManager {
         message: String,
     ) {
         let timeout = Duration::from_secs(task.budget.timeout_secs) + PROMPT_TIMEOUT_SLACK;
+        // Pi's legacy `get_session_stats` is cumulative for the whole session;
+        // retain the last cumulative value so the fallback can report this task.
+        let usage_before = session.inner.lock().await.session_usage;
         let prompt = PromptRequest {
             active_session_id: active_session_id.clone(),
             message,
@@ -1597,9 +1691,12 @@ impl SubagentManager {
 
         let (status, outcome) = match result {
             Ok(value) => {
-                let outcome = self
-                    .collect_outcome(&client, &active_session_id, Some(&value))
+                let (outcome, usage_after) = self
+                    .collect_outcome(&client, &active_session_id, Some(&value), usage_before)
                     .await;
+                if let Some(usage_after) = usage_after {
+                    session.inner.lock().await.session_usage = Some(usage_after);
+                }
                 (classify(&task, &outcome, &value).await, outcome)
             }
             Err(e) => {
@@ -1628,12 +1725,15 @@ impl SubagentManager {
                             active_session_id: active_session_id.clone(),
                         })
                         .await;
-                    let outcome = self
-                        .collect_outcome(&client, &active_session_id, None)
+                    let (outcome, usage_after) = self
+                        .collect_outcome(&client, &active_session_id, None, usage_before)
                         .await;
+                    if let Some(usage_after) = usage_after {
+                        session.inner.lock().await.session_usage = Some(usage_after);
+                    }
                     (TaskStatus::Timeout, outcome)
                 } else if !client.is_connected() {
-                    self.recover_after_socket_loss(&task, &active_session_id)
+                    self.recover_after_socket_loss(&session, &task, &active_session_id, usage_before)
                         .await
                 } else {
                     (
@@ -1658,15 +1758,16 @@ impl SubagentManager {
         client: &Arc<PiClient>,
         active_session_id: &str,
         value: Option<&Value>,
-    ) -> TaskOutcome {
+        usage_before: Option<Usage>,
+    ) -> (TaskOutcome, Option<Usage>) {
         if let Some(complete) = value.and_then(PromptComplete::from_value) {
-            return TaskOutcome {
+            return (TaskOutcome {
                 status_override: complete.failed().then_some("failed"),
                 text: complete.last_assistant_text,
                 error: complete.error_message,
                 usage: complete.usage,
                 turns: complete.turns,
-            };
+            }, None);
         }
 
         let text = client
@@ -1686,7 +1787,7 @@ impl SubagentManager {
                     .map(str::to_string),
             });
 
-        let usage = client
+        let usage_after = client
             .request(
                 Command::GetSessionStats {
                     active_session_id: active_session_id.to_string(),
@@ -1694,7 +1795,10 @@ impl SubagentManager {
                 DEFAULT_REQUEST_TIMEOUT,
             )
             .await
-            .map(|v| Usage::from_value(&v))
+            .ok()
+            .map(|v| Usage::from_value(&v));
+        let usage = usage_after
+            .map(|after| usage_before.map_or(after, |before| after.since(before)))
             .unwrap_or_default();
 
         let auto: AutonomousStatus = client
@@ -1709,7 +1813,7 @@ impl SubagentManager {
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
 
-        TaskOutcome {
+        (TaskOutcome {
             status_override: None,
             text,
             error: auto.last_gate_failure.clone(),
@@ -1722,15 +1826,17 @@ impl SubagentManager {
                 ..usage
             },
             turns: auto.turns_used,
-        }
+        }, usage_after)
     }
 
     /// The socket died mid-task. Reconnect, re-attach, wait for idle, and
     /// collect — the session itself is `resident` and kept running.
     async fn recover_after_socket_loss(
         self: &Arc<Self>,
+        session: &Arc<SessionState>,
         task: &Arc<TaskState>,
         active_session_id: &str,
+        usage_before: Option<Usage>,
     ) -> (TaskStatus, TaskOutcome) {
         warn!(
             "lost the pi socket while task {} was running; attempting recovery",
@@ -1760,9 +1866,12 @@ impl SubagentManager {
                         )
                         .await;
                     if idle.is_ok() {
-                        let outcome = self
-                            .collect_outcome(&client, active_session_id, None)
+                        let (outcome, usage_after) = self
+                            .collect_outcome(&client, active_session_id, None, usage_before)
                             .await;
+                        if let Some(usage_after) = usage_after {
+                            session.inner.lock().await.session_usage = Some(usage_after);
+                        }
                         info!("recovered task {} after a socket loss", task.task_id);
                         return (TaskStatus::Done, outcome);
                     }
@@ -1847,6 +1956,21 @@ impl SubagentManager {
             ledger.save_lossy();
         }
 
+        activity::append(&self.config.resolved_state_dir().join(format!("task-{}.jsonl", task.task_id)),
+            json!({
+                "kind":"finished",
+                "status":status.as_str(),
+                "usage": {
+                    "input": usage.input,
+                    "output": usage.output,
+                    "cache_read": usage.cache_read,
+                    "cache_write": usage.cache_write,
+                    "total": usage.total,
+                    "cost_usd": usage.cost_usd,
+                },
+                "turns": turns,
+                "error": outcome.error.clone(),
+            }));
         session
             .transcript
             .append_line(&format!(
@@ -1936,6 +2060,8 @@ impl SubagentManager {
                     "tokens": {
                         "input": usage.input,
                         "output": usage.output,
+                        "cache_read": usage.cache_read,
+                        "cache_write": usage.cache_write,
                         "total": usage.total,
                     },
                     "cost_usd": usage.cost_usd,
@@ -1963,7 +2089,7 @@ impl SubagentManager {
                 task.status().await.as_str()
             );
         }
-        if self.daemon().transport_mode().await == TransportMode::Stdio {
+        if self.config.inherit_model || self.portal_config.security.permission_mode != crate::config::PermissionMode::FullAccess || self.daemon().transport_mode().await == TransportMode::Stdio {
             anyhow::bail!("{STDIO_NO_SESSION}");
         }
         let active_session_id = self.active_session_id(&session).await?;
@@ -2009,7 +2135,7 @@ impl SubagentManager {
         // Stdio mode has no session to abort into: the runner sees the flag
         // and kills its pi process. Answer with whatever it had said by then
         // rather than waiting for the kill to land.
-        if self.daemon().transport_mode().await == TransportMode::Stdio {
+        if self.config.inherit_model || self.portal_config.security.permission_mode != crate::config::PermissionMode::FullAccess || self.daemon().transport_mode().await == TransportMode::Stdio {
             session
                 .transcript
                 .append_line(&format!("[cancel] task {task_id} aborted by the being"))
@@ -2107,6 +2233,15 @@ impl SubagentManager {
 
         let daemon = self.daemon().health().await;
         let model = self.model();
+        let runtime = match crate::task_environment::bundled_runtime() {
+            Ok(Some(runtime)) => json!({
+                "bundled": true,
+                "python": runtime.python.version,
+                "node": runtime.node.version,
+            }),
+            Ok(None) => json!({ "bundled": false }),
+            Err(_) => json!({ "bundled": false, "error": "bundled runtime unavailable" }),
+        };
         let mut sessions = Vec::new();
         for state in self.sessions.lock().await.values() {
             if session.is_some_and(|f| f != state.key) {
@@ -2165,6 +2300,7 @@ impl SubagentManager {
             "available": self.is_available(),
             "command_resolved": self.pi_installed(),
             "state_dir": self.config.resolved_state_dir().display().to_string(),
+            "runtime": runtime,
             "daemon": daemon.to_json(),
             "auth": {
                 "provider": model.provider,
@@ -2177,6 +2313,7 @@ impl SubagentManager {
             },
             "callback_configured": self.callback.is_configured(),
             "max_concurrent": self.config.max_concurrent,
+            "default_budget": self.default_budget().to_json(),
             "sessions": sessions,
             "running": running,
             "completed": completed,
@@ -2204,6 +2341,8 @@ impl SubagentManager {
             "tokens": {
                 "input": inner.usage.input,
                 "output": inner.usage.output,
+                "cache_read": inner.usage.cache_read,
+                "cache_write": inner.usage.cache_write,
                 "total": inner.usage.total,
             },
             "cost_usd": inner.usage.cost_usd,
@@ -2291,7 +2430,7 @@ impl SubagentManager {
                     "workdir": record.workdir,
                     "elapsed_secs": Value::Null,
                     "turns": record.turns,
-                    "tokens": { "input": 0, "output": 0, "total": record.tokens_total },
+                    "tokens": { "input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": record.tokens_total },
                     "scene_id": record.scene_id,
                     "portal_name": portal_name,
                 }
@@ -2924,6 +3063,31 @@ exit /b 0
     }
 
     #[tokio::test]
+    async fn inherited_model_reloads_without_restart_and_ignores_task_override() {
+        let ws = temp_workspace("inherit");
+        let path = write_config(&ws, "name = \"vale\"\n[subagent]\ninherit_model = true\n[subagent.model]\nprovider = \"openai\"\nmodel = \"first\"\n");
+        let mut config = PortalConfig::load(path.to_str().unwrap()).unwrap();
+        config.security.workspace_root = ws.clone();
+        config.subagent.state_dir = Some(ws.join("state").display().to_string());
+        config.subagent.command = Some(test_shell_command());
+        let m = SubagentManager::new(&config, HeartCallback::new());
+        let next = SubagentModelConfig { provider: Some("portal-custom".into()), model: Some("second".into()),
+            base_url: Some("http://127.0.0.1:9900/v1".into()), api: Some("openai-completions".into()),
+            api_key: Some("fixture-key".into()), thinking: Some("high".into()) };
+        crate::config::write_subagent_model(&path, &next).unwrap();
+        m.reload_inherited_model().await.unwrap();
+        assert_eq!(m.model_config(), next);
+        assert_eq!(m.daemon().config().api_key.as_deref(), Some("fixture-key"));
+        let choice = m.model_choice(&SpawnRequest { brief: "test".into(), session: "test".into(),
+            workdir: None, budget: m.default_budget(), model: Some("ignored".into()), thinking: Some("off".into()), scene_id: None });
+        assert_eq!(choice.model.as_deref(), Some("second"));
+        assert_eq!(choice.thinking.as_deref(), Some("high"));
+        assert!(matches!(m.transport().await.unwrap(), Transport::Stdio));
+        assert!(!m.status(None, None).await.unwrap().to_string().contains("fixture-key"));
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[tokio::test]
     async fn configure_model_needs_a_config_file_to_write_to() {
         let ws = temp_workspace("nofile");
         let m = unconfigured_manager(&ws);
@@ -3233,6 +3397,8 @@ exit /b 0
             usage: Usage {
                 input: 30120,
                 output: 8210,
+                cache_read: 0,
+                cache_write: 0,
                 total: 38330,
                 cost_usd: Some(0.42),
             },
@@ -3554,10 +3720,25 @@ mod flow_tests {
                     };
                     write_line(&writer, reply(serde_json::json!(text))).await;
                 }
-                "get_session_stats" if mode == FakeDaemonMode::Legacy => {
+                "get_session_stats" => {
+                    let prompts = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|command| command["type"] == "prompt_and_wait")
+                        .count() as u64;
+                    let (input, output, cost) = if mode == FakeDaemonMode::Legacy {
+                        (120 * prompts, 60 * prompts, 0.02 * prompts as f64)
+                    } else {
+                        (0, 0, 0.0)
+                    };
                     write_line(
                         &writer,
-                        reply(serde_json::json!({"input": 120, "output": 60, "cost": 0.02})),
+                        reply(serde_json::json!({
+                            "input": input,
+                            "output": output,
+                            "cost": cost
+                        })),
                     )
                     .await;
                 }
@@ -3858,6 +4039,26 @@ mod flow_tests {
     }
 
     #[tokio::test]
+    async fn a_legacy_continuation_reports_only_the_incremental_usage() {
+        let h = harness_with("legacy-usage", 20, FakeDaemonMode::Legacy).await;
+
+        h.manager.spawn(h.request("First task")).await.unwrap();
+        assert_eq!(wait_for_hits(&h.sink, 1, Duration::from_secs(10)).await, 1);
+        h.manager.spawn(h.request("Second task")).await.unwrap();
+        assert_eq!(wait_for_hits(&h.sink, 2, Duration::from_secs(10)).await, 2);
+
+        let hits = h.sink.hits.lock().unwrap();
+        let first = &hits[0]["result"]["tokens"];
+        let second = &hits[1]["result"]["tokens"];
+        assert_eq!(first["total"], 180);
+        assert_eq!(second["input"], 120);
+        assert_eq!(second["output"], 60);
+        assert_eq!(second["total"], 180);
+        assert_eq!(hits[1]["result"]["cost_usd"], 0.02);
+        h.cleanup();
+    }
+
+    #[tokio::test]
     async fn a_p3_daemon_needs_no_follow_up_round_trips() {
         let h = harness("p3", 50).await;
         h.manager.spawn(h.request("Refactor the auth module")).await.unwrap();
@@ -3952,6 +4153,38 @@ mod flow_tests {
         assert_eq!(sessions[0]["tasks_total"], 2);
         assert_eq!(sessions[0]["busy"], false);
         assert_eq!(sessions[0]["loaded"], true);
+        h.cleanup();
+    }
+
+    #[tokio::test]
+    async fn a_changed_budget_reloads_the_warm_session_before_prompting() {
+        let h = harness("budget-reload", 30).await;
+
+        let mut first = h.request("First task");
+        first.budget.max_tokens = 18_000;
+        h.manager.spawn(first).await.unwrap();
+        assert_eq!(wait_for_hits(&h.sink, 1, Duration::from_secs(10)).await, 1);
+        std::fs::create_dir_all(h.fake.session_file.parent().unwrap()).unwrap();
+        std::fs::write(&h.fake.session_file, b"{}\n").unwrap();
+
+        let mut second = h.request("Continuation with a larger budget");
+        second.budget.max_tokens = 120_000;
+        let receipt = h.manager.spawn(second).await.unwrap();
+        assert!(receipt.resumed);
+        assert_eq!(wait_for_hits(&h.sink, 2, Duration::from_secs(10)).await, 2);
+
+        let creates: Vec<Value> = h
+            .fake
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "create")
+            .cloned()
+            .collect();
+        assert_eq!(creates.len(), 2, "a changed per-task budget must recreate the session from its file");
+        assert_eq!(creates[0]["config"]["autonomous"]["maxTokens"], 18_000);
+        assert_eq!(creates[1]["config"]["autonomous"]["maxTokens"], 120_000);
         h.cleanup();
     }
 

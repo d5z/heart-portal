@@ -92,29 +92,35 @@ pub async fn execute(
         .map_err(|e| anyhow::anyhow!("Failed to execute: {}", e))?;
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
-    let (status, stdout_capture, stderr_capture) =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-            let wait = async {
-                #[cfg(unix)]
-                {
-                    owner.wait_unreaped().await?;
-                    owner.terminate();
-                }
-                let status = child.wait().await?;
-                #[cfg(windows)]
+    let wait = async {
+        let status = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            #[cfg(unix)]
+            {
+                owner.wait_unreaped().await?;
                 owner.terminate();
-                Ok(status)
-            };
-            tokio::try_join!(
-                wait,
-                capture(stdout_pipe, output_encoding, max_output_bytes),
-                capture(stderr_pipe, output_encoding, max_output_bytes)
-            )
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Command timed out after {}s", timeout_secs))?
-        .map_err(|e| anyhow::anyhow!("Failed to execute: {}", e))?;
-    let exit_code = status.code().unwrap_or(-1);
+            }
+            let status = child.wait().await?;
+            #[cfg(windows)]
+            owner.terminate();
+            Ok::<_, std::io::Error>(status)
+        }).await;
+        match status {
+            Ok(status) => status.map(Some),
+            Err(_) => {
+                owner.terminate();
+                child.kill().await?;
+                Ok(None)
+            }
+        }
+    };
+    let (status, stdout_capture, stderr_capture) = tokio::try_join!(
+        wait,
+        capture(stdout_pipe, output_encoding, max_output_bytes),
+        capture(stderr_pipe, output_encoding, max_output_bytes)
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to execute: {}", e))?;
+    let timed_out = status.is_none();
+    let exit_code = status.map(|status| status.code().unwrap_or(-1));
     let stdout_bytes = stdout_capture.total;
     let stderr_bytes = stderr_capture.total;
     let stdout = stdout_capture.render();
@@ -129,7 +135,9 @@ pub async fn execute(
             String::new()
         },
     );
-    if exit_code != 0 {
+    if timed_out {
+        text.push_str(&format!("\nCommand timed out after {}s; the process tree was terminated.", timeout_secs));
+    } else if let Some(exit_code) = exit_code.filter(|code| *code != 0) {
         text.push_str(&format!("\n(exit code: {})", exit_code));
     }
 
@@ -145,7 +153,13 @@ pub async fn execute(
 
     Ok(serde_json::json!({
         "content": [{ "type": "text", "text": text }],
-        "isError": exit_code != 0,
+        "isError": timed_out || exit_code != Some(0),
+        "failure_code": if timed_out { Some("command_timeout") } else if matches!(exit_code, Some(127 | 9009)) { Some("command_not_found") } else if exit_code != Some(0) { Some("command_exit") } else { None },
+        "next_action": if timed_out && arguments.get("sandbox_permissions").and_then(Value::as_str) == Some("require_escalated") {
+            Some("查看已保留的输出，确认原因后调整 timeout_secs（最多 300 秒）；本次宿主授权只允许前台命令。不要原样反复重试。")
+        } else if timed_out { Some("查看已保留的输出；长任务可使用 background=true，或在确认原因后调整 timeout_secs。不要原样反复重试。") }
+            else if matches!(exit_code, Some(127 | 9009)) { Some("Python/Node 已由 Portal 内置；其他命令需确认项目依赖。内置解释器缺失时修复 Portal 安装，不要反复寻找宿主路径或生成启动器。") }
+            else if exit_code != Some(0) { Some("查看 stderr 和退出码，修正命令、输入文件或依赖后再试。") } else { None },
         "truncated": truncated,
         "exit_code": exit_code,
         "duration_ms": started.elapsed().as_millis(),
@@ -311,8 +325,12 @@ mod tests {
         let manager = Arc::new(ProcessManager::new(
             crate::heart_callback::HeartCallback::new(),
         ));
-        let result = execute(&config, &manager, serde_json::json!({"command":"(sleep 2; echo leaked > leaked.txt) & wait", "timeout_secs":1})).await;
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let result = execute(&config, &manager, serde_json::json!({"command":"echo started; echo waiting >&2; (sleep 2; echo leaked > leaked.txt) & wait", "timeout_secs":1})).await;
+        let result = result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["failure_code"], "command_timeout");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("started") && text.contains("waiting") && text.contains("timed out"));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!workspace.join("leaked.txt").exists());
         std::fs::remove_dir_all(workspace).unwrap();

@@ -23,7 +23,8 @@ pub fn plan(config: &PortalConfig, name: &str, args: &Value) -> Result<Plan> {
     let mut plan = Plan { decision: decide(mode, name), file: None, host_command: false,
         isolation: "host-tool", reason: "External tool or host operation" };
     if mode == PermissionMode::FullAccess { return Ok(plan); }
-    if matches!(name, "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" | "portal_search") {
+    if matches!(name, "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" | "portal_search" | "portal_file_copy") {
+        if name == "portal_file_copy" && mode == PermissionMode::ReadOnly { return Ok(plan); }
         let write = matches!(name, "portal_file_write" | "portal_file_edit");
         if write && mode == PermissionMode::ReadOnly { return Ok(plan); }
         let path = args.get("path").and_then(Value::as_str)
@@ -40,13 +41,13 @@ pub fn plan(config: &PortalConfig, name: &str, args: &Value) -> Result<Plan> {
             plan.decision = Decision::Deny;
             return Ok(plan);
         }
-        let needs_approval = if write { super::file::authorize_write(config, &target).is_err() }
-            else { super::file::sensitive_read(config, &target)? };
+        let needs_approval = write || name == "portal_file_copy" || super::file::sensitive_read(config, &target)?;
         plan.decision = if needs_approval {
             if mode == PermissionMode::ReadOnly { Decision::Deny } else { Decision::Ask }
         } else { Decision::Allow };
         plan.isolation = "file-scope";
-        plan.reason = if write { "Write outside the workspace or change protected configuration" }
+        plan.reason = if write { "Modify this file; every modification requires consent" }
+            else if name == "portal_file_copy" { "Copy this input file into the workspace" }
             else { "Read sensitive local data" };
         plan.file = Some(target);
     } else if name == "portal_exec" && mode != PermissionMode::ReadOnly {
@@ -68,13 +69,13 @@ pub fn plan(config: &PortalConfig, name: &str, args: &Value) -> Result<Plan> {
             plan.host_command = true;
             plan.reason = "Run this command outside the sandbox with host file and network access";
         } else {
-            plan.decision = Decision::Allow;
+            plan.decision = Decision::Ask;
             plan.isolation = if cfg!(windows) { "windows-lpac-offline" } else if cfg!(target_os = "macos") { "macos-seatbelt-offline" } else { "unavailable" };
             plan.reason = "Run inside the workspace sandbox";
         }
     } else if name == "portal_process" && mode != PermissionMode::ReadOnly {
-        // These sessions were created by this ToolHost, under its sandbox policy.
-        plan.decision = Decision::Allow;
+        // Reads and stopping an already approved process do not run a new command.
+        plan.decision = if args.get("action").and_then(Value::as_str) == Some("write") { Decision::Ask } else { Decision::Allow };
     } else if name == "portal_web_fetch" {
         plan.isolation = "public-web-read";
         plan.reason = "Fetch a public URL without local credentials";
@@ -91,7 +92,6 @@ pub fn decide(mode: PermissionMode, name: &str) -> Decision {
         return Decision::Allow;
     }
     if mode == PermissionMode::ReadOnly { return Decision::Deny; }
-    if matches!(name, "portal_file_write" | "portal_file_edit") { return Decision::Allow; }
     Decision::Ask
 }
 
@@ -107,11 +107,11 @@ mod tests {
     use std::{sync::{Arc, Mutex}, future::Future, pin::Pin};
 
     #[test]
-    fn only_desktop_verbs_require_client_command_approval() {
+    fn every_shell_and_desktop_command_requires_approval() {
         let mut config = PortalConfig::default();
         config.security.permission_mode = PermissionMode::Supervised;
         for command in ["@echo marker", "@(1,2) | Write-Output", "@{key=1}"] {
-            assert_eq!(plan(&config, "portal_exec", &json!({"command":command})).unwrap().decision, Decision::Allow);
+            assert_eq!(plan(&config, "portal_exec", &json!({"command":command})).unwrap().decision, Decision::Ask);
         }
         for command in ["@context", "@scenes", "@plugins list", "@security-approve"] {
             assert_eq!(plan(&config, "portal_exec", &json!({"command":command})).unwrap().decision, Decision::Ask);
@@ -159,19 +159,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_operations_are_automatic_but_host_and_client_commands_ask() {
+    async fn sandbox_host_and_client_commands_all_ask() {
         let mut config = PortalConfig::default();
         config.security.permission_mode = PermissionMode::Supervised;
         let approver = Arc::new(Approver { requests: Mutex::new(vec![]), allow: false });
         let host = ToolHost::new(&config).with_client_handler(approver.clone());
         let normal = plan(&config, "portal_exec", &json!({"command":"echo hello"})).unwrap();
-        assert_eq!(normal.decision, Decision::Allow);
+        assert_eq!(normal.decision, Decision::Ask);
         assert!(!normal.host_command);
+        assert!(host.call_with_scene("portal_exec", json!({"command":"echo hello"}), Some("test-scene")).await.is_err());
         assert!(host.call_with_scene("portal_exec", json!({"command":"echo hello", "sandbox_permissions":"require_escalated", "justification":"host access"}), Some("test-scene")).await.is_err());
         assert!(host.call_with_scene("portal_exec", json!({"command":"  @plugins list"}), Some("test-scene")).await.is_err());
         let requests = approver.requests.lock().unwrap();
-        let shell: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
-        let client: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        let shell: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        let client: serde_json::Value = serde_json::from_str(&requests[2]).unwrap();
+        assert_eq!(requests.len(), 3);
         assert_eq!(shell["isolation"], "host-tool");
         assert_eq!(client["isolation"], "host-tool");
     }
@@ -188,7 +190,10 @@ mod tests {
         assert!(!root.join("notes.txt").exists());
         config.security.permission_mode = PermissionMode::Supervised;
         let host = ToolHost::new(&config);
-        host.call("portal_file_write", args).await.unwrap();
+        assert!(host.call("portal_file_write", args.clone()).await.is_err());
+        assert!(!root.join("notes.txt").exists());
+        let approved = ToolHost::new(&config).with_client_handler(Arc::new(Approver { requests: Mutex::new(vec![]), allow:true }));
+        approved.call_with_scene("portal_file_write", args, Some("test-scene")).await.unwrap();
         assert_eq!(std::fs::read_to_string(root.join("notes.txt")).unwrap(), "hello");
         for path in [".git/config", ".codex/config.toml", "tools/mcp.toml", "portal.toml", "../escape.txt"] {
             assert!(host.call("portal_file_write", json!({"path":path,"content":"bad"})).await.is_err());
@@ -206,7 +211,7 @@ mod tests {
         }
         assert_eq!(decide(PermissionMode::Supervised, "portal_subagent_spawn"), Decision::Allow);
         assert_eq!(decide(PermissionMode::ReadOnly, "portal_file_write"), Decision::Deny);
-        assert_eq!(decide(PermissionMode::Supervised, "portal_file_write"), Decision::Allow);
+        assert_eq!(decide(PermissionMode::Supervised, "portal_file_write"), Decision::Ask);
         assert_eq!(decide(PermissionMode::ReadOnly, "portal_file_read"), Decision::Allow);
         assert_eq!(decide(PermissionMode::FullAccess, "custom_tool"), Decision::Allow);
     }
@@ -219,13 +224,13 @@ mod tests {
         config.security.workspace_root = workspace.clone();
         config.prepare_workspace().unwrap();
         config.security.permission_mode = PermissionMode::Supervised;
-        let host = ToolHost::new(&config);
+        let host = ToolHost::new(&config).with_client_handler(Arc::new(Approver { requests: Mutex::new(vec![]), allow:true }));
         let protected = workspace.join("portal.toml");
         let outside = root.join("private.txt");
         for (target, alias) in [(&protected, "config-alias.txt"), (&outside, "outside-alias.txt")] {
             std::fs::write(target, "safe").unwrap();
             std::fs::hard_link(target, workspace.join(alias)).unwrap();
-            let result = host.call("portal_file_write", json!({"path":alias,"content":"changed","append":true})).await;
+            let result = host.call_with_scene("portal_file_write", json!({"path":alias,"content":"changed","append":true}), Some("test-scene")).await;
             let content = std::fs::read_to_string(target).unwrap();
             // Clean up before asserting so the failing regression leaves no fixtures.
             if result.is_ok() || content != "safe" {
@@ -233,8 +238,8 @@ mod tests {
                 panic!("Appending a hard link changed a protected target: {result:?}, content={content:?}");
             }
         }
-        host.call("portal_file_write", json!({"path":"normal.txt","content":"first","append":true})).await.unwrap();
-        host.call("portal_file_write", json!({"path":"normal.txt","content":"second","append":true})).await.unwrap();
+        host.call_with_scene("portal_file_write", json!({"path":"normal.txt","content":"first","append":true}), Some("test-scene")).await.unwrap();
+        host.call_with_scene("portal_file_write", json!({"path":"normal.txt","content":"second","append":true}), Some("test-scene")).await.unwrap();
         assert_eq!(std::fs::read_to_string(workspace.join("normal.txt")).unwrap(), "firstsecond");
         std::fs::remove_dir_all(root).unwrap();
     }

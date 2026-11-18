@@ -4,6 +4,7 @@
 |------|------------|---------|---------|
 | `portal_status` | (none) | Running version/build ID, effective configuration, live connection state and loaded kit summary; no credential values | `{}` |
 | `portal_exec` | `command`, optional `shell`, `workdir`, `timeout_secs`, `background`, `output_encoding` | Shell output or background session info | `{"command": "uname -a"}` |
+| `portal_file_copy` | `path`, optional `destination` | Stage a local input into the workspace, with path and SHA-256 | `{"path":"/source/report.pdf","destination":"inputs/report.pdf"}` |
 | `portal_process` | `action` (`list` \| `poll` \| `log` \| `write` \| `kill`), optional `session_id`, `timeout_ms`, `offset`, `limit`, `data` | Session/output bytes | `{"action": "list"}` |
 | `portal_file_read` | `path` | File text | `{"path": "notes.txt"}` |
 | `portal_file_write` | `path`, `content`, optional `append`, `encoding`, `unescape` | Ack text | `{"path": "out.txt", "content": "hi"}` |
@@ -47,6 +48,31 @@ use `portal_kits_reload` or wait for the five-second scan. Configured credential
 do not prove Jira or another service has granted access. Tokens, Loom links,
 environment values and credential file contents are omitted.
 
+## Computer operation permissions
+
+Desktop offers Always allow and Ask every time (the default). Ask every time
+requires consent before each command, file modification/copy or external tool call. Consent applies only to that invocation;
+repeated operations ask again. There is no automatic reviewer or remembered
+per-operation grant. Approved default commands still use the offline sandbox.
+
+## Prepare a sandbox task
+
+Desktop bundles pinned Python and Node interpreters beside Portal. Invoke
+`python3`/`python` or `node` directly through `portal_exec`; the engine prepares
+HOME, temporary and cache directories automatically. No environment tool,
+interpreter search or generated launcher is needed. The initial bundle contains
+only the interpreters, without document or plotting packages.
+
+Stage local files with `portal_file_copy` instead of shell escalation or binary
+round-trips through the model. Copies require consent in Ask every time mode; destinations
+must be ordinary workspace paths, existing files are never overwritten, and the
+per-file limit is 128 MiB. Save deliverables in `outputs/`.
+
+`workdir` accepts workspace-relative paths, including `.`. Foreground timeouts
+preserve partial output and return `failure_code` and `next_action`. Inspect and
+fix the cause before retrying. Use background mode for slow sandbox work;
+approved host commands must stay in the foreground with an appropriate timeout.
+
 ## Shell commands on Windows
 
 `portal_exec` uses `cmd.exe`, for both foreground and background commands. Quote
@@ -57,7 +83,7 @@ paths and arguments that contain spaces; do not add another outer quote pair:
 ```
 
 Portal preserves the command's quotes, pipelines, redirection, and `&&`/`&`.
-It discovers Git for Windows from the inherited PATH or standard system/per-user
+In full-access mode it discovers Git for Windows from the inherited PATH or standard system/per-user
 install directories, and appends its `usr/bin` to the exec child's PATH. This
 provides `ls`, `cat`, `grep`, and `rm` when Git is installed. Existing Windows
 commands and user PATH entries take precedence; the shell remains `cmd.exe`.
@@ -175,6 +201,7 @@ An MCP failure, capacity error or service authorization error should be handled
 within that kit; use `portal_status` to inspect the host separately.
 
 The `portal_` namespace belongs to the host. Kits run as the same OS user and
-are not sandboxed; enabling `portal_exec` gives the Being host command access.
+use the selected permission mode; Always allow grants host command access,
+while Ask every time requires consent and defaults to sandbox execution.
 Neither kit authorship nor the manifest defines a per-Being access boundary.
 See [kit reliability and trust](../../docs/kit-configuration.md#portal-reliability-and-trust-boundary).

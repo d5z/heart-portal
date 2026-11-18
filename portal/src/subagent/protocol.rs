@@ -453,6 +453,8 @@ pub struct SessionStateInfo {
 pub struct Usage {
     pub input: u64,
     pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
     pub total: u64,
     pub cost_usd: Option<f64>,
 }
@@ -472,18 +474,55 @@ impl Usage {
         };
         let input = pick(&["input", "inputTokens", "input_tokens", "promptTokens"]);
         let output = pick(&["output", "outputTokens", "output_tokens", "completionTokens"]);
+        let cache_read = pick(&["cacheRead", "cache_read", "cacheReadInputTokens", "cache_read_input_tokens"]);
+        let cache_write = pick(&[
+            "cacheWrite",
+            "cache_write",
+            "cacheWriteInputTokens",
+            "cache_write_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation_input_tokens",
+        ]);
         let mut total = pick(&["total", "totalTokens", "total_tokens"]);
         if total == 0 {
-            total = input + output;
+            total = input.saturating_add(output).saturating_add(cache_read).saturating_add(cache_write);
         }
-        let cost_usd = ["cost", "costUsd", "cost_usd", "totalCost"]
-            .iter()
-            .find_map(|k| root.get(*k).and_then(|x| x.as_f64()));
+        let cost = |value: &Value| {
+            ["cost", "costUsd", "cost_usd", "totalCost"]
+                .iter()
+                .find_map(|k| {
+                    value
+                        .get(*k)
+                        .and_then(|x| x.as_f64())
+                        .or_else(|| value.get(*k).and_then(|x| x.get("total")).and_then(|x| x.as_f64()))
+                })
+        };
+        let cost_usd = cost(root).or_else(|| (root != v).then(|| cost(v)).flatten());
         Self {
             input,
             output,
+            cache_read,
+            cache_write,
             total,
             cost_usd,
+        }
+    }
+
+    /// `get_session_stats` reports cumulative session counters. Turn them into
+    /// the usage attributable to one prompt without allowing a reset or a
+    /// reordered response to underflow.
+    pub fn since(self, baseline: Usage) -> Self {
+        Self {
+            input: self.input.saturating_sub(baseline.input),
+            output: self.output.saturating_sub(baseline.output),
+            cache_read: self.cache_read.saturating_sub(baseline.cache_read),
+            cache_write: self.cache_write.saturating_sub(baseline.cache_write),
+            total: self.total.saturating_sub(baseline.total),
+            cost_usd: match (self.cost_usd, baseline.cost_usd) {
+                (Some(after), Some(before)) => Some((after - before).max(0.0)),
+                (Some(after), None) => Some(after),
+                _ => None,
+            },
         }
     }
 }
@@ -690,6 +729,8 @@ impl StdioResult {
         let one = Usage::from_value(usage);
         self.usage.input = self.usage.input.saturating_add(one.input);
         self.usage.output = self.usage.output.saturating_add(one.output);
+        self.usage.cache_read = self.usage.cache_read.saturating_add(one.cache_read);
+        self.usage.cache_write = self.usage.cache_write.saturating_add(one.cache_write);
         self.usage.total = self.usage.total.saturating_add(one.total);
         // pi nests the price under `cost.total`; flat shapes are handled by
         // `Usage::from_value` itself.
@@ -864,7 +905,29 @@ mod tests {
         let camel = serde_json::json!({"inputTokens":10,"outputTokens":5,"totalTokens":15});
         let u = Usage::from_value(&camel);
         assert_eq!((u.input, u.output, u.total), (10, 5, 15));
+        let cached = serde_json::json!({
+            "tokens": {"input": 10, "output": 5, "cacheRead": 20, "cache_creation_input_tokens": 3},
+            "cost": {"total": 0.7}
+        });
+        let u = Usage::from_value(&cached);
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_write, u.total), (10, 5, 20, 3, 38));
+        assert_eq!(u.cost_usd, Some(0.7));
         assert_eq!(Usage::from_value(&serde_json::json!({})).total, 0);
+    }
+
+    #[test]
+    fn usage_includes_cache_and_can_be_reduced_to_one_prompt() {
+        let before = Usage::from_value(&serde_json::json!({
+            "tokens": {"input": 100, "output": 20, "cacheRead": 40, "cacheWrite": 2, "total": 162, "cost": 0.1}
+        }));
+        let after = Usage::from_value(&serde_json::json!({
+            "tokens": {"input": 500, "output": 80, "cacheRead": 140, "cacheWrite": 6, "total": 726, "cost": 0.4}
+        }));
+        assert_eq!((after.input, after.output, after.cache_read, after.cache_write, after.total), (500, 80, 140, 6, 726));
+        let delta = after.since(before);
+        assert_eq!((delta.input, delta.output, delta.cache_read, delta.cache_write, delta.total), (400, 60, 100, 4, 564));
+        let cost = delta.cost_usd.expect("cost delta");
+        assert!((cost - 0.3).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -19,8 +19,11 @@ const POLICY: &str = r#"
     (subpath "/usr/bin") (subpath "/usr/sbin")
     (subpath "/usr/lib") (subpath "/usr/libexec") (subpath "/usr/share")
     (subpath "/System/Library") (subpath "/Library/Apple")
+    (subpath "/Library/Developer/CommandLineTools")
     (subpath "/private/var/db/dyld") (subpath "/private/var/db/timezone")
     (literal "/private/etc/localtime")
+    ; Python mimetypes probes this public system table during pip/ensurepip.
+    (literal "/private/etc/apache2/mime.types")
     (literal "/dev/random") (literal "/dev/urandom")
     (subpath "/opt/homebrew/bin") (subpath "/opt/homebrew/lib")
     (subpath "/opt/homebrew/Cellar") (subpath "/opt/homebrew/opt") (subpath "/opt/homebrew/share")
@@ -55,10 +58,16 @@ pub fn shell_command(config: &PortalConfig, source: &str, workdir: &str) -> Resu
         anyhow::ensure!(!metadata.is_file() || metadata.nlink() == 1,
             "Sandbox workspace contains a hardlinked file; remove the alias before running commands");
     }
+    let environment = crate::task_environment::prepare(config)?;
     let mut policy = POLICY.to_owned();
     let mut command = Command::new("/usr/bin/sandbox-exec");
     let root_text = root.to_str().context("Sandbox workspace must be UTF-8")?;
     command.arg("-D").arg(format!("WORKSPACE={root_text}"));
+    if let Some(runtime) = &environment.runtime {
+        anyhow::ensure!(!runtime.root.starts_with(&root), "Bundled runtime must be outside the writable workspace");
+        command.arg("-D").arg(format!("RUNTIME={}", runtime.root.to_str().context("Runtime path must be UTF-8")?));
+        policy.push_str("(allow file-read* (subpath (param \"RUNTIME\")))\n");
+    }
     // Match reserved components relative to the selected workspace. A checkout
     // underneath ~/.codex/worktrees must still be writable. Pass regexes as data.
     let escaped_root: String = root_text.chars().map(|c| {
@@ -87,9 +96,7 @@ pub fn shell_command(config: &PortalConfig, source: &str, workdir: &str) -> Resu
             policy.push_str(&format!("(deny file-write-unlink (literal (param \"{key}\")))\n"));
         }
     }
-    command.args(["-p", &policy, "/bin/sh", "-c", source]).current_dir(&cwd).env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin")
-        .env("HOME", &root).env("TMPDIR", &root).env("LANG", "en_US.UTF-8");
+    command.args(["-p", &policy, "/bin/sh", "-c", source]).current_dir(&cwd).env_clear().envs(environment.variables);
     Ok(command)
 }
 

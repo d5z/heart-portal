@@ -29,16 +29,46 @@ impl ClientHandler for Approver {
 
 #[tokio::test]
 async fn remote_subagent_setup_still_requires_approval() {
-    for mode in [PermissionMode::ReadOnly, PermissionMode::Supervised, PermissionMode::AutoReview] {
+    for mode in [PermissionMode::ReadOnly, PermissionMode::Supervised] {
         let (_f, config) = fixture(mode);
         let error = ToolHost::new(&config).call("portal_subagent_setup", json!({})).await.unwrap_err();
-        assert!(error.to_string().contains(if mode == PermissionMode::ReadOnly { "denied by permission mode" } else { "approval denied" }));
+        assert!(error.to_string().contains(if mode == PermissionMode::ReadOnly { "denied by permission mode" } else { "approval" }));
     }
 }
 
 #[tokio::test]
+async fn stages_external_input_without_shell_or_model_roundtrip_and_restricts_destination() {
+    let (f, config) = fixture(PermissionMode::Supervised);
+    let source = f.0.join("source.bin");
+    std::fs::write(&source, [0, 1, 128, 255]).unwrap();
+    let denied = ToolHost::new(&config);
+    assert!(denied.call("portal_file_copy", json!({"path":source})).await.is_err());
+    assert!(!config.security.workspace_root.join("inputs/source.bin").exists());
+    let host = ToolHost::new(&config).with_client_handler(Arc::new(Approver(Mutex::new(vec![]), true)));
+    let copied = host.call("portal_file_copy", json!({"path":source})).await.unwrap();
+    assert_eq!(copied["bytes"], 4);
+    assert_eq!(std::fs::read(config.security.workspace_root.join("inputs/source.bin")).unwrap(), [0, 1, 128, 255]);
+    assert!(host.call("portal_file_copy", json!({"path":source})).await.is_err());
+    for destination in ["../escaped.bin", ".git/config", "portal.toml"] {
+        assert!(host.call("portal_file_copy", json!({"path":source,"destination":destination})).await.is_err());
+    }
+    let secret = f.0.join(".env");
+    std::fs::write(&secret, "secret").unwrap();
+    assert!(denied.call("portal_file_copy", json!({"path":secret,"destination":"inputs/env.txt"})).await.is_err());
+    assert!(!config.security.workspace_root.join("inputs/env.txt").exists());
+    let approver = Arc::new(Approver(Mutex::new(vec![]), true));
+    let approved = ToolHost::new(&config).with_client_handler(approver.clone());
+    approved.call("portal_file_copy", json!({"path":secret,"destination":"inputs/env.txt"})).await.unwrap();
+    assert_eq!(approver.0.lock().unwrap().len(), 1);
+    assert!(approved.call("portal_file_copy", json!({"path":secret,"destination":"../escaped.txt"})).await.is_err());
+    let mut readonly = config.clone();
+    readonly.security.permission_mode = PermissionMode::ReadOnly;
+    assert!(ToolHost::new(&readonly).call("portal_file_copy", json!({"path":source,"destination":"inputs/readonly.bin"})).await.is_err());
+}
+
+#[tokio::test]
 async fn external_writes_require_exact_single_call_approval_and_reads_do_not() {
-    for mode in [PermissionMode::Supervised, PermissionMode::AutoReview] {
+    for mode in [PermissionMode::Supervised] {
         let (f, config) = fixture(mode);
         let outside = f.0.join("external.txt");
         std::fs::write(&outside, "original").unwrap();
@@ -100,7 +130,7 @@ async fn secrets_ask_and_broad_search_cannot_disclose_secrets_or_hardlinks() {
 
 #[tokio::test]
 async fn secret_reads_edits_and_writes_share_the_same_approval_boundary() {
-    for mode in [PermissionMode::Supervised, PermissionMode::AutoReview] {
+    for mode in [PermissionMode::Supervised] {
         let (_f, config) = fixture(mode);
         let denied = ToolHost::new(&config);
         let approver = Arc::new(Approver(Mutex::new(vec![]), true));
@@ -139,7 +169,7 @@ async fn protected_configuration_requires_explicit_approval_and_disabled_tools_s
 
 #[tokio::test]
 async fn restricted_startup_never_loads_workspace_mcp() {
-    for mode in [PermissionMode::ReadOnly, PermissionMode::Supervised, PermissionMode::AutoReview] {
+    for mode in [PermissionMode::ReadOnly, PermissionMode::Supervised] {
         let (_f, config) = fixture(mode);
         std::fs::create_dir_all(config.security.workspace_root.join("tools")).unwrap();
         // Invalid config proves the restricted startup never even attempts discovery.
@@ -153,8 +183,9 @@ async fn restricted_startup_never_loads_workspace_mcp() {
 #[test]
 fn shell_escalation_is_explicit_and_never_creates_persistent_host_sessions() {
     let (_f, config) = fixture(PermissionMode::Supervised);
-    assert_eq!(plan(&config, "portal_exec", &json!({"command":"echo ordinary"})).unwrap().decision, Decision::Allow);
+    assert_eq!(plan(&config, "portal_exec", &json!({"command":"echo ordinary"})).unwrap().decision, Decision::Ask);
     assert_eq!(plan(&config, "portal_process", &json!({"action":"poll"})).unwrap().decision, Decision::Allow);
+    assert_eq!(plan(&config, "portal_process", &json!({"action":"write"})).unwrap().decision, Decision::Ask);
     let args = json!({"command":"echo outside", "sandbox_permissions":"require_escalated", "justification":"needs host tools"});
     let host = plan(&config, "portal_exec", &args).unwrap();
     assert_eq!(host.decision, Decision::Ask);

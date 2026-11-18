@@ -26,6 +26,9 @@ const MAX_TIMEOUT_SECS: u64 = 21_600;
 /// A meaningful task needs at least a couple of turns and some tokens.
 const MIN_MAX_TURNS: u32 = 1;
 const MIN_MAX_TOKENS: u64 = 1_000;
+const MAX_MAX_TURNS: u64 = u32::MAX as u64;
+const MAX_MAX_TOKENS: u64 = 9_007_199_254_740_991; // JavaScript's exact-integer ceiling
+const MAX_MAX_CONTINUATIONS: u64 = u32::MAX as u64;
 /// `portal_process`-compatible long-poll cap.
 const MAX_LOG_TIMEOUT_MS: u64 = 300_000;
 
@@ -57,7 +60,7 @@ pub fn list_tools() -> Vec<ToolInfo> {
     vec![
         ToolInfo {
             name: "portal_subagent_spawn".to_string(),
-            description: "Delegate a self-contained task to your sub-agent. Returns immediately with a task_id; when the task finishes Portal notifies you through your inbox with the result — let go of it instead of polling. Tasks in the same `session` share one accumulating working memory (files, decisions, project knowledge); use one session per project or scene. Use this for work that needs judgement and many steps; use portal_exec for a single command.".to_string(),
+            description: "Delegate a self-contained task to your sub-agent. Returns immediately with a task_id; when the task finishes Portal notifies you through your inbox with the result — let go of it instead of polling. In daemon mode, tasks in the same `session` share accumulated working memory; restricted client-model mode runs each task in a fresh process, while files remain shared. Use one session per project or scene when the selected runtime supports it. Use this for work that needs judgement and many steps; use portal_exec for a single command.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -78,9 +81,10 @@ pub fn list_tools() -> Vec<ToolInfo> {
                         "properties": {
                             "max_turns": {"type": "integer", "minimum": 1},
                             "max_tokens": {"type": "integer", "minimum": 1000},
-                            "timeout_secs": {"type": "integer", "minimum": 30, "maximum": 21600}
+                            "timeout_secs": {"type": "integer", "minimum": 30, "maximum": 21600},
+                            "max_continuations": {"type": "integer", "minimum": 0}
                         },
-                        "description": "Caps for this task; defaults from portal.toml [subagent.budget]."
+                        "description": "Caps for this task; defaults from portal.toml [subagent.budget]. max_continuations limits daemon-mode autonomous continuation turns; stdio fallback remains bounded by max_turns, max_tokens and timeout_secs."
                     },
                     "model": {
                         "type": "string",
@@ -189,6 +193,9 @@ pub async fn handle(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value> {
+    if tool_name == "portal_subagent_setup" && manager.inherits_model() && arguments.as_object().is_some_and(|a| !a.is_empty()) {
+        return Ok(err("Subagent automatically inherits the Being model. Change the existing client model settings instead."));
+    }
     let result = match tool_name {
         "portal_subagent_spawn" => spawn(manager, arguments).await,
         "portal_subagent_status" => status(manager, arguments).await,
@@ -207,22 +214,14 @@ pub async fn handle(
 }
 
 async fn spawn(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value> {
-    let brief = arguments
-        .get("brief")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'brief'"))?
-        .to_string();
+    let brief = match arguments.get("brief") {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => anyhow::bail!("'brief' must be a string, got {value}"),
+        None => anyhow::bail!("Missing 'brief'"),
+    };
 
-    let session = arguments
-        .get("session")
-        .and_then(|v| v.as_str())
-        .unwrap_or(DEFAULT_SESSION_KEY)
-        .to_string();
-
-    let workdir = arguments
-        .get("workdir")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let session = optional_string(&arguments, "session")?.unwrap_or_else(|| DEFAULT_SESSION_KEY.to_string());
+    let workdir = optional_string(&arguments, "workdir")?;
 
     let budget = parse_budget(manager.default_budget(), arguments.get("budget"))?;
 
@@ -231,18 +230,9 @@ async fn spawn(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
         session,
         workdir,
         budget,
-        model: arguments
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        thinking: arguments
-            .get("thinking")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        scene_id: arguments
-            .get("scene_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        model: optional_string(&arguments, "model")?,
+        thinking: optional_string(&arguments, "thinking")?.map(|value| value.to_ascii_lowercase()),
+        scene_id: optional_string(&arguments, "scene_id")?,
     };
 
     Ok(manager.spawn(req).await?.to_json())
@@ -390,16 +380,36 @@ fn parse_budget(default: Budget, raw: Option<&Value>) -> Result<Budget> {
         .ok_or_else(|| anyhow::anyhow!("'budget' must be an object"))?;
 
     let mut budget = default;
-    if let Some(v) = obj.get("max_turns").and_then(value_as_u64) {
-        budget.max_turns = (v as u32).max(MIN_MAX_TURNS);
+    if let Some(v) = budget_u64(obj, "max_turns")? {
+        budget.max_turns = v.clamp(MIN_MAX_TURNS as u64, MAX_MAX_TURNS) as u32;
     }
-    if let Some(v) = obj.get("max_tokens").and_then(value_as_u64) {
-        budget.max_tokens = v.max(MIN_MAX_TOKENS);
+    if let Some(v) = budget_u64(obj, "max_tokens")? {
+        budget.max_tokens = v.clamp(MIN_MAX_TOKENS, MAX_MAX_TOKENS);
     }
-    if let Some(v) = obj.get("timeout_secs").and_then(value_as_u64) {
+    if let Some(v) = budget_u64(obj, "timeout_secs")? {
         budget.timeout_secs = v.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
     }
+    if let Some(v) = budget_u64(obj, "max_continuations")? {
+        budget.max_continuations = v.min(MAX_MAX_CONTINUATIONS) as u32;
+    }
     Ok(budget)
+}
+
+fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(value) => anyhow::bail!("'{key}' must be a string, got {value}"),
+    }
+}
+
+fn budget_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value_as_u64(value)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("'budget.{key}' must be a non-negative integer")),
+    }
 }
 
 fn ok(value: &Value) -> Result<Value> {
@@ -489,6 +499,7 @@ mod tests {
         let spawn = &tools[0];
         assert_eq!(spawn.input_schema["required"][0], "brief");
         assert!(spawn.description.contains("inbox"), "the being must be told where the result goes");
+        assert_eq!(spawn.input_schema["properties"]["budget"]["properties"]["max_continuations"]["minimum"], 0);
         let control = &tools[3];
         let actions = control.input_schema["properties"]["action"]["enum"]
             .as_array()
@@ -672,6 +683,9 @@ mod tests {
         // Unspecified fields keep the configured default.
         assert_eq!(b.max_continuations, 3);
 
+        let continuation = parse_budget(default, Some(&json!({"max_continuations": 0}))).unwrap();
+        assert_eq!(continuation.max_continuations, 0);
+
         let clamped = parse_budget(
             default,
             Some(&json!({"max_turns": 0, "max_tokens": 1, "timeout_secs": 999_999})),
@@ -685,6 +699,12 @@ mod tests {
         let coerced = parse_budget(default, Some(&json!({"timeout_secs": "300"}))).unwrap();
         assert_eq!(coerced.timeout_secs, 300);
 
+        let huge = parse_budget(default, Some(&json!({"max_turns": u64::MAX}))).unwrap();
+        assert_eq!(huge.max_turns, u32::MAX);
+        let huge_tokens = parse_budget(default, Some(&json!({"max_tokens": u64::MAX}))).unwrap();
+        assert_eq!(huge_tokens.max_tokens, MAX_MAX_TOKENS);
+        assert!(parse_budget(default, Some(&json!({"max_turns": "many"}))).is_err());
+
         assert!(parse_budget(default, Some(&json!("nope"))).is_err());
     }
 
@@ -695,6 +715,9 @@ mod tests {
         let resp = handle(&m, "portal_subagent_spawn", json!({})).await.unwrap();
         assert_eq!(resp["isError"], true);
         assert!(text_of(&resp).contains("Missing 'brief'"), "{resp}");
+        let resp = handle(&m, "portal_subagent_spawn", json!({"brief": 42})).await.unwrap();
+        assert_eq!(resp["isError"], true);
+        assert!(text_of(&resp).contains("'brief' must be a string"), "{resp}");
         let _ = std::fs::remove_dir_all(ws);
     }
 
@@ -734,6 +757,7 @@ mod tests {
         let parsed: Value = serde_json::from_str(&text_of(&resp)).unwrap();
         assert_eq!(parsed["available"], true);
         assert_eq!(parsed["daemon"]["running"], false);
+        assert!(parsed["runtime"].is_object());
         let _ = std::fs::remove_dir_all(ws);
     }
 

@@ -471,6 +471,26 @@ pub async fn read(config: &PortalConfig, arguments: Value) -> Result<Value> {
     }))
 }
 
+pub async fn copy(config: &PortalConfig, arguments: Value) -> Result<Value> {
+    use tokio::io::AsyncWriteExt;
+    let source = arguments.get("path").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("Missing source path"))?;
+    let source = resolve_existing_path(config, source)?;
+    let destination = arguments.get("destination").and_then(Value::as_str).map(str::to_owned)
+        .unwrap_or_else(|| format!("inputs/{}", source.file_name().unwrap_or_default().to_string_lossy()));
+    // The source capability must never authorize the copy destination.
+    let mut target_config = config.clone();
+    target_config.security.approved_file = None;
+    target_config.security.permission_mode = crate::config::PermissionMode::Supervised;
+    let target = resolve_write_path(&target_config, &destination)?;
+    authorize_write(&target_config, &target)?;
+    let bytes = bounded_bytes(config, &source, 128 * 1024 * 1024).await?;
+    tokio::fs::create_dir_all(target.parent().unwrap()).await?;
+    let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&target).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+    Ok(write_result(&target, &bytes, "Input file staged in workspace".into()))
+}
+
 pub async fn write(config: &PortalConfig, arguments: Value) -> Result<Value> {
     let path_str = arguments
         .get("path")

@@ -13,8 +13,11 @@ commands run on the host without a desktop approval service. Tool enable flags,
 an explicitly configured exec allowlist, and OS permissions still apply.
 
 Town-Client passes `--permission-mode` on every launch, overriding the config's
-mode with the user's saved `read-only`, `supervised`, `auto-review`, or
-`full-access` policy. Client registration via `HEART_PORTAL_CLIENT_FILE` provides
+mode with the user's saved `supervised` (Ask every time, the client default) or
+`full-access` (Always allow) policy. The client migrates old `auto-review` and
+read-only settings to `supervised`; the engine accepts `auto-review` only as a
+compatibility alias for `supervised`. Commands and file modifications each need
+consent in this mode, with no automatic reviewer or remembered per-operation grants. Client registration via `HEART_PORTAL_CLIENT_FILE` provides
 scene commands and tool approvals. Absence of a client handler does not bypass
 an explicitly selected restricted mode.
 

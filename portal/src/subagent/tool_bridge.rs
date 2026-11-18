@@ -7,7 +7,7 @@ use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::
 use crate::{config::PortalConfig, tools::{ToolHost, client::ClientHandler}};
 use subtle::ConstantTimeEq;
 
-const ALLOWED: &[&str] = &["portal_exec", "portal_process", "portal_file_read", "portal_file_write", "portal_file_edit", "portal_file_list", "portal_search", "portal_web_fetch"];
+const ALLOWED: &[&str] = &["portal_exec", "portal_process", "portal_file_read", "portal_file_copy", "portal_file_write", "portal_file_edit", "portal_file_list", "portal_search", "portal_web_fetch", "portal_screenshot"];
 pub struct ToolBridge { pub port: u16, pub token: String, pub extension: PathBuf, task: JoinHandle<()>, host: ToolHost }
 impl ToolBridge {
     pub fn start(mut config: PortalConfig, handler: Arc<dyn ClientHandler>, scene: Option<String>, directory: PathBuf)
@@ -98,12 +98,15 @@ mod tests {
         config.prepare_workspace().unwrap();
         config.security.permission_mode = PermissionMode::Supervised;
         let bridge = ToolBridge::start(config.clone(), Arc::new(NoClientHandler), Some("child-task".into()), root.join("bridge")).await.unwrap();
+        let extension_source = std::fs::read_to_string(&bridge.extension).unwrap();
+        assert!(extension_source.contains("portal_screenshot"), "restricted child should receive the built-in screenshot tool");
         let args = json!({"path":"notes.txt", "content":"child"});
         assert!(request(&bridge,"forged","portal_file_write", args.clone()).await.is_none());
         assert!(!config.security.workspace_root.join("notes.txt").exists());
         let result = request(&bridge,&bridge.token,"portal_file_write", args.clone()).await.unwrap();
-        assert_ne!(result["isError"], true);
-        assert_eq!(std::fs::read_to_string(config.security.workspace_root.join("notes.txt")).unwrap(),"child");
+        assert_eq!(result["isError"], true);
+        assert!(!config.security.workspace_root.join("notes.txt").exists());
+        std::fs::write(config.security.workspace_root.join("notes.txt"), "child").unwrap();
         let result = request(&bridge,&bridge.token,"portal_exec",json!({"command":"echo forbidden", "sandbox_permissions":"require_escalated", "justification":"test host operation", "approved":true})).await.unwrap();
         assert_eq!(result["isError"],true);
         assert!(request(&bridge,&bridge.token,"portal_subagent_spawn",json!({})).await.is_none());

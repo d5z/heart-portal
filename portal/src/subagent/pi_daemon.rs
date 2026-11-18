@@ -409,7 +409,7 @@ impl PiDaemon {
         }
 
         cmd.env_clear();
-        cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key)));
+        cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key))?);
         // Inject api_key from portal.toml into daemon env — the provider
         // determines the env var name. This is the ONLY place where config-level
         // auth reaches daemon-spawned sessions.
@@ -663,7 +663,7 @@ impl PiDaemon {
         cmd.arg(&task.prompt);
 
         cmd.env_clear();
-        cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key)));
+        cmd.envs(child_environment(&self.config.env_passthrough, |key| std::env::var_os(key))?);
         if let Some(bridge) = bridge {
             cmd.env("PORTAL_TOOL_PORT", bridge.port.to_string()).env("PORTAL_TOOL_TOKEN", &bridge.token);
         }
@@ -696,12 +696,16 @@ impl PiDaemon {
         );
 
         let (max_turns, max_tokens) = (task.max_turns, task.max_tokens);
+        let activity_file = task.activity_file.clone();
         let (budget_tx, budget_rx) = tokio::sync::oneshot::channel();
         let stdout_reader = tokio::spawn(async move {
             let mut result = StdioResult::default();
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 result.fold_line(&line);
+                if let Some(file) = task.activity_file.as_ref() {
+                    if let Ok(event) = serde_json::from_str(&line) { super::activity::record(file, &event); }
+                }
                 if let Some(tx) = task.transcript.as_ref() {
                     if let Some(rendered) = render_stdio_line(&line) { let _ = tx.send(rendered); }
                 }
@@ -755,6 +759,20 @@ impl PiDaemon {
 
         let budget_exhausted = budget_exhausted || (max_turns > 0 && result.turns >= max_turns)
             || (max_tokens > 0 && result.usage.total >= max_tokens);
+        if let Some(file) = activity_file {
+            super::activity::append(&file, serde_json::json!({
+                "kind": "usage",
+                "input": result.usage.input,
+                "output": result.usage.output,
+                "cache_read": result.usage.cache_read,
+                "cache_write": result.usage.cache_write,
+                "total": result.usage.total,
+                "cost_usd": result.usage.cost_usd,
+                "turns": result.turns,
+                "stop_reason": result.stop_reason.clone(),
+                "budget_exhausted": budget_exhausted,
+            }));
+        }
         Ok(StdioRun {
             result,
             exit_code,
@@ -830,6 +848,15 @@ pub fn bundled_pi_binary(root: &Path) -> PathBuf {
 /// Resolve npm's JS entry point through Node instead of executing a Unix shim
 /// or passing a potentially long prompt through cmd.exe.
 fn pi_command(program: &Path) -> Option<Vec<String>> {
+    // The pinned npm CLI must use the release-owned Node, even if an older
+    // installation has a shebang pointing at a host Node that was removed.
+    if let Ok(Some(runtime)) = crate::task_environment::bundled_runtime() {
+        let cli = program.canonicalize().ok()?;
+        if cli.extension().is_some_and(|ext| ext == "js" || ext == "mjs") {
+            return Some(vec![runtime.root.join(runtime.node.path).display().to_string(), cli.display().to_string()]);
+        }
+    }
+
     #[cfg(windows)]
     {
         let cli = if program.extension().is_some_and(|ext| ext == "js") {
@@ -924,7 +951,11 @@ pub async fn auto_provision_pi(force: bool) -> Provision {
     let Some(root) = bundled_pi_root() else {
         return Provision::Failed("no home directory to install pi under".to_string());
     };
-    let npm = find_on_path(if cfg!(windows) { "npm.cmd" } else { "npm" });
+    let npm = match crate::task_environment::bundled_runtime() {
+        Ok(Some(runtime)) => Some(runtime.root.join(if cfg!(windows) { "node/bin/node_modules/npm/bin/npm-cli.js" } else { "node/lib/node_modules/npm/bin/npm-cli.js" })),
+        Ok(None) => find_on_path(if cfg!(windows) { "npm.cmd" } else { "npm" }),
+        Err(error) => return Provision::Failed(error.to_string()),
+    };
     provision_pi_into(&root, npm.as_deref(), force).await
 }
 
@@ -1004,7 +1035,17 @@ pub async fn provision_pi_into(root: &Path, npm: Option<&Path>, force: bool) -> 
 /// [`NPM_INSTALL_TIMEOUT`]. `Err` carries a one-line reason.
 async fn run_npm_install(npm: &Path, root: &Path) -> std::result::Result<(), String> {
     let spec = format!("{PI_NPM_PACKAGE}@{PI_PINNED_VERSION}");
-    let mut command = TokioCommand::new(npm);
+    let mut command = if npm.extension().is_some_and(|ext| ext == "js") {
+        let runtime = crate::task_environment::bundled_runtime().map_err(|e| e.to_string())?
+            .ok_or_else(|| "Bundled Node runtime is missing".to_string())?;
+        let node = runtime.root.join(runtime.node.path);
+        let mut command = TokioCommand::new(&node);
+        command.arg(npm);
+        let mut paths = vec![node.parent().unwrap().to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&path)); }
+        command.env("PATH", std::env::join_paths(paths).map_err(|e| e.to_string())?);
+        command
+    } else { TokioCommand::new(npm) };
     command.arg("install")
         .arg("--prefix")
         .arg(root)
@@ -1084,7 +1125,7 @@ fn unix_now_secs() -> u64 {
 fn child_environment(
     configured: &[String],
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Vec<(String, std::ffi::OsString)> {
+) -> anyhow::Result<Vec<(String, std::ffi::OsString)>> {
     #[cfg(windows)]
     const SYSTEM_KEYS: &[&str] = &[
         "SystemRoot", "SystemDrive", "ProgramFiles", "ProgramFiles(x86)",
@@ -1092,9 +1133,31 @@ fn child_environment(
     ];
     #[cfg(not(windows))]
     const SYSTEM_KEYS: &[&str] = &[];
-    configured.iter().map(String::as_str).chain(SYSTEM_KEYS.iter().copied())
+    let mut environment: Vec<(String, std::ffi::OsString)> = configured.iter().map(String::as_str).chain(SYSTEM_KEYS.iter().copied())
         .filter_map(|key| lookup(key).map(|value| (key.to_string(), value)))
-        .collect()
+        .collect();
+
+    // Subagent tools and direct shell commands must resolve the same release-owned
+    // interpreters as portal_exec. Do this after the configured passthrough so a
+    // user's PATH remains available for ordinary tools, while Python/Node win
+    // lookup precedence. In managed packages a missing or invalid runtime is an
+    // installation error; never silently fall back to a host interpreter.
+    if let Some(runtime) = crate::task_environment::bundled_runtime()? {
+        let mut paths = vec![
+            runtime.root.join(&runtime.python.path).parent().unwrap().to_owned(),
+            runtime.root.join(&runtime.node.path).parent().unwrap().to_owned(),
+        ];
+        if let Some(existing) = environment.iter().find_map(|(key, value)| (key == "PATH").then_some(value)) {
+            paths.extend(std::env::split_paths(existing));
+        }
+        let path = std::env::join_paths(paths)?;
+        if let Some((_, value)) = environment.iter_mut().find(|(key, _)| key == "PATH") {
+            *value = path;
+        } else {
+            environment.push(("PATH".to_string(), path));
+        }
+    }
+    Ok(environment)
 }
 
 /// One task to run as its own pi process ([`PiDaemon::run_stdio_task`]).
@@ -1117,6 +1180,7 @@ pub struct StdioTask {
     /// Rendered transcript lines, pushed as pi emits them. The run dropping
     /// the sender is the reader's signal that the task is over.
     pub transcript: Option<mpsc::UnboundedSender<String>>,
+    pub activity_file: Option<PathBuf>,
 }
 
 /// What one `pi --print --mode json` run produced.
@@ -1395,7 +1459,7 @@ mod tests {
             let run = daemon.run_stdio_task(StdioTask {
                 max_turns, max_tokens, prompt: "test".into(), workdir: root.clone(),
                 provider: None, model: None, thinking: None, api_key: None,
-                timeout: Duration::from_secs(15), transcript: None,
+                timeout: Duration::from_secs(15), transcript: None, activity_file: None,
             }).await.unwrap();
             assert!(run.budget_exhausted, "{run:?}");
             assert!(!run.timed_out);
@@ -1865,7 +1929,7 @@ JSON
                 api_key: Some("sk-or-test".to_string()),
                 thinking: None,
                 timeout: Duration::from_secs(30),
-                transcript: Some(tx),
+                transcript: Some(tx), activity_file: Some(root.join("task-activity.jsonl")),
             })
             .await
             .unwrap();
@@ -1879,6 +1943,9 @@ JSON
         );
         assert_eq!(run.result.turns, 1);
         assert_eq!(run.result.usage.total, 18);
+        let activity = std::fs::read_to_string(root.join("task-activity.jsonl")).unwrap();
+        assert!(activity.contains("\"kind\":\"usage\""), "{activity}");
+        assert!(activity.contains("\"total\":18"), "{activity}");
 
         let argv = argv_log(&root);
         assert!(argv.contains("--print --mode json"), "{argv}");
@@ -1926,7 +1993,7 @@ JSON
                 api_key: None,
                 thinking: None,
                 timeout: Duration::from_millis(300),
-                transcript: None,
+                transcript: None, activity_file: None,
             })
             .await
             .unwrap();
@@ -1967,7 +2034,7 @@ JSON
                 api_key: None,
                 thinking: None,
                 timeout: Duration::from_secs(10),
-                transcript: None,
+                transcript: None, activity_file: None,
             })
             .await
             .unwrap();
@@ -2010,7 +2077,7 @@ mod windows_env_tests {
             vec![],
         ] {
             let child: HashMap<_, _> = child_environment(&configured, |key| machine.get(key).cloned())
-                .into_iter().collect();
+                .unwrap().into_iter().collect();
             for key in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"] {
                 assert_eq!(child.get(key), machine.get(key), "lost machine path {key}");
             }
@@ -2026,7 +2093,7 @@ mod windows_env_tests {
         let root = std::env::var_os("SystemRoot").unwrap();
         let mut cmd = std::process::Command::new(PathBuf::from(root).join("System32").join("cmd.exe"));
         let output = cmd.env_clear()
-            .envs(child_environment(&[], |key| std::env::var_os(key)))
+            .envs(child_environment(&[], |key| std::env::var_os(key)).unwrap())
             .args(["/d", "/c", "if defined SystemRoot (echo WINDOWS_RUNTIME_OK) else (exit /b 1)"])
             .output().unwrap();
         assert!(output.status.success());
