@@ -22,6 +22,7 @@ pub(crate) enum ConnectionState {
     Retrying,
     Invalid,
     Listening,
+    Rejected,
 }
 
 impl ConnectionState {
@@ -32,6 +33,7 @@ impl ConnectionState {
             x if x == Self::Retrying as u8 => "retrying",
             x if x == Self::Invalid as u8 => "invalid",
             x if x == Self::Listening as u8 => "listening",
+            x if x == Self::Rejected as u8 => "handshake_rejected",
             _ => "starting",
         }
     }

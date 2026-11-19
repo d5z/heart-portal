@@ -18,11 +18,12 @@ function Show-ConnectionStatus([string]$State, $Launch) {
         'connecting' { '正在连接 Being' }
         'connected' { '已连接 Being' }
         'retrying' { 'Being 未连接，等待自动重试' }
+        'handshake_rejected' { 'Relay 拒绝了 Portal 握手，等待自动重试' }
         'invalid' { 'Being 链接无效，请检查完整链接和 token' }
         'stopped' { 'Portal 未运行' }
         default { '等待当前进程的连接状态' }
     }
-    $color = if ($State -eq 'connected') { 'Green' } elseif ($State -in @('local','retrying','invalid')) { 'Yellow' } else { 'Cyan' }
+    $color = if ($State -eq 'connected') { 'Green' } elseif ($State -in @('local','retrying','handshake_rejected','invalid')) { 'Yellow' } else { 'Cyan' }
     if (-not [Console]::IsOutputRedirected) {
         try { [Console]::Title = "Heart Portal | $label" } catch { }
     }
@@ -37,7 +38,7 @@ function Show-ConnectionStatus([string]$State, $Launch) {
         Write-Output '--connect 接收完整链接，不能只填写 token；以上命令保留当前配置和 Portal 名称。'
     } elseif ($State -eq 'connected') {
         Write-Output '连接握手成功，Being 现在可以通过此 Portal 调用本机工具。'
-    } elseif ($State -eq 'retrying') {
+    } elseif ($State -in @('retrying', 'handshake_rejected')) {
         Write-Output '连接失败或已断开，Portal 会自动重试；具体原因见上方运行日志。'
     }
     Write-Host '============================================================' -ForegroundColor $color

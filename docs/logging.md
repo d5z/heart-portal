@@ -4,6 +4,15 @@ Portal defaults to `info`. Set `RUST_LOG=heart_portal=debug` temporarily for
 troubleshooting; protocol bodies are not needed for normal diagnostics. ANSI
 colors are disabled for redirected output, or when `NO_COLOR` is present.
 
+Relay connection logs include engine version and PID at startup, an attempt
+number on each session, completed TCP/WebSocket stages, failed-session elapsed
+time, and the actual retry delay including jitter. A rejected application
+handshake records only `code`, `message`, or `error` text (including an error
+object's `code`/`message`), redacted before truncation to 512 characters. The
+current credential, credential assignments and URLs are removed; raw handshake
+and response objects are never logged. Missing reasons appear as
+`reason_not_provided` and require relay-side logs to explain the rejection.
+
 Kit scans still run every five seconds. Unchanged validation/conflict warnings
 are suppressed across successful scans. A changed or recurring problem is
 reported again, and resolved problems generate an INFO event. Repeated failures

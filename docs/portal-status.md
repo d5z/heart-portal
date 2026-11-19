@@ -65,12 +65,18 @@ on disk or a newly edited config does not change its startup snapshot. Comparing
 identifies binary content, not source provenance or authenticity. Signing or
 repackaging an executable can also change its digest.
 
-`connection.state` is `starting`, `connecting`, `connected`, `retrying`, `invalid`
+`connection.state` is `starting`, `connecting`, `connected`, `retrying`, `handshake_rejected`, `invalid`
 or `listening`. `connected` means a relay handshake succeeded; `listening` means
 the local MCP TCP listener was bound. An offline Being cannot query a disconnected
 Portal through that connection; use the host's local `heart-portal status` command
 on Windows/macOS, or the configured service manager on Linux, for supervisor
 diagnostics in that situation.
+
+`handshake_rejected` means the WebSocket connected but the relay returned
+`ok: false` to the Portal handshake. It does not by itself prove an expired
+credential. The engine still retries with backoff so server-side recovery can
+restore the connection. The runtime log includes a bounded, redacted reason
+when the server provides one; no raw handshake or response is recorded.
 
 `config.snapshot` is `loaded-at-startup`: Portal does not reread `portal.toml`
 during a query. `config.reload_requires_restart` applies to Portal configuration.

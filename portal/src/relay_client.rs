@@ -13,7 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 use tokio::time::MissedTickBehavior;
 
 use crate::tools::ToolHost;
@@ -30,6 +30,40 @@ struct HandshakeResponse {
     ok: bool,
     #[serde(default)]
     relay_keepalive: Option<String>,
+    #[serde(default)]
+    error: serde_json::Value,
+    #[serde(default)]
+    code: serde_json::Value,
+    #[serde(default)]
+    message: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct HandshakeRejected(String);
+
+impl std::fmt::Display for HandshakeRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "relay rejected handshake: {}", self.0)
+    }
+}
+impl std::error::Error for HandshakeRejected {}
+
+impl HandshakeResponse {
+    fn rejection(&self, token: &str) -> HandshakeRejected {
+        // Select diagnostic fields only; never serialize the response or echoed handshake.
+        let fields = [&self.code, &self.message, &self.error,
+            &self.error["code"], &self.error["message"]];
+        let detail = fields.into_iter().filter_map(|value| value.as_str())
+            .collect::<Vec<_>>().join("; ");
+        let detail = if token.is_empty() { detail } else { detail.replace(token, "[redacted]") };
+        // Redact before truncation, including quoted credential values containing spaces.
+        let credentials = regex::Regex::new(r#"(?i)(?:[\w-]*(?:token|secret|password|api[_-]?key)|authorization)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:bearer\s+)?[^\s,;&}]+)"#).unwrap();
+        let detail = credentials.replace_all(&detail, "[credential redacted]");
+        let urls = regex::Regex::new(r#"(?i)(?:https?|wss?)://[^\s"'<>]+"#).unwrap();
+        let detail = urls.replace_all(&detail, "[url redacted]");
+        let detail: String = detail.chars().map(|c| if c.is_control() { ' ' } else { c }).take(512).collect();
+        HandshakeRejected(if detail.trim().is_empty() { "reason_not_provided".into() } else { detail })
+    }
 }
 
 /// Build relay handshake JSON (`portal_name` identifies this Portal instance; D-077).
@@ -113,21 +147,27 @@ pub async fn connect_and_serve(
     };
     let relay_url = derive_relay_url(loom_link, &host);
     info!(
+        pid = std::process::id(), version = crate::protocol::PORTAL_VERSION,
         "Portal connect mode: relay {} (being_id={}, portal_name={}, host={})",
         relay_url, being_id, portal_name, host
     );
 
     let mut backoff = Duration::from_secs(BACKOFF_MIN_SECS);
+    let mut attempt: u64 = 0;
     loop {
+        attempt += 1;
         tool_host.set_connection_state(crate::tools::status::ConnectionState::Connecting);
         crate::connection_status::publish("connecting");
         let session_start = Instant::now();
-        match run_one_session(&relay_url, &being_id, &token, tool_host, portal_name).await {
+        let mut rejected = false;
+        match run_one_session(&relay_url, &being_id, &token, tool_host, portal_name)
+            .instrument(tracing::info_span!("relay_session", attempt, pid = std::process::id())).await {
             Ok(()) => {
                 backoff = Duration::from_secs(BACKOFF_MIN_SECS);
                 info!("relay session ended cleanly; reconnecting in {:?}", backoff);
             }
             Err(e) => {
+                rejected = e.is::<HandshakeRejected>();
                 // Ratchet fix: `run_one_session` almost always ends in Err
                 // (heartbeat timeout = bail!), so resetting only on Ok left
                 // long-lived Portals stuck at the max backoff forever. A
@@ -141,6 +181,7 @@ pub async fn connect_and_serve(
                     );
                 } else {
                     warn!(
+                        attempt, pid = std::process::id(), elapsed_ms = session_start.elapsed().as_millis() as u64,
                         "relay session error after {}s: {e:#}; retry in {:?}",
                         session_start.elapsed().as_secs(),
                         backoff
@@ -148,10 +189,12 @@ pub async fn connect_and_serve(
                 }
             }
         }
-        tool_host.set_connection_state(crate::tools::status::ConnectionState::Retrying);
-        crate::connection_status::publish("retrying");
-        tokio::time::sleep(Duration::from_millis(backoff_sleep_ms(backoff, jitter_ratio())))
-            .await;
+        tool_host.set_connection_state(if rejected { crate::tools::status::ConnectionState::Rejected }
+            else { crate::tools::status::ConnectionState::Retrying });
+        crate::connection_status::publish(if rejected { "handshake_rejected" } else { "retrying" });
+        let retry_ms = backoff_sleep_ms(backoff, jitter_ratio());
+        info!(attempt, pid = std::process::id(), retry_ms, handshake_rejected = rejected, "relay retry scheduled");
+        tokio::time::sleep(Duration::from_millis(retry_ms)).await;
         backoff = next_backoff(backoff);
     }
 }
@@ -220,6 +263,7 @@ async fn run_one_session(
             .await
             .with_context(|| format!("TCP connect to relay {addr} timed out (15s)"))?
             .with_context(|| format!("TCP connect to relay {addr}"))?;
+        info!(stage = "tcp_connected", "relay transport ready");
         // TCP keepalive: 15s idle + 5s probe interval (survives NAT/firewall idle timeouts)
         let sock_ref = socket2::SockRef::from(&tcp);
         let keepalive = socket2::TcpKeepalive::new()
@@ -239,6 +283,7 @@ async fn run_one_session(
             .await
             .with_context(|| format!("TLS/WS handshake to relay {relay_url} timed out (15s)"))?
             .with_context(|| format!("WebSocket connect to relay {relay_url}"))?;
+        info!(stage = "websocket_connected", "relay transport ready");
         ws
     };
 
@@ -258,8 +303,7 @@ async fn run_one_session(
     let handshake_resp: HandshakeResponse =
         serde_json::from_str(resp.as_str()).context("relay handshake JSON")?;
     if !handshake_resp.ok {
-        // A server response can echo the authentication token.
-        anyhow::bail!("relay rejected handshake");
+        return Err(handshake_resp.rejection(token).into());
     }
     let supports_text_keepalive =
         handshake_resp.relay_keepalive.as_deref() == Some("text-v1");
@@ -290,24 +334,25 @@ async fn run_one_session(
                     }
                     let mut data = t.as_bytes().to_vec();
                     data.push(b'\n');
-                    if tokio::io::AsyncWriteExt::write_all(&mut bridge_write, &data).await.is_err() {
-                        break;
-                    }
+                    tokio::io::AsyncWriteExt::write_all(&mut bridge_write, &data).await
+                        .context("relay inbound MCP bridge write")?;
                 }
                 Ok(Message::Ping(payload)) => {
                     // tokio-tungstenite may auto-reply when using unsplit stream; we split,
                     // so reply explicitly (D-077).
                     let mut w = ws_write_inbound.lock().await;
-                    if w.send(Message::Pong(payload)).await.is_err() {
-                        break;
-                    }
+                    w.send(Message::Pong(payload)).await.context("relay pong send")?;
                 }
                 Ok(Message::Pong(_)) => {}
-                Ok(Message::Close(_)) => break,
+                Ok(Message::Close(frame)) => {
+                    // Close reasons are arbitrary server text; retain only the protocol code.
+                    anyhow::bail!("relay WebSocket closed (code={})", frame.map(|f| u16::from(f.code)).unwrap_or(1005));
+                }
                 Ok(_) => {}
-                Err(_) => break,
+                Err(error) => return Err(anyhow::Error::new(error).context("relay WebSocket receive")),
             }
         }
+        anyhow::bail!("relay WebSocket reached EOF")
     };
 
     let ws_write_out = std::sync::Arc::clone(&ws_write);
@@ -316,16 +361,16 @@ async fn run_one_session(
         loop {
             line.clear();
             match crate::mcp::limits::read_line(&mut bridge_reader, &mut line, 16 * 1024 * 1024).await {
-                Ok(0) => break,
+                Ok(0) => anyhow::bail!("relay outbound MCP bridge reached EOF"),
                 Ok(_) => {
-                    let Ok(text) = std::str::from_utf8(&line) else { break; };
+                    let text = std::str::from_utf8(&line).context("relay outbound MCP bridge UTF-8")?;
                     let trimmed = text.trim();
-                    if !trimmed.is_empty()
-                        && ws_write_out.lock().await.send(Message::Text(trimmed.to_string())).await.is_err() {
-                            break;
-                        }
+                    if !trimmed.is_empty() {
+                        ws_write_out.lock().await.send(Message::Text(trimmed.to_string())).await
+                            .context("relay WebSocket send")?;
+                    }
                 }
-                Err(_) => break,
+                Err(error) => return Err(error.context("relay outbound MCP bridge read")),
             }
         }
     };
@@ -369,14 +414,72 @@ async fn run_one_session(
     tokio::select! {
         result = crate::handle_connection(portal_stream, tool_host, portal_name, None) => result,
         result = heartbeat => result,
-        _ = ws_to_bridge => anyhow::bail!("relay receive bridge closed"),
-        _ = bridge_to_ws => anyhow::bail!("relay send bridge closed"),
+        result = ws_to_bridge => result,
+        result = bridge_to_ws => result,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_reason_is_bounded_and_does_not_echo_credentials() {
+        let response: HandshakeResponse = serde_json::from_value(serde_json::json!({
+            "ok": false, "code": "invalid_token",
+            "error": { "message": "Denied supplied-value\nAuthorization: Bearer another-secret; password='has spaces'; https://host/?token=url-secret" },
+            "loom_token": "echoed-secret", "request": { "token": "nested-secret" }
+        })).unwrap();
+        let reason = response.rejection("supplied-value").to_string();
+        assert!(reason.contains("invalid_token"));
+        for secret in ["supplied-value", "another-secret", "has spaces", "url-secret", "echoed-secret", "nested-secret", "\n"] {
+            assert!(!reason.contains(secret), "leaked {secret}: {reason}");
+        }
+        let missing: HandshakeResponse = serde_json::from_str(r#"{"ok":false}"#).unwrap();
+        assert!(missing.rejection("secret").to_string().contains("reason_not_provided"));
+        let long: HandshakeResponse = serde_json::from_value(serde_json::json!({
+            "ok": false, "error": "拒绝".repeat(1000)
+        })).unwrap();
+        assert_eq!(long.rejection("secret").0.chars().count(), 512);
+    }
+
+    #[tokio::test]
+    async fn websocket_rejection_is_typed_and_a_later_session_can_recover() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/_relay", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for ok in [false, true] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let hello = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+                assert_eq!(hello["loom_token"], "fixture-secret");
+                ws.send(Message::Text(serde_json::json!({
+                    "ok": ok, "error": "invalid credential fixture-secret"
+                }).to_string())).await.unwrap();
+                if ok { tokio::time::sleep(Duration::from_millis(50)).await; }
+                ws.close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "fixture-secret".into(),
+                })).await.unwrap();
+            }
+        });
+        let root = crate::kits::tests::TestKits::new();
+        let mut config = crate::config::PortalConfig::default();
+        config.security.workspace_root = root.0.clone();
+        config.kits_enabled = false;
+        config.subagent.enabled = false;
+        let host = ToolHost::new(&config);
+        let error = run_one_session(&url, "fixture", "fixture-secret", &host, "test").await.unwrap_err();
+        assert!(error.is::<HandshakeRejected>());
+        assert!(error.to_string().contains("invalid credential"));
+        assert!(!error.to_string().contains("fixture-secret"));
+        let closed = run_one_session(&url, "fixture", "fixture-secret", &host, "test").await.unwrap_err();
+        assert!(!closed.is::<HandshakeRejected>());
+        assert!(closed.to_string().contains("code=1008"), "{closed:#}");
+        assert!(!closed.to_string().contains("fixture-secret"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn parse_standard_loom_link() {
