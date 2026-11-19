@@ -35,7 +35,7 @@ pub fn shell_command(config: &PortalConfig, source: &str, workdir: &str, shell: 
         anyhow::ensure!(encoded.len() < 28000, "Sandbox command is too large; use a workspace script");
         let mut command = Command::new(std::env::current_exe()?);
         command.args(["sandbox-run", &encoded]).env_clear();
-        for key in ["HEART_PORTAL_CLIENT_MANAGED", "SystemRoot", "WINDIR", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"] {
+        for key in ["HEART_PORTAL_CLIENT_MANAGED", "HEART_PORTAL_RUNTIME_DIR", "SystemRoot", "WINDIR", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(key) { command.env(key, value); }
         }
         command.creation_flags(0x08000000);
