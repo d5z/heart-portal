@@ -12,13 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time;
 use tracing::{debug, warn};
 
 const DEFAULT_MAX_SESSIONS: usize = 10;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const EXIT_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// Long-poll cap: prevents MCP clients from holding connections indefinitely.
@@ -43,7 +44,11 @@ pub struct ManagedProcess {
     pub pid: u32,
     pub command: String,
     pub started_at: tokio::time::Instant,
-    pub stdin: Option<ChildStdin>,
+    /// Separate from the session map so a blocked stdin write cannot prevent
+    /// polling or termination of the same process.
+    pub stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
+    /// Owns the whole process range (POSIX process group / Windows Job).
+    pub(crate) owner: Arc<crate::mcp::ProcessOwner>,
     pub output: Arc<AsyncMutex<OutputBuffer>>,
     pub status: Arc<AsyncMutex<ProcessStatus>>,
     pub output_encoding: OutputEncoding,
@@ -352,11 +357,12 @@ impl ProcessManager {
         }
 
         let (mut child, process_owner) = crate::mcp::ProcessOwner::spawn_exec(&mut cmd)?;
+        let process_owner = Arc::new(process_owner);
         let pid = child.id().unwrap_or_else(|| {
             tracing::warn!("Failed to get child process ID");
             0
         });
-        let stdin = child.stdin.take();
+        let stdin = Arc::new(AsyncMutex::new(child.stdin.take()));
         let stdout = child
             .stdout
             .take()
@@ -386,7 +392,8 @@ impl ProcessManager {
             pid,
             command: command.to_string(),
             started_at,
-            stdin,
+            stdin: Arc::clone(&stdin),
+            owner: Arc::clone(&process_owner),
             output: Arc::clone(&output),
             status: Arc::clone(&status),
             output_encoding,
@@ -405,12 +412,16 @@ impl ProcessManager {
         let cmd_wait = command.to_string();
         let workdir_wait = workdir.to_string();
         let output_wait = Arc::clone(&output);
+        let stdin_wait = Arc::clone(&stdin);
         let callback = self.callback.clone();
         let killed_wait = Arc::clone(&killed);
         let callback_output_encoding = output_encoding;
         tokio::spawn(async move {
             #[cfg(unix)]
-            { let _ = process_owner.wait_unreaped().await; process_owner.terminate(); }
+            {
+                let _ = process_owner.wait_unreaped().await;
+                process_owner.terminate();
+            }
             let wait_status = child.wait().await.ok();
             #[cfg(windows)]
             process_owner.terminate();
@@ -436,6 +447,10 @@ impl ProcessManager {
                     "session {sid_wait}: output drain timed out; descendants may still hold pipes"
                 );
             }
+            // Release the write end once the child and its output have
+            // settled. A concurrent writer gets an ordinary broken-pipe error
+            // instead of keeping the session alive through a stale handle.
+            stdin_wait.lock().await.take();
             let mut st = st_b.lock().await;
             *st = ProcessStatus::Exited(code);
             drop(st);
@@ -605,20 +620,20 @@ impl ProcessManager {
     pub async fn write_stdin(&self, session_id: &str, data: &[u8]) -> Result<()> {
         validate_session_id(session_id)?;
         if data.len() > MAX_STDIN_WRITE_BYTES {
-            anyhow::bail!(
-                "stdin write exceeds max {} bytes",
-                MAX_STDIN_WRITE_BYTES
-            );
+            anyhow::bail!("stdin write exceeds max {} bytes", MAX_STDIN_WRITE_BYTES);
         }
-        let mut guard = self.sessions.lock().await;
-        let s = guard
-            .get_mut(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
-        if s.exited_at.is_some() || matches!(*s.status.lock().await, ProcessStatus::Exited(_)) {
-            anyhow::bail!("Session has exited");
-        }
-        let stdin = s
-            .stdin
+        let stdin = {
+            let guard = self.sessions.lock().await;
+            let s = guard
+                .get(session_id)
+                .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?;
+            if s.exited_at.is_some() || matches!(*s.status.lock().await, ProcessStatus::Exited(_)) {
+                anyhow::bail!("Session has exited");
+            }
+            Arc::clone(&s.stdin)
+        };
+        let mut stdin = stdin.lock().await;
+        let stdin = stdin
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("stdin not available for this session"))?;
         stdin.write_all(data).await?;
@@ -630,7 +645,7 @@ impl ProcessManager {
         validate_session_id(session_id)?;
         #[cfg(windows)]
         let sandboxed;
-        let pid = {
+        let owner = {
             let guard = self.sessions.lock().await;
             let s = guard
                 .get(session_id)
@@ -645,63 +660,54 @@ impl ProcessManager {
             anyhow::ensure!(s.pid != 0, "Cannot kill a session without a process ID");
             #[cfg(windows)]
             { sandboxed = s.sandboxed; }
-            s.pid
+            Arc::clone(&s.owner)
         };
 
         #[cfg(unix)]
-        {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-            time::sleep(KILL_GRACE).await;
-            let still_running = {
-                let guard = self.sessions.lock().await;
-                if let Some(s) = guard.get(session_id) {
-                    s.exited_at.is_none()
-                        && matches!(*s.status.lock().await, ProcessStatus::Running)
-                } else {
-                    false
-                }
-            };
-            if still_running {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-        }
+        owner.signal(libc::SIGTERM);
         #[cfg(windows)]
         {
-            if sandboxed && crate::windows_sandbox::cancel(pid).await { return Ok(()); }
-            let _ = Command::new("taskkill")
-                .args(["/T", "/PID", &pid.to_string()])
-                .creation_flags(0x08000000)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
-            time::sleep(KILL_GRACE).await;
-            let still_running = {
-                let guard = self.sessions.lock().await;
-                if let Some(s) = guard.get(session_id) {
-                    s.exited_at.is_none()
-                        && matches!(*s.status.lock().await, ProcessStatus::Running)
-                } else {
-                    false
+            if sandboxed {
+                let pid = {
+                    let guard = self.sessions.lock().await;
+                    guard.get(session_id).map(|s| s.pid).unwrap_or(0)
+                };
+                if pid != 0 && crate::windows_sandbox::cancel(pid).await {
+                    return Ok(());
                 }
-            };
-            if still_running {
-                let _ = Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .creation_flags(0x08000000)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
+            }
+            owner.terminate();
+        }
+        #[cfg(unix)]
+        {
+            // Do not sleep for the full grace period when the range has
+            // already settled. This keeps cancellation responsive while
+            // retaining the staged TERM -> KILL fallback for stubborn trees.
+            let settled = time::timeout(KILL_GRACE, async {
+                loop {
+                    let running = {
+                        let guard = self.sessions.lock().await;
+                        if let Some(s) = guard.get(session_id) {
+                            s.exited_at.is_none()
+                                && matches!(*s.status.lock().await, ProcessStatus::Running)
+                        } else {
+                            false
+                        }
+                    };
+                    if !running {
+                        break;
+                    }
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !settled {
+                owner.terminate();
             }
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = pid;
             anyhow::bail!("kill is not supported on this platform");
         }
 
@@ -772,16 +778,18 @@ impl ProcessManager {
     pub async fn kill_all(&self) {
         let ids: Vec<String> = {
             let g = self.sessions.lock().await;
-            // Mark everything up front: `kill` below is sequential (5s grace each),
-            // and a session must not fire a callback while waiting its turn.
+            // Mark everything up front so no session can fire a callback while
+            // the concurrent termination pass is still collecting its range.
             for s in g.values() {
                 s.killed.store(true, Ordering::SeqCst);
             }
             g.keys().cloned().collect()
         };
-        for id in ids {
-            let _ = self.kill(&id).await;
-        }
+        futures_util::future::join_all(
+            ids.into_iter()
+                .map(|id| async move { self.kill(&id).await }),
+        )
+        .await;
     }
 }
 
@@ -1018,12 +1026,10 @@ mod tests {
         assert_eq!(body["result"]["portal_name"], "alice-laptop");
         assert_eq!(body["result"]["workdir"], ".");
         assert_eq!(body["result"]["truncated"], false);
-        assert!(
-            body["result"]["output"]
-                .as_str()
-                .unwrap()
-                .contains("portal_callback_test")
-        );
+        assert!(body["result"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("portal_callback_test"));
     }
 
     #[tokio::test]
@@ -1036,7 +1042,9 @@ mod tests {
 
         let mut config = PortalConfig::default();
         config.security.workspace_root = std::env::current_dir().unwrap();
-        pm.spawn(&config, "echo standalone", ".", &[]).await.unwrap();
+        pm.spawn(&config, "echo standalone", ".", &[])
+            .await
+            .unwrap();
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(2)).await, 0);
     }
@@ -1073,6 +1081,61 @@ mod tests {
         pm.kill_all().await;
 
         assert_eq!(wait_for_hits(&server, 1, Duration::from_secs(2)).await, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_terminates_the_owned_process_group_not_only_the_shell() {
+        use crate::config::PortalConfig;
+
+        let root =
+            std::env::temp_dir().join(format!("portal-process-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = root.clone();
+        let pm = ProcessManager::new(HeartCallback::new());
+        // Ignore TERM so the five-second escalation is required. The child
+        // would outlive the shell if kill() signalled only the leader PID.
+        let info = pm
+            .spawn(
+                &config,
+                "trap '' TERM; (sleep 6; echo leaked > child.txt) & wait",
+                ".",
+                &[],
+            )
+            .await
+            .unwrap();
+        time::sleep(Duration::from_millis(100)).await;
+        pm.kill(&info.session_id).await.unwrap();
+        time::sleep(Duration::from_secs(2)).await;
+        assert!(!root.join("child.txt").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_stdin_write_does_not_hold_the_session_lock() {
+        use crate::config::PortalConfig;
+
+        let root =
+            std::env::temp_dir().join(format!("portal-process-stdin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = PortalConfig::default();
+        config.security.workspace_root = root.clone();
+        let pm = Arc::new(ProcessManager::new(HeartCallback::new()));
+        let info = pm.spawn(&config, "sleep 30", ".", &[]).await.unwrap();
+        let writer = {
+            let pm = Arc::clone(&pm);
+            let session_id = info.session_id.clone();
+            tokio::spawn(async move { pm.write_stdin(&session_id, &vec![b'x'; 256 * 1024]).await })
+        };
+        time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(2), pm.kill(&info.session_id))
+            .await
+            .expect("kill must not wait for a blocked stdin write")
+            .unwrap();
+        let _ = writer.await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
