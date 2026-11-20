@@ -488,7 +488,7 @@ pub fn run(request: &Request) -> Result<u32> {
     let system = PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot unavailable")?);
     let exe = if request.powershell { system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe") } else { system.join(r"System32\cmd.exe") };
     let source = if request.powershell {
-        let script = format!("try {{ New-PSDrive -Name Workspace -PSProvider FileSystem -Root '{}' -ErrorAction Stop | Out-Null; Set-Location Workspace:\\ -ErrorAction Stop }} catch {{ Write-Error $_; exit 126 }};\n{}", cwd_native.replace('\'', "''"), request.source);
+        let script = format!("try {{ New-PSDrive -Name Workspace -PSProvider FileSystem -Root '{}' -ErrorAction Stop | Out-Null; Set-Location Workspace:\\ -ErrorAction Stop }} catch {{ [Console]::Error.WriteLine($_.ToString()); exit 126 }};\n{}", cwd_native.replace('\'', "''"), request.source);
         format!("\"{}\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}", exe.display(),
             crate::exec_policy::powershell_encoded_command(&script))
     } else { format!("\"{}\" /D /S /C \"{}\"", exe.display(), request.source) };
@@ -521,6 +521,9 @@ pub fn run(request: &Request) -> Result<u32> {
     environment.insert("SYSTEMROOT".into(), system.display().to_string());
     environment.insert("WINDIR".into(), system.display().to_string());
     environment.insert("COMSPEC".into(), system.join(r"System32\cmd.exe").display().to_string());
+    // The isolated environment has no host module search path. Resolve the
+    // built-in Windows PowerShell cmdlets from the shell we actually launch.
+    environment.insert("PSMODULEPATH".into(), system.join(r"System32\WindowsPowerShell\v1.0\Modules").display().to_string());
     let mut env = vec![];
     for (key, value) in environment {
         env.extend(wide(format!("{key}={value}")));
