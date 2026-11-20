@@ -106,6 +106,28 @@ impl ProcessOwner {
             }
         }
     }
+
+    /// Signal the whole owned range without closing ownership yet.
+    ///
+    /// The process manager uses this for the first, graceful termination
+    /// phase. The range remains owned so a later `terminate()` can escalate
+    /// to SIGKILL without falling back to a reused PID.
+    #[cfg(unix)]
+    pub fn signal(&self, signal: libc::c_int) {
+        if self.stopped.load(Ordering::Acquire) || self.exit_observed().is_err() {
+            return;
+        }
+        unsafe {
+            libc::kill(-self.group, signal);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn signal(&self, _signal: u32) {
+        // Windows Job Objects do not expose a graceful group signal here;
+        // terminate the owned tree as one operation.
+        self.terminate();
+    }
 }
 
 impl Drop for ProcessOwner {
