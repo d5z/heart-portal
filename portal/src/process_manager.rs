@@ -47,6 +47,8 @@ pub struct ManagedProcess {
     pub output: Arc<AsyncMutex<OutputBuffer>>,
     pub status: Arc<AsyncMutex<ProcessStatus>>,
     pub output_encoding: OutputEncoding,
+    #[cfg(windows)]
+    sandboxed: bool,
     /// Set before we signal the process; suppresses the exit callback so
     /// `portal_process kill` and Portal shutdown never wake the being.
     pub(crate) killed: Arc<AtomicBool>,
@@ -388,6 +390,8 @@ impl ProcessManager {
             output: Arc::clone(&output),
             status: Arc::clone(&status),
             output_encoding,
+            #[cfg(windows)]
+            sandboxed: config.security.permission_mode != crate::config::PermissionMode::FullAccess,
             killed: Arc::clone(&killed),
             notify: Arc::clone(&notify),
             exited_at: None,
@@ -624,6 +628,8 @@ impl ProcessManager {
 
     pub async fn kill(&self, session_id: &str) -> Result<()> {
         validate_session_id(session_id)?;
+        #[cfg(windows)]
+        let sandboxed;
         let pid = {
             let guard = self.sessions.lock().await;
             let s = guard
@@ -637,6 +643,8 @@ impl ProcessManager {
                 return Ok(());
             }
             anyhow::ensure!(s.pid != 0, "Cannot kill a session without a process ID");
+            #[cfg(windows)]
+            { sandboxed = s.sandboxed; }
             s.pid
         };
 
@@ -663,6 +671,7 @@ impl ProcessManager {
         }
         #[cfg(windows)]
         {
+            if sandboxed && crate::windows_sandbox::cancel(pid).await { return Ok(()); }
             let _ = Command::new("taskkill")
                 .args(["/T", "/PID", &pid.to_string()])
                 .creation_flags(0x08000000)

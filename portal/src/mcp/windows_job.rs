@@ -71,9 +71,12 @@ impl KitJob {
         if kit {
             command.env("HEART_PORTAL_KIT_JOB", "1");
         }
+        let sandboxed = !kit && command.as_std().get_args().next().is_some_and(|arg| arg == "sandbox-run");
         let mut child = command
             .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED)
-            .kill_on_drop(true)
+            // The owner cooperatively cancels before closing the sandbox job.
+            // Child::drop must not race it by killing the ACL-owning wrapper.
+            .kill_on_drop(!sandboxed)
             .spawn()
             .context("Spawning suspended Kit")?;
         let attach = (|| {

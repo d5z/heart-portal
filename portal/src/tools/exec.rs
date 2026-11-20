@@ -107,6 +107,10 @@ pub async fn execute(
         match status {
             Ok(status) => status.map(Some),
             Err(_) => {
+                #[cfg(windows)]
+                if config.security.permission_mode != crate::config::PermissionMode::FullAccess {
+                    if let Some(pid) = child.id() { crate::windows_sandbox::cancel(pid).await; }
+                }
                 owner.terminate();
                 child.kill().await?;
                 Ok(None)

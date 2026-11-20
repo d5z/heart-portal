@@ -4,22 +4,59 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{ffi::c_void, os::windows::{ffi::OsStrExt, io::{AsRawHandle, FromRawHandle, OwnedHandle}}, path::{Path, PathBuf}, ptr::{null, null_mut}};
 use windows_sys::Win32::{Foundation::*, Security::{*, Authorization::*, Isolation::*},
-    Storage::FileSystem::*, System::{Console::*, JobObjects::*, Threading::*}};
+    Storage::FileSystem::*, System::{Console::*, JobObjects::*, SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE}, Threading::*}};
 
 struct AclLock(OwnedHandle);
 impl AclLock {
-    fn acquire() -> Result<Self> {
-        let handle = unsafe { CreateMutexW(null(), 0, wide("Local\\Town.Portal.SandboxACL").as_ptr()) };
+    fn acquire(cancel: HANDLE, root: &Path) -> Result<Self> {
+        // Preparation is serialized per canonical workspace. A global mutex
+        // would make unrelated Being workspaces wait behind one another even
+        // though their standing grants and AppContainer SIDs are independent.
+        let identity = root.to_string_lossy().to_ascii_lowercase();
+        let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+        let name = wide(format!("Local\\Town.Portal.SandboxACL.{}", &digest[..32]));
+        let handle = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
         anyhow::ensure!(!handle.is_null(), "Cannot create sandbox ACL lock");
         let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-        let result = unsafe { WaitForSingleObject(handle.as_raw_handle(), 60000) };
-        anyhow::ensure!(result == WAIT_OBJECT_0 || result == WAIT_ABANDONED, "Sandbox is busy; retry after the active command completes");
+        let handles = [cancel, handle.as_raw_handle()];
+        let result = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 60000) };
+        anyhow::ensure!(result != WAIT_OBJECT_0, "Sandbox cancelled before execution");
+        anyhow::ensure!(result == WAIT_OBJECT_0 + 1 || result == WAIT_ABANDONED + 1, "Sandbox is busy; retry after the active command completes");
         Ok(Self(handle))
     }
 }
 impl Drop for AclLock { fn drop(&mut self) { unsafe { ReleaseMutex(self.0.as_raw_handle()); } } }
+
+/// Cancel through a host-only event, never through the command's stdin.
+/// The wrapper stays alive to revoke ACLs after stopping its inner job.
+pub async fn cancel(pid: u32) -> bool {
+    let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if process.is_null() { return false; }
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let name = wide(format!("Local\\Town.Portal.SandboxCancel.{pid}"));
+    // A zero-second timeout may beat the resumed wrapper to event creation.
+    let ready = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_OBJECT_0 { return true; }
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if !event.is_null() {
+            let event = unsafe { OwnedHandle::from_raw_handle(event) };
+            if unsafe { SetEvent(event.as_raw_handle()) } == 0 { return false; }
+            break;
+        }
+        if tokio::time::Instant::now() >= ready { return false; }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let cleanup = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_OBJECT_0 { return true; }
+        if tokio::time::Instant::now() >= cleanup { return false; }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,7 +67,7 @@ fn check(ok: i32, label: &str) -> Result<()> {
     if ok == 0 { return Err(std::io::Error::last_os_error()).context(label.to_owned()); } Ok(())
 }
 
-struct Profile { name: Vec<u16>, sid: *mut c_void, acls: Vec<SavedAcl>, modified: bool }
+struct Profile { sid: *mut c_void, acls: Vec<SavedAcl>, modified: bool, standing: bool }
 struct Capability(*mut c_void);
 impl Capability {
     fn named(name: &str) -> Result<Self> {
@@ -49,12 +86,24 @@ impl Capability {
 }
 impl Drop for Capability { fn drop(&mut self) { unsafe { LocalFree(self.0); } } }
 impl Profile {
-    fn create() -> Result<Self> {
-        let name = wide(format!("Town.Portal.{}", uuid::Uuid::new_v4().simple()));
+    fn create(root: &Path) -> Result<Self> {
+        // A stable profile name gives one capability SID per canonical
+        // workspace. The SID is retained by the standing ACL cache, while the
+        // process token is still created afresh for every command.
+        let identity = root.to_string_lossy().to_ascii_lowercase();
+        let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+        let name = wide(format!("Town.Portal.Workspace.{}", &digest[..32]));
         let mut sid = null_mut();
         let hr = unsafe { CreateAppContainerProfile(name.as_ptr(), name.as_ptr(), name.as_ptr(), null(), 0, &mut sid) };
-        anyhow::ensure!(hr >= 0 && !sid.is_null(), "CreateAppContainerProfile failed: {hr:#x}");
-        Ok(Self { name, sid, acls: vec![], modified: false })
+        if hr < 0 {
+            // CreateAppContainerProfile reports an existing stable profile as
+            // an error. Resolve its SID instead of creating a new profile or
+            // retrying the command with a host token.
+            let derive = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+            anyhow::ensure!(derive >= 0 && !sid.is_null(), "CreateAppContainerProfile failed: {hr:#x}");
+        }
+        anyhow::ensure!(!sid.is_null(), "CreateAppContainerProfile returned no SID");
+        Ok(Self { sid, acls: vec![], modified: false, standing: false })
     }
     fn capture(&mut self, path: &Path) -> Result<()> {
         self.acls.push(SavedAcl::open(path)?);
@@ -67,16 +116,19 @@ impl Drop for Profile {
         // restoring existing children's original inheritance settings. File IDs
         // keep cleanup valid when an ordinary file/directory has been renamed.
         let root = self.acls.first().and_then(|acl| acl.handle.as_ref()).map(|h| h.as_raw_handle());
-        if self.modified {
+        if self.modified && !self.standing {
             for acl in &self.acls {
                 if let Err(error) = acl.restore(root) { eprintln!("Sandbox ACL cleanup failed: {error:#}"); }
             }
         }
-        unsafe { FreeSid(self.sid); DeleteAppContainerProfile(self.name.as_ptr()); }
+        // The profile is deliberately retained with its workspace capability
+        // SID. Deleting it would make the standing ACL grant unusable and
+        // force a full tree rewrite on the next command.
+        unsafe { FreeSid(self.sid); }
     }
 }
 
-struct SavedAcl { handle: Option<OwnedHandle>, id: i64, descriptor: *mut c_void, dacl: *mut ACL, protected: bool, reparse: bool }
+struct SavedAcl { handle: Option<OwnedHandle>, id: i64, descriptor: *mut c_void, dacl: *mut ACL, protected: bool, auto_inherited: bool, reparse: bool }
 impl SavedAcl {
     fn open(path: &Path) -> Result<Self> {
         // Never follow reparse points while changing security descriptors.
@@ -89,7 +141,7 @@ impl SavedAcl {
         let code = unsafe { GetSecurityInfo(handle.as_raw_handle(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
             null_mut(), null_mut(), &mut dacl, null_mut(), &mut descriptor) };
         anyhow::ensure!(code == 0, "Read sandbox ACL failed: {code}");
-        let mut saved = Self { handle: Some(handle), id: 0, descriptor, dacl, protected: false, reparse: false };
+        let mut saved = Self { handle: Some(handle), id: 0, descriptor, dacl, protected: false, auto_inherited: false, reparse: false };
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         check(unsafe { GetFileInformationByHandle(saved.handle.as_ref().unwrap().as_raw_handle(), &mut info) }, "Read sandbox file identity")?;
         saved.id = (((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64) as i64;
@@ -98,6 +150,7 @@ impl SavedAcl {
         let mut control = 0; let mut revision = 0;
         check(unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }, "Read ACL inheritance")?;
         saved.protected = control & SE_DACL_PROTECTED != 0;
+        saved.auto_inherited = control & SE_DACL_AUTO_INHERITED != 0;
         Ok(saved)
     }
     fn apply(&self, dacl: *mut ACL, flags: u32) -> Result<()> {
@@ -118,6 +171,9 @@ impl SavedAcl {
         Ok(())
     }
     fn grant(&self, sid: *mut c_void, access: u32, inherit: bool) -> Result<()> {
+        // Stable workspace SIDs make preparation idempotent after a deleted
+        // marker or an interrupted first run; do not accumulate duplicate ACEs.
+        if acl_has_grant(self.dacl, sid, access) { return Ok(()); }
         let entry = EXPLICIT_ACCESS_W { grfAccessPermissions: access, grfAccessMode: GRANT_ACCESS,
             grfInheritance: 0,
             Trustee: TRUSTEE_W { pMultipleTrustee: null_mut(), MultipleTrusteeOperation: 0,
@@ -139,13 +195,50 @@ impl SavedAcl {
         unsafe { LocalFree(new.cast()); }
         result
     }
+    fn deny(&self, sid: *mut c_void) -> Result<()> {
+        // A stable workspace SID may already have arrived through an
+        // inheritable grant before this path was created. Build a filtered ACL
+        // so inherited allow entries for that SID cannot survive alongside the
+        // boundary deny.
+        let source_size = unsafe { (*self.dacl).AclSize as usize };
+        let mut storage = vec![0u8; source_size + 256];
+        let acl = storage.as_mut_ptr().cast::<ACL>();
+        check(unsafe { InitializeAcl(acl, storage.len() as u32, ACL_REVISION) }, "Initialize boundary ACL")?;
+        for index in 0..unsafe { (*self.dacl).AceCount } {
+            let mut ace: *mut c_void = null_mut();
+            check(unsafe { GetAce(self.dacl, index as u32, &mut ace) }, "Read boundary ACL entry")?;
+            let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+            let same_sid = match header.AceType as u32 {
+                ACCESS_ALLOWED_ACE_TYPE => unsafe { EqualSid((&(*(ace.cast::<ACCESS_ALLOWED_ACE>())).SidStart as *const u32).cast_mut().cast(), sid) != 0 },
+                ACCESS_DENIED_ACE_TYPE => unsafe { EqualSid((&(*(ace.cast::<ACCESS_DENIED_ACE>())).SidStart as *const u32).cast_mut().cast(), sid) != 0 },
+                _ => false,
+            };
+            if !same_sid { check(unsafe { AddAce(acl, ACL_REVISION, u32::MAX, ace, header.AceSize as u32) }, "Copy boundary ACL entry")?; }
+        }
+        let deny = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: DENY_ACCESS,
+            grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            Trustee: TRUSTEE_W { pMultipleTrustee: null_mut(), MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID, TrusteeType: TRUSTEE_IS_UNKNOWN, ptstrName: sid.cast() },
+        };
+        let mut denied = null_mut();
+        let code = unsafe { SetEntriesInAclW(1, &deny, acl, &mut denied) };
+        anyhow::ensure!(code == 0, "Add sandbox boundary deny failed: {code}");
+        let result = self.apply(denied, PROTECTED_DACL_SECURITY_INFORMATION);
+        unsafe { LocalFree(denied.cast()); }
+        result
+    }
     fn apply_kernel(&self, handle: HANDLE, protected: bool) -> Result<()> {
         let size = unsafe { GetSecurityDescriptorLength(self.descriptor) } as usize;
         let mut copy = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
         unsafe { std::ptr::copy_nonoverlapping(self.descriptor.cast::<u8>(), copy.as_mut_ptr().cast::<u8>(), size); }
         let descriptor = copy.as_mut_ptr().cast();
-        check(unsafe { SetSecurityDescriptorControl(descriptor, SE_DACL_PROTECTED,
-            if protected { SE_DACL_PROTECTED } else { 0 }) }, "Set restored ACL inheritance")?;
+        // The low-level setter consumes AUTO_INHERIT_REQ to preserve the stored
+        // AUTO_INHERITED bit; copying AUTO_INHERITED alone clears it on NTFS.
+        let inheritance = if self.auto_inherited { SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED } else { 0 };
+        check(unsafe { SetSecurityDescriptorControl(descriptor, SE_DACL_PROTECTED | SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED,
+            inheritance | if protected { SE_DACL_PROTECTED } else { 0 }) }, "Set restored ACL inheritance")?;
         check(unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor) }, "Restore original sandbox ACL")
     }
     fn restore(&self, root: Option<HANDLE>) -> Result<()> {
@@ -182,6 +275,71 @@ impl SavedAcl {
 }
 impl Drop for SavedAcl { fn drop(&mut self) { unsafe { LocalFree(self.descriptor); } } }
 
+const WORKSPACE_GRANT: u32 = 0x001201bf;
+const RUNTIME_GRANT: u32 = 0x001200a9;
+
+fn acl_has_grant(dacl: *mut ACL, sid: *mut c_void, required: u32) -> bool {
+    if dacl.is_null() { return false; }
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..count {
+        let mut ace: *mut c_void = null_mut();
+        if unsafe { GetAce(dacl, index as u32, &mut ace) } == 0 || ace.is_null() { continue; }
+        let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+        if header.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE { continue; }
+        let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+        let ace_sid = (&allowed.SidStart as *const u32).cast_mut().cast();
+        if unsafe { EqualSid(ace_sid, sid) } != 0 && allowed.Mask & required == required { return true; }
+    }
+    false
+}
+
+fn cache_marker(root: &Path) -> PathBuf { root.join(".portal-runtime").join(".portal-acl-cache") }
+
+fn cache_matches(root: &Path, runtime: Option<&Path>, sid: *mut c_void) -> Result<bool> {
+    let marker = cache_marker(root);
+    let expected = runtime.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+    let actual = match std::fs::read_to_string(&marker) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("Read sandbox ACL cache marker"),
+    };
+    if actual.trim() != expected { return Ok(false); }
+    let workspace = SavedAcl::open(root)?;
+    if !acl_has_grant(workspace.dacl, sid, WORKSPACE_GRANT) { return Ok(false); }
+    if let Some(runtime) = runtime {
+        let runtime_acl = SavedAcl::open(runtime)?;
+        if !acl_has_grant(runtime_acl.dacl, sid, RUNTIME_GRANT) { return Ok(false); }
+    }
+    Ok(true)
+}
+
+fn boundary_paths(root: &Path, protected_paths: &[PathBuf], sid: *mut c_void) -> Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    // Standing grants make ordinary invocations cheap. Look for newly
+    // created sensitive paths, but prune generated trees that can contain
+    // hundreds of thousands of files. A path already restricted by the full
+    // preparation pass has no package grant and therefore does not invalidate
+    // the standing cache again.
+    let mut directories = vec![root.to_owned()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            let sensitive = crate::sensitive_paths::is_secret_name(&name) || protected_paths.contains(&path);
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if sensitive {
+                let acl = SavedAcl::open(&path)?;
+                if acl_has_grant(acl.dacl, sid, WORKSPACE_GRANT) { result.push(path.clone()); }
+            }
+            if metadata.is_dir() && !matches!(name.as_str(), ".portal-runtime" | "node_modules" | ".venv" | "__pycache__") {
+                directories.push(path);
+            }
+        }
+    }
+    Ok(result)
+}
+
 struct Attributes { storage: Vec<usize>, pointer: LPPROC_THREAD_ATTRIBUTE_LIST }
 impl Attributes {
     fn new() -> Result<Self> {
@@ -207,6 +365,10 @@ pub fn run_payload(encoded: &str) -> Result<u32> {
 }
 
 pub fn run(request: &Request) -> Result<u32> {
+    // Default host DACL, non-inherited handle, no AppContainer grant.
+    let event = unsafe { CreateEventW(null(), 1, 0, wide(format!("Local\\Town.Portal.SandboxCancel.{}", std::process::id())).as_ptr()) };
+    anyhow::ensure!(!event.is_null(), "Cannot create sandbox cancellation event");
+    let cancel = unsafe { OwnedHandle::from_raw_handle(event) };
     let root = request.root.canonicalize()?;
     let cwd = request.cwd.canonicalize()?;
     anyhow::ensure!(root.is_dir() && cwd.is_dir() && cwd.starts_with(&root) && root.parent().is_some(), "Invalid sandbox workspace");
@@ -214,28 +376,58 @@ pub fn run(request: &Request) -> Result<u32> {
     let cwd_text = cwd.to_string_lossy();
     let cwd_native = cwd_text.strip_prefix(r"\\?\").unwrap_or(&cwd_text);
     anyhow::ensure!(!cwd_native.starts_with("UNC\\"), "Network workspaces are not supported by the offline sandbox");
-    let _acl_lock = AclLock::acquire()?;
+    let mut profile = Profile::create(&root)?;
     let mut config = crate::config::PortalConfig::default();
     config.security.workspace_root = root.clone();
     config.security.permission_mode = crate::config::PermissionMode::Supervised;
     config.config_path = request.protected_paths.first().cloned();
-    let task_environment = crate::task_environment::prepare(&config)?;
-    let mut profile = Profile::create()?;
+    let mut task_environment = crate::task_environment::prepare(&config)?;
+    // A command may target a nested project. Put only that directory's local
+    // shims in front of the bundled tools; do not scan ancestors or inherit a
+    // host PATH into the AppContainer.
+    if let Some(path) = task_environment.variables.get_mut("PATH") {
+        let mut local = vec![cwd.join("node_modules/.bin"), cwd.join(".venv/Scripts")];
+        local.retain(|entry| entry.is_dir());
+        if !local.is_empty() {
+            local.extend(std::env::split_paths(path));
+            *path = std::env::join_paths(local)?.to_string_lossy().into_owned();
+        }
+    }
     // Resolve once and fail closed if an explicitly protected configuration is
     // missing. Silently dropping it would turn its old location into writable data.
     let protected_paths = request.protected_paths.iter().map(|p| p.canonicalize()
         .context("Resolve protected sandbox configuration")).collect::<Result<Vec<_>>>()?;
-    let mut objects = vec![(root.clone(), true, 0x001201bfu32)]; // root cannot be moved
+    let runtime_root = task_environment.runtime.as_ref().map(|runtime| runtime.root.as_path());
+    let mut cache_ready = cache_matches(&root, runtime_root, profile.sid)?;
+    // Name-based secret/config exclusions need a fresh boundary pass. Keep the
+    // fast standing-grant path for ordinary projects; once a boundary object
+    // exists, use the original full preparation so every descendant is checked.
+    if cache_ready && !boundary_paths(&root, &protected_paths, profile.sid)?.is_empty() { cache_ready = false; }
+    // Only the first preparation (or an invalidated cache) needs the global
+    // ACL mutex. Commands using an already materialized grant do not wait for
+    // another command to finish.
+    let acl_lock = if cache_ready { None } else { Some(AclLock::acquire(cancel.as_raw_handle(), &root)?) };
+    if acl_lock.is_some() {
+        cache_ready = cache_matches(&root, runtime_root, profile.sid)?;
+        // Another invocation may have materialized the standing grant while
+        // this call waited. Recheck boundaries after the lock handoff too;
+        // otherwise a newly-created secret path could bypass the deny pass.
+        if cache_ready && !boundary_paths(&root, &protected_paths, profile.sid)?.is_empty() { cache_ready = false; }
+    }
+    let mut objects = vec![(root.clone(), true, WORKSPACE_GRANT)]; // root cannot be moved
     let mut boundaries = protected_paths.clone();
-    let mut directories = vec![(root.clone(), false)];
-    while let Some((directory, protected)) = directories.pop() {
+    let mut secret_boundaries = Vec::new();
+    if !cache_ready {
+      let mut directories = vec![(root.clone(), false)];
+      while let Some((directory, protected)) = directories.pop() {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?; let path = entry.path();
             use std::os::windows::fs::MetadataExt;
             let metadata = std::fs::symlink_metadata(&path)?;
             anyhow::ensure!(objects.len() < 20000, "Workspace exceeds sandbox ACL budget; select a smaller workspace");
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            let hidden = crate::sensitive_paths::is_secret_name(&name) || protected_paths.contains(&path);
+            let secret_name = crate::sensitive_paths::is_secret_name(&name);
+            let hidden = secret_name || protected_paths.contains(&path);
             let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             if metadata.is_file() && !reparse {
                 let file = std::fs::File::open(&path)?;
@@ -247,47 +439,57 @@ pub fn run(request: &Request) -> Result<u32> {
             }
             let protected = protected || protected_paths.contains(&path)
                 || matches!(name.as_str(), ".git" | ".codex" | ".agents" | "portal.toml" | "desktop-portal.toml" | "mcp.toml");
-            let access = if hidden || reparse { 0 } else if protected { 0x001200a9 } else { 0x001301bf };
+            if secret_name { secret_boundaries.push(path.clone()); }
+            let secret_tree = secret_boundaries.iter().any(|boundary| path.starts_with(boundary));
+            let access = if hidden || reparse || secret_tree { 0 } else if protected { 0x001200a9 } else { 0x001301bf };
             if protected || access == 0 { boundaries.push(path.clone()); }
             objects.push((path.clone(), metadata.is_dir(), access));
-            if metadata.is_dir() && !hidden && !reparse { directories.push((path, protected)); }
+            if metadata.is_dir() && !reparse { directories.push((path, protected || hidden)); }
         }
+      }
+      let workspace_objects = objects.len();
+      if let Some(runtime) = &task_environment.runtime {
+          anyhow::ensure!(!runtime.root.starts_with(&root), "Bundled runtime must be outside the writable workspace");
+          // Grant this invocation read/execute only. Keep handles for this separate
+          // tree so cleanup also works when it lives on another volume.
+          for entry in walkdir::WalkDir::new(&runtime.root).follow_links(false) {
+              let entry = entry.context("Inspect bundled runtime")?;
+              let metadata = entry.metadata()?;
+              anyhow::ensure!(!metadata.file_type().is_symlink(), "Bundled runtime must contain ordinary files");
+              objects.push((entry.path().to_owned(), metadata.is_dir(), RUNTIME_GRANT));
+          }
+      }
+      // Protect every existing child from inheritance BEFORE granting inheritable
+      // access on ordinary directories. New objects can inherit the package SID,
+      // while metadata, secrets and junctions never receive that grant.
+      // Capture all descriptors before changing any inheritance settings.
+      for (path, _, _) in &objects { profile.capture(path)?; }
+      let root_handle = profile.acls[0].handle.as_ref().unwrap().as_raw_handle();
+      for acl in profile.acls.iter().take(workspace_objects) { drop(acl.reopen(root_handle).context("Sandbox requires file-ID based ACL restoration")?); }
+      if unsafe { WaitForSingleObject(cancel.as_raw_handle(), 0) } == WAIT_OBJECT_0 { return Ok(137); }
+      profile.modified = true;
+      for acl in &profile.acls { acl.apply(acl.dacl, PROTECTED_DACL_SECURITY_INFORMATION)?; }
+      for ((path, directory, access), acl) in objects.iter().zip(&profile.acls) {
+          let mut access = *access;
+          // DELETE on an ancestor can move protected contents without opening them.
+          if *directory && boundaries.iter().any(|p| p.starts_with(path)) { access &= !DELETE; }
+          if access != 0 { acl.grant(profile.sid, access, *directory)?; }
+          else { acl.deny(profile.sid)?; }
+      }
+      // Open descendant handles can block directory renames on Windows even with
+      // FILE_SHARE_DELETE. Retain only the immovable root and restore by file ID.
+      for acl in profile.acls.iter_mut().take(workspace_objects).skip(1) { acl.handle = None; }
+      if unsafe { WaitForSingleObject(cancel.as_raw_handle(), 0) } == WAIT_OBJECT_0 { return Ok(137); }
+      std::fs::write(cache_marker(&root), runtime_root.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default())
+          .context("Write sandbox ACL cache marker")?;
+      profile.standing = true;
     }
-    let workspace_objects = objects.len();
-    if let Some(runtime) = &task_environment.runtime {
-        anyhow::ensure!(!runtime.root.starts_with(&root), "Bundled runtime must be outside the writable workspace");
-        // Grant this invocation read/execute only. Keep handles for this separate
-        // tree so cleanup also works when it lives on another volume.
-        for entry in walkdir::WalkDir::new(&runtime.root).follow_links(false) {
-            let entry = entry.context("Inspect bundled runtime")?;
-            let metadata = entry.metadata()?;
-            anyhow::ensure!(!metadata.file_type().is_symlink(), "Bundled runtime must contain ordinary files");
-            objects.push((entry.path().to_owned(), metadata.is_dir(), 0x001200a9));
-        }
-    }
-    // Protect every existing child from inheritance BEFORE granting inheritable
-    // access on ordinary directories. New objects can inherit the package SID,
-    // while metadata, secrets and junctions never receive that grant.
-    // Capture all descriptors before changing any inheritance settings.
-    for (path, _, _) in &objects { profile.capture(path)?; }
-    let root_handle = profile.acls[0].handle.as_ref().unwrap().as_raw_handle();
-    for acl in profile.acls.iter().take(workspace_objects) { drop(acl.reopen(root_handle).context("Sandbox requires file-ID based ACL restoration")?); }
-    profile.modified = true;
-    for acl in &profile.acls { acl.apply(acl.dacl, PROTECTED_DACL_SECURITY_INFORMATION)?; }
-    for ((path, directory, access), acl) in objects.iter().zip(&profile.acls) {
-        let mut access = *access;
-        // DELETE on an ancestor can move protected contents without opening them.
-        if *directory && boundaries.iter().any(|p| p.starts_with(path)) { access &= !DELETE; }
-        if access != 0 { acl.grant(profile.sid, access, *directory)?; }
-    }
-    // Open descendant handles can block directory renames on Windows even with
-    // FILE_SHARE_DELETE. Retain only the immovable root and restore by file ID.
-    for acl in profile.acls.iter_mut().take(workspace_objects).skip(1) { acl.handle = None; }
+    drop(acl_lock);
     let system = PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot unavailable")?);
     let exe = if request.powershell { system.join(r"System32\WindowsPowerShell\v1.0\powershell.exe") } else { system.join(r"System32\cmd.exe") };
     let source = if request.powershell {
         let script = format!("try {{ New-PSDrive -Name Workspace -PSProvider FileSystem -Root '{}' -ErrorAction Stop | Out-Null; Set-Location Workspace:\\ -ErrorAction Stop }} catch {{ Write-Error $_; exit 126 }};\n{}", cwd_native.replace('\'', "''"), request.source);
-        format!("\"{}\" -NoLogo -NoProfile -NonInteractive -EncodedCommand {}", exe.display(),
+        format!("\"{}\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}", exe.display(),
             crate::exec_policy::powershell_encoded_command(&script))
     } else { format!("\"{}\" /D /S /C \"{}\"", exe.display(), request.source) };
     let mut command = wide(source);
@@ -351,7 +553,16 @@ pub fn run(request: &Request) -> Result<u32> {
         Ok(())
     })();
     if let Err(error) = initialized { unsafe { TerminateProcess(process.as_raw_handle(), 126); } return Err(error); }
-    anyhow::ensure!(unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } == WAIT_OBJECT_0, "Wait for sandbox failed");
+    let handles = [cancel.as_raw_handle(), process.as_raw_handle()];
+    let completed = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+    if completed == WAIT_OBJECT_0 {
+        check(unsafe { TerminateJobObject(job.as_raw_handle(), 137) }, "Cancel sandbox job")?;
+        anyhow::ensure!(unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } == WAIT_OBJECT_0, "Wait for cancelled sandbox failed");
+        // A cancelled first preparation must not leave standing grants behind.
+        // Let Profile restore the captured descriptors; the next invocation
+        // will notice the missing root grant and prepare again.
+        profile.standing = false;
+    } else { anyhow::ensure!(completed == WAIT_OBJECT_0 + 1, "Wait for sandbox failed"); }
     let mut code = 126;
     check(unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) }, "Read sandbox exit code")?;
     unsafe { TerminateJobObject(job.as_raw_handle(), code); }

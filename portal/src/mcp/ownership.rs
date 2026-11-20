@@ -7,7 +7,9 @@ use tokio::process::{Child, Command};
 pub(crate) struct ProcessOwner {
     stopped: AtomicBool,
     #[cfg(windows)]
-    job: super::windows_job::KitJob,
+    job: Option<super::windows_job::KitJob>,
+    #[cfg(windows)]
+    sandbox_pid: Option<u32>,
     #[cfg(unix)]
     group: i32,
 }
@@ -54,16 +56,19 @@ impl ProcessOwner {
     fn spawn_owned(command: &mut Command, _kit: bool) -> Result<(Child, Self)> {
         #[cfg(windows)]
         {
+            let sandboxed = !_kit && command.as_std().get_args().next().is_some_and(|arg| arg == "sandbox-run");
             let (child, job) = if _kit {
                 super::windows_job::KitJob::spawn(command)?
             } else {
                 super::windows_job::KitJob::spawn_exec(command)?
             };
+            let sandbox_pid = if sandboxed { child.id() } else { None };
             Ok((
                 child,
                 Self {
                     stopped: AtomicBool::new(false),
-                    job,
+                    job: Some(job),
+                    sandbox_pid,
                 },
             ))
         }
@@ -93,7 +98,7 @@ impl ProcessOwner {
             return;
         }
         #[cfg(windows)]
-        self.job.terminate();
+        if let Some(job) = &self.job { job.terminate(); }
         #[cfg(unix)]
         {
             // McpConnection never waits/reaps before this one-shot cleanup.
@@ -110,6 +115,20 @@ impl ProcessOwner {
 
 impl Drop for ProcessOwner {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if !self.stopped.load(Ordering::Acquire) {
+            if let (Some(pid), Ok(runtime)) = (self.sandbox_pid, tokio::runtime::Handle::try_current()) {
+                if let Some(job) = self.job.take() {
+                    // Keep job ownership until the cancelled tool's wrapper
+                    // has revoked temporary ACLs and exited.
+                    runtime.spawn(async move {
+                        crate::windows_sandbox::cancel(pid).await;
+                        job.terminate();
+                    });
+                    return;
+                }
+            }
+        }
         self.terminate();
     }
 }

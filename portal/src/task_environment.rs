@@ -176,6 +176,27 @@ fn prepare_environment(
             system.clone(),
             system.join("System32/WindowsPowerShell/v1.0"),
         ]);
+        // Keep project-local command shims discoverable on Windows too. npm
+        // writes them to node_modules/.bin, and direct `python` calls should
+        // use a venv created in the current workspace when one exists.
+        paths.push(root.join("node_modules/.bin"));
+        // cmd wrappers (including npm.cmd) cannot use canonicalize's extended
+        // path prefix. Keep ordinary absolute paths in the command search path.
+        for path in &mut paths {
+            if let Some(native) = path.to_str().and_then(|value| value.strip_prefix(r"\\?\")) {
+                *path = PathBuf::from(native);
+            }
+        }
+        env.insert("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into());
+        // Module realpath probes otherwise inspect ancestors outside the LPAC
+        // grants. This preserves module path identity; the OS still restricts
+        // reparse points, so it grants no access outside the sandbox.
+        env.insert("NODE_OPTIONS".into(), "--preserve-symlinks --preserve-symlinks-main".into());
+        env.insert("HEART_PORTAL_SANDBOX".into(), "1".into());
+        env.insert("HEART_PORTAL_WORKSPACE".into(), root.to_string_lossy().into_owned());
+        // Local npm dependencies must be copied: creating directory links is
+        // unavailable in AppContainer and would not survive its reparse gate.
+        env.insert("npm_config_install_links".into(), "true".into());
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     paths.extend(["/usr/bin", "/bin"].map(PathBuf::from));
@@ -194,6 +215,12 @@ fn prepare_environment(
         "PORTAL_OUTPUTS".into(),
         root.join("outputs").to_string_lossy().into_owned(),
     );
+    #[cfg(windows)]
+    for value in env.values_mut() {
+        if let Some(native) = value.strip_prefix(r"\\?\") {
+            *value = native.to_owned();
+        }
+    }
     Ok(env)
 }
 
@@ -217,9 +244,18 @@ mod tests {
             "PORTAL_OUTPUTS",
         ] {
             assert!(std::path::Path::new(&first[key]).is_dir());
-            assert!(std::path::Path::new(&first[key]).starts_with(root.canonicalize().unwrap()));
+            assert!(std::path::Path::new(&first[key]).canonicalize().unwrap().starts_with(root.canonicalize().unwrap()));
         }
         assert!(!first.contains_key("PORTAL_TOKEN"));
+        #[cfg(windows)]
+        {
+            assert_eq!(first["PATHEXT"], ".COM;.EXE;.BAT;.CMD");
+            assert_eq!(first["NODE_OPTIONS"], "--preserve-symlinks --preserve-symlinks-main");
+            assert_eq!(first["HEART_PORTAL_SANDBOX"], "1");
+            assert_eq!(first["npm_config_install_links"], "true");
+            assert_eq!(Path::new(&first["HEART_PORTAL_WORKSPACE"]).canonicalize().unwrap(), root.canonicalize().unwrap());
+            assert!(!first["PATH"].contains(r"\\?\"));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]

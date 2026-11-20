@@ -13,11 +13,19 @@ pub fn shell_command(config: &PortalConfig, source: &str, workdir: &str, shell: 
         if let Some(runtime) = crate::task_environment::bundled_runtime()? {
             let mut paths = vec![runtime.root.join(runtime.python.path).parent().unwrap().to_owned(),
                 runtime.root.join(runtime.node.path).parent().unwrap().to_owned()];
+            #[cfg(windows)]
+            paths.extend([directory.join("node_modules/.bin"), directory.join(".venv/Scripts")]);
             // Preserve the platform paths configure_shell_command already supplied.
             let configured_path = command.as_std().get_envs()
                 .find_map(|(key, value)| (key == "PATH").then_some(value).flatten())
                 .unwrap_or_default();
             paths.extend(std::env::split_paths(configured_path));
+            #[cfg(windows)]
+            for path in &mut paths {
+                if let Some(native) = path.to_str().and_then(|value| value.strip_prefix(r"\\?\")) {
+                    *path = std::path::PathBuf::from(native);
+                }
+            }
             command.env("PATH", std::env::join_paths(paths)?);
         }
         return Ok(command);
