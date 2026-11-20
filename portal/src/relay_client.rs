@@ -462,6 +462,13 @@ mod tests {
                     code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
                     reason: "fixture-secret".into(),
                 })).await.unwrap();
+                // Drain the peer's queued frames before dropping TCP. Windows
+                // otherwise sends a reset that can hide the close frame.
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    while let Some(Ok(message)) = ws.next().await {
+                        if message.is_close() { break; }
+                    }
+                }).await;
             }
         });
         let root = crate::kits::tests::TestKits::new();

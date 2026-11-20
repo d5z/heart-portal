@@ -848,6 +848,11 @@ pub fn bundled_pi_binary(root: &Path) -> PathBuf {
 /// Resolve npm's JS entry point through Node instead of executing a Unix shim
 /// or passing a potentially long prompt through cmd.exe.
 fn pi_command(program: &Path) -> Option<Vec<String>> {
+    #[cfg(windows)]
+    if program.file_name().is_some_and(|name| name == "pi.cmd") {
+        let cli = program.parent()?.join("node_modules/@mariozechner/pi-coding-agent/dist/cli.js");
+        return pi_command(&cli);
+    }
     // The pinned npm CLI must use the release-owned Node, even if an older
     // installation has a shebang pointing at a host Node that was removed.
     if let Ok(Some(runtime)) = crate::task_environment::bundled_runtime() {
@@ -861,9 +866,6 @@ fn pi_command(program: &Path) -> Option<Vec<String>> {
     {
         let cli = if program.extension().is_some_and(|ext| ext == "js") {
             Some(program.to_path_buf())
-        } else if program.file_name().is_some_and(|name| name == "pi.cmd") {
-            program.parent().map(|dir| dir.join("node_modules/@mariozechner/pi-coding-agent/dist/cli.js"))
-                .filter(|path| path.is_file())
         } else { None };
         if let Some(cli) = cli {
             if !cli.is_file() { return None; }
@@ -933,7 +935,9 @@ pub fn bundled_pi_wants_provisioning(resolved: Option<&[String]>, root: &Path) -
         None => true,
         Some(argv) => {
             let bundled = bundled_pi_binary(root);
-            argv.iter().any(|p| Path::new(p) == bundled) && !bundled_pi_is_current(root)
+            let bundled = bundled.canonicalize().unwrap_or(bundled);
+            argv.iter().any(|p| Path::new(p).canonicalize().unwrap_or_else(|_| PathBuf::from(p)) == bundled)
+                && !bundled_pi_is_current(root)
         }
     }
 }
@@ -1428,12 +1432,14 @@ mod tests {
         assert!(bundled_pi_is_current(&install));
         let resolved = PiDaemon::resolve_command_with_bundled(None, Some(&install)).unwrap();
         assert_eq!(Path::new(&resolved[0]).file_name().unwrap().to_string_lossy().to_lowercase(), "node.exe");
-        assert_eq!(Path::new(&resolved[1]), binary);
+        assert_eq!(Path::new(&resolved[1]).canonicalize().unwrap(), binary.canonicalize().unwrap());
         assert!(!bundled_pi_wants_provisioning(Some(&resolved), &install));
         std::fs::write(install.join("pi"), "#!/bin/sh\n").unwrap();
         assert!(pi_command(&install.join("pi")).is_none());
         std::fs::write(install.join("pi.cmd"), "@echo off").unwrap();
         assert_eq!(pi_command(&install.join("pi.cmd")).unwrap(), resolved);
+        std::fs::write(bundled_pi_version_file(&install), "old-version").unwrap();
+        assert!(bundled_pi_wants_provisioning(Some(&resolved), &install));
         assert!(find_on_path("cmd").unwrap().ends_with("cmd.exe"));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2082,7 +2088,16 @@ mod windows_env_tests {
                 assert_eq!(child.get(key), machine.get(key), "lost machine path {key}");
             }
             assert_eq!(child.contains_key("MY_PROVIDER_TOKEN"), configured.iter().any(|k| k == "MY_PROVIDER_TOKEN"));
-            assert_eq!(child.contains_key("PATH"), configured.iter().any(|k| k == "PATH"));
+            let mut expected_paths = Vec::new();
+            if let Some(runtime) = crate::task_environment::bundled_runtime().unwrap() {
+                expected_paths.push(runtime.root.join(runtime.python.path).parent().unwrap().to_owned());
+                expected_paths.push(runtime.root.join(runtime.node.path).parent().unwrap().to_owned());
+            }
+            if configured.iter().any(|key| key == "PATH") {
+                expected_paths.extend(std::env::split_paths(&machine["PATH"]));
+            }
+            let actual_paths: Vec<_> = child.get("PATH").map(|value| std::env::split_paths(value).collect()).unwrap_or_default();
+            assert_eq!(actual_paths, expected_paths);
             assert!(!child.contains_key("UNRELATED_SECRET"));
             assert!(!child.contains_key("LOCALAPPDATA"), "do not invent missing paths");
         }
