@@ -23,11 +23,6 @@ use crate::tools::{value_as_u64, ToolInfo};
 /// Hard floor/ceiling on a per-task wall clock, mirroring the tool schema.
 const MIN_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 21_600;
-/// A meaningful task needs at least a couple of turns and some tokens.
-const MIN_MAX_TURNS: u32 = 1;
-const MIN_MAX_TOKENS: u64 = 1_000;
-const MAX_MAX_TURNS: u64 = u32::MAX as u64;
-const MAX_MAX_TOKENS: u64 = 9_007_199_254_740_991; // JavaScript's exact-integer ceiling
 const MAX_MAX_CONTINUATIONS: u64 = u32::MAX as u64;
 /// `portal_process`-compatible long-poll cap.
 const MAX_LOG_TIMEOUT_MS: u64 = 300_000;
@@ -79,12 +74,13 @@ pub fn list_tools() -> Vec<ToolInfo> {
                     "budget": {
                         "type": "object",
                         "properties": {
-                            "max_turns": {"type": "integer", "minimum": 1},
-                            "max_tokens": {"type": "integer", "minimum": 1000},
+                            "max_turns": {"type": "integer", "minimum": 0, "description": "Accepted for compatibility and ignored during beta."},
+                            "max_tokens": {"type": "integer", "minimum": 0, "description": "Accepted for compatibility and ignored during beta."},
+                            "count_cache_read": {"type": "boolean", "default": true, "description": "Include cached prompt reads in reported budget_tokens_used. Raw usage is always reported."},
                             "timeout_secs": {"type": "integer", "minimum": 30, "maximum": 21600},
                             "max_continuations": {"type": "integer", "minimum": 0}
                         },
-                        "description": "Caps for this task; defaults from portal.toml [subagent.budget]. max_continuations limits daemon-mode autonomous continuation turns; stdio fallback remains bounded by max_turns, max_tokens and timeout_secs."
+                        "description": "Tasks have no token or turn cap during beta. timeout_secs still limits execution time and max_continuations limits daemon-mode autonomous continuation turns."
                     },
                     "model": {
                         "type": "string",
@@ -380,11 +376,9 @@ fn parse_budget(default: Budget, raw: Option<&Value>) -> Result<Budget> {
         .ok_or_else(|| anyhow::anyhow!("'budget' must be an object"))?;
 
     let mut budget = default;
-    if let Some(v) = budget_u64(obj, "max_turns")? {
-        budget.max_turns = v.clamp(MIN_MAX_TURNS as u64, MAX_MAX_TURNS) as u32;
-    }
-    if let Some(v) = budget_u64(obj, "max_tokens")? {
-        budget.max_tokens = v.clamp(MIN_MAX_TOKENS, MAX_MAX_TOKENS);
+    if let Some(value) = obj.get("count_cache_read") {
+        budget.count_cache_read = value.as_bool()
+            .ok_or_else(|| anyhow::anyhow!("'budget.count_cache_read' must be a boolean"))?;
     }
     if let Some(v) = budget_u64(obj, "timeout_secs")? {
         budget.timeout_secs = v.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
@@ -664,21 +658,24 @@ mod tests {
     #[test]
     fn budget_overrides_are_clamped_to_the_schema() {
         let default = Budget {
-            max_turns: 40,
-            max_tokens: 400_000,
+            max_turns: 0,
+            max_tokens: 0,
+            count_cache_read: true,
             timeout_secs: 1800,
             max_continuations: 3,
         };
         assert_eq!(parse_budget(default, None).unwrap(), default);
         assert_eq!(parse_budget(default, Some(&Value::Null)).unwrap(), default);
+        assert!(!parse_budget(default, Some(&json!({"count_cache_read": false}))).unwrap().count_cache_read);
+        assert!(parse_budget(default, Some(&json!({"count_cache_read": "false"}))).is_err());
 
         let b = parse_budget(
             default,
             Some(&json!({"max_turns": 5, "max_tokens": 50_000, "timeout_secs": 120})),
         )
         .unwrap();
-        assert_eq!(b.max_turns, 5);
-        assert_eq!(b.max_tokens, 50_000);
+        assert_eq!(b.max_turns, 0);
+        assert_eq!(b.max_tokens, 0);
         assert_eq!(b.timeout_secs, 120);
         // Unspecified fields keep the configured default.
         assert_eq!(b.max_continuations, 3);
@@ -691,19 +688,13 @@ mod tests {
             Some(&json!({"max_turns": 0, "max_tokens": 1, "timeout_secs": 999_999})),
         )
         .unwrap();
-        assert_eq!(clamped.max_turns, MIN_MAX_TURNS);
-        assert_eq!(clamped.max_tokens, MIN_MAX_TOKENS);
+        assert_eq!(clamped.max_turns, 0);
+        assert_eq!(clamped.max_tokens, 0);
         assert_eq!(clamped.timeout_secs, MAX_TIMEOUT_SECS);
 
         // Strings coerce, per the HF-7 argument policy.
         let coerced = parse_budget(default, Some(&json!({"timeout_secs": "300"}))).unwrap();
         assert_eq!(coerced.timeout_secs, 300);
-
-        let huge = parse_budget(default, Some(&json!({"max_turns": u64::MAX}))).unwrap();
-        assert_eq!(huge.max_turns, u32::MAX);
-        let huge_tokens = parse_budget(default, Some(&json!({"max_tokens": u64::MAX}))).unwrap();
-        assert_eq!(huge_tokens.max_tokens, MAX_MAX_TOKENS);
-        assert!(parse_budget(default, Some(&json!({"max_turns": "many"}))).is_err());
 
         assert!(parse_budget(default, Some(&json!("nope"))).is_err());
     }

@@ -696,12 +696,15 @@ impl PiDaemon {
         );
 
         let (max_turns, max_tokens) = (task.max_turns, task.max_tokens);
+        let count_cache_read = task.count_cache_read;
         let activity_file = task.activity_file.clone();
         let (budget_tx, budget_rx) = tokio::sync::oneshot::channel();
         let stdout_reader = tokio::spawn(async move {
             let mut result = StdioResult::default();
+            let mut budget_limit = None;
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let previous_turns = result.turns;
                 result.fold_line(&line);
                 if let Some(file) = task.activity_file.as_ref() {
                     if let Ok(event) = serde_json::from_str(&line) { super::activity::record(file, &event); }
@@ -709,12 +712,24 @@ impl PiDaemon {
                 if let Some(tx) = task.transcript.as_ref() {
                     if let Some(rendered) = render_stdio_line(&line) { let _ = tx.send(rendered); }
                 }
-                if (max_turns > 0 && result.turns >= max_turns) || (max_tokens > 0 && result.usage.total >= max_tokens) {
+                // Pi emits message_end before executing its requested tools.
+                // Let those tools finish and keep their results before stopping.
+                if result.turns == previous_turns || result.failed() || result.stop_reason.as_deref() == Some("stop") {
+                    continue;
+                }
+                budget_limit = if max_tokens > 0 && result.usage.budget_tokens(count_cache_read) >= max_tokens {
+                    Some("max_tokens")
+                } else if max_turns > 0 && result.turns >= max_turns {
+                    Some("max_turns")
+                } else {
+                    None
+                };
+                if budget_limit.is_some() {
                     let _ = budget_tx.send(());
                     break;
                 }
             }
-            result
+            (result, budget_limit)
         });
         let stderr_reader = tokio::spawn(read_stderr_tail(stderr, STDIO_STDERR_TAIL_BYTES));
 
@@ -743,7 +758,7 @@ impl PiDaemon {
         }
         // The readers end at EOF, which the exit above guarantees — but a
         // grandchild holding the pipe open must not hang the task forever.
-        let result = time::timeout(STDIO_KILL_GRACE, stdout_reader)
+        let (result, budget_limit) = time::timeout(STDIO_KILL_GRACE, stdout_reader)
             .await
             .ok()
             .and_then(Result::ok)
@@ -757,8 +772,7 @@ impl PiDaemon {
             append_log(&self.log_path(), &stderr_tail);
         }
 
-        let budget_exhausted = budget_exhausted || (max_turns > 0 && result.turns >= max_turns)
-            || (max_tokens > 0 && result.usage.total >= max_tokens);
+        let budget_exhausted = budget_exhausted || budget_limit.is_some();
         if let Some(file) = activity_file {
             super::activity::append(&file, serde_json::json!({
                 "kind": "usage",
@@ -771,6 +785,8 @@ impl PiDaemon {
                 "turns": result.turns,
                 "stop_reason": result.stop_reason.clone(),
                 "budget_exhausted": budget_exhausted,
+                "budget_limit": budget_limit,
+                "budget_tokens_used": result.usage.budget_tokens(count_cache_read),
             }));
         }
         Ok(StdioRun {
@@ -778,6 +794,7 @@ impl PiDaemon {
             exit_code,
             timed_out,
             budget_exhausted,
+            budget_limit,
             stderr_tail,
         })
     }
@@ -1169,6 +1186,7 @@ fn child_environment(
 pub struct StdioTask {
     pub max_turns: u32,
     pub max_tokens: u64,
+    pub count_cache_read: bool,
     /// The full prompt, exactly as a daemon session would have received it.
     pub prompt: String,
     /// cwd for the process; the sub-agent's working directory.
@@ -1195,6 +1213,7 @@ pub struct StdioRun {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub budget_exhausted: bool,
+    pub budget_limit: Option<&'static str>,
     /// Tail of pi's stderr, for explaining a failure in the callback.
     pub stderr_tail: String,
 }
@@ -1446,30 +1465,68 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_budget_stops_before_the_next_turn() {
-        for (max_turns, max_tokens) in [(1, 0), (0, 10)] {
+        for (max_turns, max_tokens, count_cache_read, stop_reason, budget_limit) in [
+            (1, 0, true, "toolUse", Some("max_turns")),
+            (0, 10, true, "toolUse", Some("max_tokens")),
+            (0, 10, false, "toolUse", None),
+            (1, 10, true, "stop", None),
+        ] {
             let root = temp_dir("budget");
-            let event = r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":8,"output":2}}}"#;
+            let event = serde_json::json!({"type":"message_end", "message":{
+                "role":"assistant", "content":[{"type":"text","text":"last response"}],
+                "usage":{"input":3,"output":2,"cacheRead":5}, "stopReason":stop_reason,
+            }});
+            let tail = if stop_reason == "stop" {
+                r#"{"type":"agent_end","messages":[]}"#
+            } else {
+                r#"{"type":"tool_execution_end","toolName":"write","isError":false,"result":"saved"}"#
+            };
             #[cfg(windows)]
             let command = {
                 let script = root.join("pi.cmd");
-                std::fs::write(&script, format!("@echo off\r\necho {event}\r\necho {{\"type\":\"turn_end\"}}\r\n\"%SystemRoot%\\System32\\ping.exe\" -n 6 127.0.0.1 >nul\r\necho ran > next-turn\r\n")).unwrap();
+                let end = if stop_reason == "stop" {
+                    format!("echo {tail}\r\n")
+                } else if budget_limit.is_some() {
+                    "\"%SystemRoot%\\System32\\ping.exe\" -n 6 127.0.0.1 >nul\r\necho ran > next-turn\r\n".into()
+                } else { String::new() };
+                let tool = if stop_reason == "toolUse" { format!("echo {tail}\r\n") } else { String::new() };
+                std::fs::write(&script, format!("@echo off\r\necho {event}\r\n{tool}echo {{\"type\":\"turn_end\"}}\r\n{end}")).unwrap();
                 vec![script.display().to_string()]
             };
             #[cfg(unix)]
-            let command = vec!["/bin/sh".into(), "-c".into(), format!("printf '%s\\n' '{event}' '{{\"type\":\"turn_end\"}}'; sleep 5; touch next-turn")];
+            let command = {
+                let boundary = r#"{"type":"turn_end"}"#;
+                let script = if stop_reason == "stop" {
+                    format!("printf '%s\\n' '{event}' '{boundary}' '{tail}'")
+                } else if budget_limit.is_some() {
+                    format!("printf '%s\\n' '{event}' '{tail}' '{boundary}'; sleep 5; touch next-turn")
+                } else {
+                    format!("printf '%s\\n' '{event}' '{tail}' '{boundary}'")
+                };
+                vec!["/bin/sh".into(), "-c".into(), script]
+            };
             let daemon = PiDaemon::new(PiDaemonConfig {
                 command, state_dir: root.join("s"), workspace_root: root.clone(),
                 env_passthrough: vec!["PATH".into()], api_key: None, provider: None,
             });
             let started = time::Instant::now();
+            let activity = root.join("activity.jsonl");
             let run = daemon.run_stdio_task(StdioTask {
-                max_turns, max_tokens, prompt: "test".into(), workdir: root.clone(),
+                max_turns, max_tokens, count_cache_read, prompt: "test".into(), workdir: root.clone(),
                 provider: None, model: None, thinking: None, api_key: None,
-                timeout: Duration::from_secs(15), transcript: None, activity_file: None,
+                timeout: Duration::from_secs(15), transcript: None, activity_file: Some(activity.clone()),
             }).await.unwrap();
-            assert!(run.budget_exhausted, "{run:?}");
+            assert_eq!(run.budget_exhausted, budget_limit.is_some(), "{run:?}");
+            assert_eq!(run.budget_limit, budget_limit);
+            assert_eq!(run.result.usage.total, 10);
+            assert_eq!(run.result.usage.budget_tokens(count_cache_read), if count_cache_read { 10 } else { 5 });
             assert!(!run.timed_out);
             assert!(run.error().is_none());
+            assert_eq!(run.result.turns, 1);
+            assert_eq!(run.result.last_assistant_text.as_deref(), Some("last response"));
+            if stop_reason == "toolUse" {
+                assert!(std::fs::read_to_string(activity).unwrap().contains("\"output\":\"saved\""));
+            }
             assert!(started.elapsed() < Duration::from_secs(4));
             assert!(!root.join("next-turn").exists());
             let _ = std::fs::remove_dir_all(root);
@@ -1480,7 +1537,7 @@ mod tests {
     fn budget_termination_does_not_hide_a_reported_provider_error() {
         let run = StdioRun {
             result: StdioResult { error_message: Some("provider refused request".into()), ..Default::default() },
-            exit_code: None, timed_out: false, budget_exhausted: true, stderr_tail: String::new(),
+            exit_code: None, timed_out: false, budget_exhausted: true, budget_limit: Some("max_tokens"), stderr_tail: String::new(),
         };
         assert_eq!(run.error().as_deref(), Some("provider refused request"));
     }
@@ -1928,6 +1985,7 @@ JSON
             .run_stdio_task(StdioTask {
                 max_turns: 40,
                 max_tokens: 400_000,
+                count_cache_read: true,
                 prompt: "# Task sub_1\nrefactor the thing".to_string(),
                 workdir: workdir.clone(),
                 provider: Some("openrouter".to_string()),
@@ -1992,6 +2050,7 @@ JSON
             .run_stdio_task(StdioTask {
                 max_turns: 40,
                 max_tokens: 400_000,
+                count_cache_read: true,
                 prompt: "take too long".to_string(),
                 workdir: root.clone(),
                 provider: None,
@@ -2033,6 +2092,7 @@ JSON
             .run_stdio_task(StdioTask {
                 max_turns: 40,
                 max_tokens: 400_000,
+                count_cache_read: true,
                 prompt: "anything".to_string(),
                 workdir: root.clone(),
                 provider: None,

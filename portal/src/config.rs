@@ -125,8 +125,8 @@ pub struct PortalConfig {
 /// eager = false
 ///
 /// [subagent.budget]
-/// max_turns = 40
-/// max_tokens = 400000
+/// max_turns = 0
+/// max_tokens = 0
 /// timeout_secs = 1800
 /// max_continuations = 3
 ///
@@ -726,8 +726,8 @@ fn default_kits_dir() -> String {
 
 fn default_max_concurrent() -> usize { 3 }
 fn default_idle_unload_secs() -> u64 { 1800 }
-fn default_max_turns() -> u32 { 40 }
-fn default_max_tokens() -> u64 { 400_000 }
+fn default_max_turns() -> u32 { 0 }
+fn default_max_tokens() -> u64 { 0 }
 fn default_timeout_secs() -> u64 { 1800 }
 fn default_max_continuations() -> u32 { 3 }
 
@@ -880,8 +880,8 @@ web_fetch = false
         assert_eq!(s.max_concurrent, 3);
         assert_eq!(s.idle_unload_secs, 1800);
         assert_eq!(s.daemon_idle_exit_secs, 0, "0 = keep the daemon while Portal runs");
-        assert_eq!(s.budget.max_turns, 40);
-        assert_eq!(s.budget.max_tokens, 400_000);
+        assert_eq!(s.budget.max_turns, 0);
+        assert_eq!(s.budget.max_tokens, 0);
         assert_eq!(s.budget.timeout_secs, 1800);
         assert_eq!(s.budget.max_continuations, 3);
         assert!(s.command.is_none());

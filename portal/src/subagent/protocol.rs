@@ -249,7 +249,7 @@ pub struct SessionRuntimeConfig {
 
 /// Pi's own budget primitives — Portal maps `[subagent.budget]` onto these
 /// instead of re-implementing turn/token accounting.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutonomousConfig {
     pub enabled: bool,
@@ -460,6 +460,10 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub fn budget_tokens(&self, count_cache_read: bool) -> u64 {
+        if count_cache_read { self.total } else { self.total.saturating_sub(self.cache_read) }
+    }
+
     /// Pull usage out of whatever shape the daemon produced. Missing numbers
     /// stay zero rather than failing a task that actually succeeded.
     pub fn from_value(v: &Value) -> Self {

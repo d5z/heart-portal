@@ -67,7 +67,6 @@ pub const MAX_SESSION_KEY_BYTES: usize = 64;
 const PROMPT_TIMEOUT_SLACK: Duration = Duration::from_secs(120);
 const MIN_TASK_TIMEOUT_SECS: u64 = 30;
 const MAX_TASK_TIMEOUT_SECS: u64 = 21_600;
-const MIN_TASK_TOKENS: u64 = 1_000;
 /// How long a finished task stays visible in `portal_subagent_status`.
 const TASK_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// How long `cancel` waits for the session to go idle before answering.
@@ -121,6 +120,7 @@ If you cannot finish within budget, stop and report exactly where you are.";
 pub struct Budget {
     pub max_turns: u32,
     pub max_tokens: u64,
+    pub count_cache_read: bool,
     pub timeout_secs: u64,
     pub max_continuations: u32,
 }
@@ -128,10 +128,11 @@ pub struct Budget {
 impl Budget {
     fn from_config(cfg: &SubagentConfig) -> Self {
         Self {
-            // Config files are user-edited input. Keep zero values from
-            // accidentally turning a bounded task into an unbounded one.
-            max_turns: cfg.budget.max_turns.max(1),
-            max_tokens: cfg.budget.max_tokens.max(MIN_TASK_TOKENS),
+            // Temporarily disable usage caps during beta, including legacy
+            // values in deployed portal.toml files.
+            max_turns: 0,
+            max_tokens: 0,
+            count_cache_read: true,
             timeout_secs: cfg
                 .budget
                 .timeout_secs
@@ -154,6 +155,7 @@ impl Budget {
         json!({
             "max_turns": self.max_turns,
             "max_tokens": self.max_tokens,
+            "count_cache_read": self.count_cache_read,
             "timeout_secs": self.timeout_secs,
             "max_continuations": self.max_continuations,
         })
@@ -430,6 +432,7 @@ pub struct ModelConfigOutcome {
 #[derive(Debug, Clone, Default)]
 struct TaskOutcome {
     status_override: Option<&'static str>,
+    budget_limit: Option<&'static str>,
     text: Option<String>,
     error: Option<String>,
     usage: Usage,
@@ -1127,6 +1130,8 @@ impl SubagentManager {
             })?;
 
         let transport = self.transport().await?;
+        anyhow::ensure!(req.budget.max_tokens == 0 || req.budget.count_cache_read || matches!(&transport, Transport::Stdio),
+            "budget.count_cache_read=false requires the stdio subagent transport");
         let (session, resumed) = self
             .ensure_session(&transport, &key, &workdir, &req)
             .await?;
@@ -1283,12 +1288,12 @@ impl SubagentManager {
                 let inner = session.inner.lock().await;
                 (
                     inner.active_session_id.is_some(),
-                    inner.budget.is_some_and(|budget| budget != req.budget),
+                    inner.budget.is_some_and(|budget| budget.to_autonomous() != req.budget.to_autonomous()),
                     inner.busy_task.clone(),
                 )
             };
             if loaded && !budget_changed {
-                return Ok((session, true));
+                return Ok((session, matches!(transport, Transport::Daemon(_))));
             }
             if let Some(task_id) = busy_task {
                 anyhow::bail!(
@@ -1570,6 +1575,7 @@ impl SubagentManager {
         let spec = StdioTask {
             max_turns: task.budget.max_turns,
             max_tokens: task.budget.max_tokens,
+            count_cache_read: task.budget.count_cache_read,
             prompt: message,
             workdir: task.workdir.clone(),
             provider: choice.provider,
@@ -1649,6 +1655,7 @@ impl SubagentManager {
         let error = run.error();
         let outcome = TaskOutcome {
             status_override: error.is_some().then_some("failed"),
+            budget_limit: run.budget_limit,
             text: run.result.last_assistant_text.clone(),
             error,
             usage: run.result.usage,
@@ -1660,14 +1667,19 @@ impl SubagentManager {
             return (TaskStatus::Timeout, outcome);
         }
         if run.budget_exhausted && outcome.error.is_none() { return (TaskStatus::BudgetExhausted, outcome); }
-        // `classify` reads the accounting an autonomous daemon would report,
-        // so budget exhaustion is judged by one rule in one place.
-        let reported = json!({
-            "turnsUsed": run.result.turns,
-            "tokensUsed": run.result.usage.total,
-            "stopReason": run.result.stop_reason,
-        });
-        (classify(task, &outcome, &reported).await, outcome)
+        // The stdio reader already applied the caps at a turn boundary. A
+        // normal final answer can finish on that boundary without being cut.
+        let reported = AutonomousStatus { stop_reason: run.result.stop_reason, ..Default::default() };
+        let status = if task.is_cancelled() {
+            TaskStatus::Cancelled
+        } else if outcome.error.is_some() {
+            TaskStatus::Failed
+        } else if reported.budget_exhausted(0, 0) {
+            TaskStatus::BudgetExhausted
+        } else {
+            TaskStatus::Done
+        };
+        (status, outcome)
     }
 
     async fn run_task_daemon(
@@ -1763,6 +1775,7 @@ impl SubagentManager {
         if let Some(complete) = value.and_then(PromptComplete::from_value) {
             return (TaskOutcome {
                 status_override: complete.failed().then_some("failed"),
+                budget_limit: None,
                 text: complete.last_assistant_text,
                 error: complete.error_message,
                 usage: complete.usage,
@@ -1815,6 +1828,7 @@ impl SubagentManager {
 
         (TaskOutcome {
             status_override: None,
+            budget_limit: None,
             text,
             error: auto.last_gate_failure.clone(),
             usage: Usage {
@@ -2057,6 +2071,9 @@ impl SubagentManager {
                     "workdir": task.workdir.display().to_string(),
                     "elapsed_secs": elapsed_secs,
                     "turns": turns,
+                    "budget": task.budget.to_json(),
+                    "budget_tokens_used": usage.budget_tokens(task.budget.count_cache_read),
+                    "budget_limit_reached": outcome.budget_limit,
                     "tokens": {
                         "input": usage.input,
                         "output": usage.output,
@@ -2227,8 +2244,27 @@ impl SubagentManager {
     /// One task, or the whole picture (PRD §6.2).
     pub async fn status(&self, task_id: Option<&str>, session: Option<&str>) -> Result<Value> {
         if let Some(task_id) = task_id {
-            let (task, session_state) = self.task_and_session(task_id).await?;
-            return Ok(self.task_detail(&task, &session_state).await);
+            let task = self.tasks.lock().await.get(task_id).cloned();
+            if let Some(task) = task {
+                if let Ok(session_state) = self.session_for_task(&task.session_key).await {
+                    return Ok(self.task_detail(&task, &session_state).await);
+                }
+            }
+            let ledger = self.ledger.lock().await;
+            let record = ledger.task(task_id).ok_or_else(|| anyhow::anyhow!("unknown task: {task_id}"))?;
+            return Ok(json!({
+                "task_id": record.task_id,
+                "session": record.session,
+                "status": record.status(),
+                "brief": record.brief_head,
+                "workdir": record.workdir,
+                "scene_id": record.scene_id,
+                "elapsed_s": record.ended_ms.map(|end| end.saturating_sub(record.created_ms) / 1000),
+                "turns": record.turns,
+                "tokens": { "total": record.tokens_total },
+                "callback": record.callback,
+                "error": record.error,
+            }));
         }
 
         let daemon = self.daemon().health().await;
@@ -2337,6 +2373,7 @@ impl SubagentManager {
             "elapsed_s": elapsed,
             "idle_s": session.transcript.idle_s().await,
             "turns": inner.turns,
+            "budget_tokens_used": inner.usage.budget_tokens(task.budget.count_cache_read),
             "last_tool": inner.last_tool,
             "tokens": {
                 "input": inner.usage.input,
@@ -2676,14 +2713,16 @@ async fn classify(task: &Arc<TaskState>, outcome: &TaskOutcome, value: &Value) -
 
 /// The prompt a task becomes inside its session (PRD §7.1).
 fn render_prompt(task: &TaskState, brief: &str) -> String {
+    let mut limits = Vec::new();
+    if task.budget.max_turns > 0 { limits.push(format!("≤{} turns", task.budget.max_turns)); }
+    if task.budget.max_tokens > 0 { limits.push(format!("≤{} tokens", task.budget.max_tokens)); }
+    limits.push(format!("≤{} seconds", task.budget.timeout_secs));
     format!(
-        "# Task {} (session {})\nWorking directory: {}\nBudget: ≤{} turns, ≤{} tokens, ≤{} min\n\n{}",
+        "# Task {} (session {})\nWorking directory: {}\nBudget: {}\n\n{}",
         task.task_id,
         task.session_key,
         task.workdir.display(),
-        task.budget.max_turns,
-        task.budget.max_tokens,
-        task.budget.timeout_secs / 60,
+        limits.join(", "),
         brief
     )
 }
@@ -2767,7 +2806,10 @@ mod tests {
 if "%~1"=="--mode" goto rpc
 > "%~dp0launch.args" echo %*
 if defined PORTAL_TOOL_TOKEN (> "%~dp0broker.txt" echo true) else (> "%~dp0broker.txt" echo false)
+echo {"type":"message_end","message":{"role":"assistant","usage":{"input":450000},"stopReason":"toolUse"}}
+echo {"type":"turn_end"}
 echo {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"## Result\nDone"}],"stopReason":"stop"}}
+echo {"type":"turn_end"}
 echo {"type":"agent_end","messages":[]}
 exit /b 0
 :rpc
@@ -2780,6 +2822,8 @@ exit /b 0
             config.security.workspace_root = workspace.clone();
             config.security.permission_mode = mode;
             config.subagent.auto_install = false;
+            config.subagent.budget.max_turns = 1;
+            config.subagent.budget.max_tokens = 400_000;
             config.subagent.state_dir = Some(workspace.join("state").display().to_string());
             let mut command = test_shell_command();
             command.extend(["/D".into(), "/C".into(), script.display().to_string()]);
@@ -2788,7 +2832,7 @@ exit /b 0
             config.subagent.model.api_key = Some("test-key".into());
             config.prepare_workspace().unwrap();
             let manager = SubagentManager::new(&config, HeartCallback::new());
-            let request = SpawnRequest { brief: "Check launch policy".into(), session: "policy-test".into(),
+            let mut request = SpawnRequest { brief: "Check launch policy".into(), session: "policy-test".into(),
                 workdir: None, budget: manager.default_budget(), model: None, thinking: None, scene_id: None };
             // Stock RPC waits for input without sending daemon_hello. Full access
             // must detect that before sending any daemon command; restricted
@@ -2797,12 +2841,16 @@ exit /b 0
             assert_eq!(transport.mode(), TransportMode::Stdio, "{mode:?}");
             assert_eq!(manager.transport().await.unwrap().mode(), TransportMode::Stdio);
             let (session, _) = manager.ensure_session(&transport, &request.session, &workspace, &request).await.unwrap();
+            request.budget.count_cache_read = false;
+            let (same_session, resumed) = manager.ensure_session(&transport, &request.session, &workspace, &request).await.unwrap();
+            assert!(Arc::ptr_eq(&session, &same_session));
+            assert!(!resumed, "stdio starts a fresh process even when Portal reuses its session record");
             let task = manager.register_task("policy-task".into(), &request.session, &request.brief, &workspace, &request).await;
             let run = time::timeout(Duration::from_secs(20), manager.clone().run_task_stdio(
                 session, task.clone(), request.brief.clone(), manager.model_choice(&request))).await;
-            let (status, error) = {
+            let (status, error, turns, total) = {
                 let inner = task.inner.lock().await;
-                (inner.status, inner.error.clone())
+                (inner.status, inner.error.clone(), inner.turns, inner.usage.total)
             };
             manager.shutdown().await;
             let launch = std::fs::read_to_string(workspace.join("launch.args"));
@@ -2810,6 +2858,7 @@ exit /b 0
             assert!(run.is_ok(), "{mode:?}: timed out; status={status:?}, error={error:?}, argv={launch:?}");
             // Report the subprocess error before looking for its output file.
             assert_eq!(status, TaskStatus::Done, "{mode:?}: {error:?}");
+            assert_eq!((turns, total), (2, 450_000));
             let launch = launch.unwrap();
             assert!(!workspace.join("unexpected-command.txt").exists(), "daemon commands reached stock RPC");
             let probes = std::fs::read_to_string(workspace.join("rpc-probes.txt")).unwrap_or_default();
@@ -3116,6 +3165,7 @@ exit /b 0
         let b = Budget {
             max_turns: 40,
             max_tokens: 400_000,
+            count_cache_read: true,
             timeout_secs: 1800,
             max_continuations: 3,
         };
@@ -3154,6 +3204,7 @@ exit /b 0
             budget: Budget {
                 max_turns: 40,
                 max_tokens: 400_000,
+                count_cache_read: true,
                 timeout_secs: 1800,
                 max_continuations: 3,
             },
@@ -3174,7 +3225,7 @@ exit /b 0
         assert!(prompt.starts_with("# Task sub_1 (session scene-42)"), "{prompt}");
         assert!(prompt.contains("Working directory: /ws/proj"));
         assert!(prompt.contains("≤40 turns"));
-        assert!(prompt.contains("≤30 min"));
+        assert!(prompt.contains("≤1800 seconds"));
         assert!(prompt.ends_with("Refactor the auth module"));
     }
 
@@ -3347,6 +3398,11 @@ exit /b 0
         let task = reloaded.task("sub_orphan").unwrap();
         assert_eq!(task.status(), LedgerTaskStatus::Interrupted);
         assert!(task.error.as_deref().unwrap().contains("Portal restarted"));
+        let restarted = manager_for(&ws, |c| c.command = Some(test_shell_command()));
+        let status = restarted.status(Some("sub_orphan"), None).await.unwrap();
+        assert_eq!(status["status"], "interrupted");
+        assert_eq!(status["session"], "scene-42");
+        assert!(status["error"].as_str().unwrap().contains("Portal restarted"));
 
         // Idempotent: a second pass changes nothing.
         m.reconcile().await;
@@ -3376,7 +3432,7 @@ exit /b 0
             brief: "Refactor the auth module and add tests".to_string(),
             workdir: PathBuf::from("/ws/proj"),
             scene_id: Some("desktop-1".to_string()),
-            budget: m.default_budget(),
+            budget: Budget { count_cache_read: false, ..m.default_budget() },
             started_at: time::Instant::now(),
             cancelled: AtomicBool::new(false),
             inner: AsyncMutex::new(TaskInner {
@@ -3392,12 +3448,13 @@ exit /b 0
         });
         let outcome = TaskOutcome {
             status_override: None,
+            budget_limit: None,
             text: Some("## Result\nDone.".to_string()),
             error: None,
             usage: Usage {
-                input: 30120,
+                input: 10120,
                 output: 8210,
-                cache_read: 0,
+                cache_read: 20000,
                 cache_write: 0,
                 total: 38330,
                 cost_usd: Some(0.42),
@@ -3427,6 +3484,10 @@ exit /b 0
         assert_eq!(r["kind"], "subagent");
         assert_eq!(r["session"], "scene-42");
         assert_eq!(r["status"], "done");
+        assert_eq!(r["budget"]["count_cache_read"], false);
+        assert_eq!(r["budget_tokens_used"], 18330);
+        assert_eq!(r["tokens"]["cache_read"], 20000);
+        assert!(r["budget_limit_reached"].is_null());
         assert_eq!(r["result"], "## Result\nDone.");
         assert_eq!(r["truncated"], false);
         assert_eq!(r["elapsed_secs"], 312);
@@ -3494,6 +3555,7 @@ exit /b 0
             budget: Budget {
                 max_turns: 10,
                 max_tokens: 1000,
+                count_cache_read: true,
                 timeout_secs: 60,
                 max_continuations: 1,
             },
@@ -3878,6 +3940,7 @@ mod flow_tests {
                 budget: Budget {
                     max_turns: 40,
                     max_tokens: 400_000,
+                    count_cache_read: true,
                     timeout_secs: 60,
                     max_continuations: 3,
                 },
@@ -4554,6 +4617,7 @@ mod flow_tests {
             budget: Budget {
                 max_turns: 10,
                 max_tokens: 1000,
+                count_cache_read: true,
                 timeout_secs: 60,
                 max_continuations: 1,
             },
@@ -4668,6 +4732,7 @@ JSON
                 budget: Budget {
                     max_turns: 40,
                     max_tokens: 400_000,
+                    count_cache_read: true,
                     timeout_secs: 60,
                     max_continuations: 3,
                 },
@@ -4706,7 +4771,9 @@ JSON
     #[tokio::test]
     async fn a_pi_without_daemon_mode_runs_the_task_and_wakes_the_being() {
         let h = stdio_harness("stdio", 0).await;
-        let receipt = h.manager.spawn(h.request("Refactor the parser")).await.unwrap();
+        let mut request = h.request("Refactor the parser");
+        request.budget.max_turns = 1;
+        let receipt = h.manager.spawn(request).await.unwrap();
         assert_eq!(receipt.status, TaskStatus::Running);
         assert!(!receipt.resumed, "a fresh process resumes nothing");
 
@@ -4741,6 +4808,10 @@ JSON
         // A run that was left alone leaves the marker — which is what makes
         // its absence meaningful in the cancel test below.
         assert!(h.workspace.join("finished.marker").exists());
+        h.manager.tasks.lock().await.remove(&receipt.task_id);
+        let archived = h.manager.status(Some(&receipt.task_id), None).await.unwrap();
+        assert_eq!(archived["status"], "done");
+        assert_eq!(archived["tokens"]["total"], 18);
 
         h.cleanup();
     }
