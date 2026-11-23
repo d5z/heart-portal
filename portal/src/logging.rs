@@ -76,8 +76,13 @@ fn redirected_stdout() -> Option<PathBuf> {
 }
 
 pub fn init() -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Desktop launchers pin RUST_LOG to info. Enable only the bounded,
+    // redacted rejection diagnostics in their managed Portal logs.
+    if std::env::var("HEART_PORTAL_CLIENT_MANAGED").as_deref() == Ok("1") {
+        filter = filter.add_directive("portal_mcp_rejections=debug".parse()?);
+    }
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
     let file = std::env::var_os("HEART_PORTAL_LOG_FILE")
         .filter(|s| !s.is_empty())

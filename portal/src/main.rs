@@ -1256,10 +1256,29 @@ async fn handle_request(
                     debug!("Missing or invalid tool name in tools/call request");
                     ""
                 });
+            let scene_id = request
+                .params
+                .get("_meta")
+                .or_else(|| request.params.get("meta"))
+                .or(Some(&request.meta))
+                .and_then(|meta| meta.get("scene_id"))
+                .and_then(serde_json::Value::as_str);
             let arguments = match request.params.get("arguments") {
                 Some(value) if value.is_object() => value.clone(),
                 None => serde_json::json!({}),
-                Some(_) => {
+                Some(value) => {
+                    debug!(
+                        target: "portal_mcp_rejections",
+                        request_id = ?id,
+                        tool = match tool_name {
+                            "portal_exec" | "portal_file_write" => tool_name,
+                            "" => "missing",
+                            _ => "other",
+                        },
+                        has_scene_id = scene_id.is_some(),
+                        preview = %rejected_tool_arguments_preview(value),
+                        "tools/call rejected: arguments is not an object"
+                    );
                     return JsonRpcResponse {
                         jsonrpc: "2.0".into(),
                         id,
@@ -1276,13 +1295,6 @@ async fn handle_request(
             let start = std::time::Instant::now();
             info!("⚡ {} called", tool_name);
 
-            let scene_id = request
-                .params
-                .get("_meta")
-                .or_else(|| request.params.get("meta"))
-                .or(Some(&request.meta))
-                .and_then(|meta| meta.get("scene_id"))
-                .and_then(serde_json::Value::as_str);
             let result = tool_host
                 .call_with_scene(tool_name, arguments, scene_id)
                 .await;
@@ -1386,9 +1398,56 @@ async fn send_notification<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Describe the rejected value without emitting commands, file contents, or metadata.
+fn rejected_tool_arguments_preview(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            let prefix = &text.as_bytes()[..text.len().min(200)];
+            format!(
+                "type=string bytes={} starts_object={} ends_object={} prefix_lt={} prefix_gt={}",
+                text.len(),
+                trimmed.starts_with('{'),
+                trimmed.ends_with('}'),
+                prefix.contains(&b'<'),
+                prefix.contains(&b'>'),
+            )
+        }
+        Value::Array(items) => format!("type=array items={}", items.len()),
+        Value::Bool(_) => "type=boolean".into(),
+        Value::Number(_) => "type=number".into(),
+        Value::Null => "type=null".into(),
+        Value::Object(_) => "type=object".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_stringified_tool_arguments_without_exposing_their_contents() {
+        let arguments = serde_json::json!(r#"{"command":"write <h2>秘密</h2>","token":"private-value"}"#);
+        let preview = rejected_tool_arguments_preview(&arguments);
+        assert!(preview.starts_with("type=string bytes="));
+        assert!(preview.ends_with("starts_object=true ends_object=true prefix_lt=true prefix_gt=true"));
+        assert!(!preview.contains("秘密") && !preview.contains("private-value"));
+        assert!(preview.len() <= 200);
+
+        let request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 19, "method": "tools/call",
+            "params": {"name":"portal_exec", "arguments":arguments, "_meta":{"scene_id":"desktop-test"}}
+        })).unwrap();
+        let host = ToolHost::new(&PortalConfig::default());
+        let response = handle_request(&request, &host, "test").await;
+        let error = response.error.unwrap();
+        assert_eq!(response.id, Some(19));
+        assert!(response.result.is_none());
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "Tool arguments must be an object");
+        assert!(error.data.is_none());
+    }
 
     #[test]
     fn runtime_overrides_round_trip_without_changing_standalone_defaults() {

@@ -134,6 +134,7 @@ mod tests {
         let host = ToolHost::new(&config).with_client_handler(Arc::new(Echo));
         for (command, expected) in [
             ("@context scene-b", "context|scene-b|scene-a"),
+            ("@context <h2>x</h2>", "context|<h2>x</h2>|scene-a"),
             ("  @context\t scene-b  ", "context|scene-b|scene-a"),
             ("@scenes", "scenes||scene-a"),
             ("@context", "context||scene-a"),
