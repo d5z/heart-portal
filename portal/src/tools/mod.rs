@@ -11,7 +11,7 @@ mod permissions;
 mod process;
 mod screenshot;
 mod search;
-mod security;
+pub(crate) mod security;
 pub(crate) mod status;
 pub(crate) mod subagent;
 pub(crate) mod text;

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc};
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::TcpListener, task::{JoinHandle, JoinSet}};
-use crate::{config::PortalConfig, tools::{ToolHost, client::ClientHandler}};
+use crate::{config::PortalConfig, tools::{ToolHost, client::ClientHandler, security::{self, Decision}}};
 use subtle::ConstantTimeEq;
 
 const ALLOWED: &[&str] = &["portal_exec", "portal_process", "portal_file_read", "portal_file_copy", "portal_file_write", "portal_file_edit", "portal_file_list", "portal_search", "portal_web_fetch", "portal_screenshot"];
@@ -19,8 +19,16 @@ impl ToolBridge {
         config.tools.custom_tools_enabled = false;
         let runtime = crate::tools::status::RuntimeStatus::for_bridge(&config);
         let host = ToolHost::new_with_runtime(&config, runtime).with_client_handler(handler);
-        let definitions: Vec<_> = host.list_tools().await.into_iter().filter(|t| ALLOWED.contains(&t.name.as_str()))
-            .map(|t| json!({"name":t.name,"description":t.description,"inputSchema":t.input_schema})).collect();
+        let definitions: Vec<_> = host.list_tools().await.into_iter()
+            .filter(|tool| ALLOWED.contains(&tool.name.as_str())
+                && security::decide(config.security.permission_mode, &tool.name) != Decision::Deny)
+            .map(|mut tool| {
+                if tool.name == "portal_exec" {
+                    tool.input_schema["properties"]["max_output_bytes"]["description"] =
+                        json!("Foreground output budget in UTF-8 bytes (default 16000); request more only if needed.");
+                }
+                json!({"name":tool.name,"description":tool.description,"inputSchema":tool.input_schema})
+            }).collect();
         tokio::fs::create_dir_all(&directory).await?;
         let extension = directory.join(format!("tool-bridge-{}.mjs", uuid::Uuid::new_v4()));
         let source = include_str!("tool_bridge.mjs").replace("/*PORTAL_TOOL_DEFINITIONS*/[]", &serde_json::to_string(&definitions)?);
@@ -114,6 +122,10 @@ mod tests {
         assert!(!extension.exists());
         config.security.permission_mode = PermissionMode::ReadOnly;
         let bridge = ToolBridge::start(config.clone(), Arc::new(NoClientHandler), None,root.join("bridge")).await.unwrap();
+        let extension_source = std::fs::read_to_string(&bridge.extension).unwrap();
+        assert!(extension_source.contains(r#""name":"portal_file_read""#));
+        assert!(!extension_source.contains(r#""name":"portal_exec""#));
+        assert!(!extension_source.contains(r#""name":"portal_file_write""#));
         assert_eq!(request(&bridge,&bridge.token,"portal_file_write",args).await.unwrap()["isError"],true);
         assert_ne!(request(&bridge,&bridge.token,"portal_file_read",json!({"path":"notes.txt"})).await.unwrap()["isError"],true);
         drop(bridge);

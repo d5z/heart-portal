@@ -28,6 +28,9 @@ pub fn record(file: &Path, event: &SessionEventBody) {
         "tool_execution_end" => json!({"kind":"tool-result", "callId":event.str_field("toolCallId"),
             "name":event.str_field("toolName").unwrap_or("tool"),
             "failed":event.rest.get("isError").and_then(Value::as_bool).unwrap_or(false) || event.rest.get("error").is_some_and(|v| !v.is_null()),
+            "duration_ms":event.rest.get("result").and_then(|result| result.pointer("/details/duration_ms")),
+            "total_output_bytes":event.rest.get("result").and_then(|result| result.pointer("/details/total_output_bytes")),
+            "truncated":event.rest.get("result").and_then(|result| result.pointer("/details/truncated")),
             "output":event.rest.get("result").or_else(|| event.rest.get("error")).map(text).unwrap_or_default()}),
         "message_update" => {
             let Some(update) = event.rest.get("assistantMessageEvent") else { return };
@@ -36,8 +39,8 @@ pub fn record(file: &Path, event: &SessionEventBody) {
             json!({"kind":"message-delta", "output":delta})
         },
         "message_end" => {
-            let Some(message) = event.rest.get("message").and_then(assistant_text) else { return };
-            let usage = event.rest.get("message").and_then(|message| message.get("usage"))
+            let Some(message) = event.rest.get("message").filter(|message| message["role"] == "assistant") else { return };
+            let usage = message.get("usage")
                 .map(Usage::from_value)
                 .map(|usage| json!({
                     "input": usage.input,
@@ -47,15 +50,24 @@ pub fn record(file: &Path, event: &SessionEventBody) {
                     "total": usage.total,
                     "cost_usd": usage.cost_usd,
                 }));
-            let stop_reason = event.rest.get("message")
-                .and_then(|message| message.get("stopReason").or_else(|| message.get("stop_reason")))
+            let stop_reason = message.get("stopReason").or_else(|| message.get("stop_reason"))
                 .and_then(Value::as_str);
-            let mut value = json!({"kind":"message", "output":text(&Value::String(message))});
+            let mut value = match assistant_text(message) {
+                Some(text) => json!({"kind":"message", "output":text}),
+                None if usage.is_some() || stop_reason.is_some() => json!({"kind":"usage"}),
+                None => return,
+            };
             if let Some(usage) = usage { value["usage"] = usage; }
             if let Some(stop_reason) = stop_reason { value["stop_reason"] = json!(stop_reason); }
             value
         },
         "turn_end" => json!({"kind":"turn-end"}),
+        "compaction_start" | "compaction_end" => json!({
+            "kind":event.kind.replace('_', "-"),
+            "reason":event.str_field("reason"),
+            "tokens_before":event.rest.get("result").and_then(|result| result.get("tokensBefore")),
+            "aborted":event.rest.get("aborted"),
+        }),
         _ => return,
     };
     append(file, value);
@@ -88,19 +100,33 @@ mod tests {
         for event in [
             json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"private thought"}}),
             json!({"type":"tool_execution_start","toolName":"bash","toolCallId":"a","args":{"command":"python3 -V"}}),
-            json!({"type":"tool_execution_end","toolName":"bash","toolCallId":"a","isError":false,"result":{"content":[{"type":"text","text":"Python 3.12"}]}}),
+            json!({"type":"tool_execution_end","toolName":"bash","toolCallId":"a","isError":false,"result":{"content":[{"type":"text","text":"Python 3.12"}],"details":{"duration_ms":12,"total_output_bytes":11,"truncated":false}}}),
             json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private thought"},{"type":"text","text":"All done"}],"usage":{"input":10,"output":4,"cacheRead":2},"stopReason":"stop"}}),
         ] { record(&file, &serde_json::from_value(event).unwrap()); }
         let output = std::fs::read_to_string(&file).unwrap();
         assert_eq!(output.lines().count(), 3);
         assert!(output.contains("python3 -V") && output.contains("Python 3.12") && output.contains("All done"));
         assert!(output.contains("\"cache_read\":2") && output.contains("\"stop_reason\":\"stop\""));
+        assert!(output.contains("\"duration_ms\":12") && output.contains("\"total_output_bytes\":11"));
         assert!(!output.contains("private thought"));
         let long = "文".repeat(70000);
         record(&file, &serde_json::from_value(json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":long}]}})).unwrap());
         let updated = std::fs::read_to_string(&file).unwrap();
         let last: Value = serde_json::from_str(updated.lines().last().unwrap()).unwrap();
         assert_eq!(last["output"].as_str().unwrap(), long);
+        for event in [
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"portal_file_read"}],"usage":{"input":10,"output":4,"cacheRead":2},"stopReason":"toolUse"}}),
+            json!({"type":"compaction_start","reason":"threshold"}),
+            json!({"type":"compaction_end","reason":"threshold","aborted":false,"result":{"tokensBefore":123,"summary":"private summary"}}),
+        ] { record(&file, &serde_json::from_value(event).unwrap()); }
+        let updated = std::fs::read_to_string(&file).unwrap();
+        let entries: Vec<Value> = updated.lines().skip(4).map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(entries[0]["kind"], "usage");
+        assert_eq!(entries[0]["usage"]["cache_read"], 2);
+        assert_eq!(entries[1]["kind"], "compaction-start");
+        assert_eq!(entries[2]["kind"], "compaction-end");
+        assert_eq!(entries[2]["tokens_before"], 123);
+        assert!(!updated.contains("private summary"));
         let _ = std::fs::remove_file(file);
     }
 }

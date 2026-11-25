@@ -112,6 +112,8 @@ the working directory given in the task. When finished, end your final message \
 with a `## Result` section: what you did, what changed (files), how you verified \
 it, and anything the principal must decide or check. Keep the result under ~2000 \
 words; put long output in files and reference them. Do not start unrelated work. \
+Resolve the uncertainties that can change the result first. Use the current working directory and workspace-relative paths where possible. \
+After a command or import fails, verify the shell or active interpreter and retry only after correcting the cause. \
 If you cannot finish within budget, stop and report exactly where you are.";
 
 // ── task and session state ──────────────────────────────────────────
@@ -1369,17 +1371,6 @@ impl SubagentManager {
         };
         let resumed = session_path.is_some();
 
-        let mut append_system_prompt = vec![SUB_CONTRACT.to_string()];
-        if let Some(extra) = self
-            .config
-            .append_system_prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            append_system_prompt.push(extra.to_string());
-        }
-
         let model = self.model();
         let daemon = self.daemon();
         let config = SessionRuntimeConfig {
@@ -1389,7 +1380,7 @@ impl SubagentManager {
             provider: model.provider,
             model: req.model.clone().or(model.model),
             thinking: req.thinking.clone().or(model.thinking),
-            append_system_prompt,
+            append_system_prompt: self.system_prompts(),
             skills: self.config.skills.clone(),
             extensions: self.config.extensions.clone(),
             no_context_files: false,
@@ -1588,6 +1579,7 @@ impl SubagentManager {
             max_tokens: task.budget.max_tokens,
             count_cache_read: task.budget.count_cache_read,
             prompt: message,
+            append_system_prompt: Some(self.system_prompts().join("\n\n")),
             workdir: task.workdir.clone(),
             provider: choice.provider,
             model: choice.model,
@@ -2660,6 +2652,14 @@ impl SubagentManager {
             .ok_or_else(|| {
                 anyhow::anyhow!("session '{}' is not loaded in the daemon", session.key)
             })
+    }
+
+    fn system_prompts(&self) -> Vec<String> {
+        let mut prompts = vec![SUB_CONTRACT.to_owned()];
+        if let Some(extra) = self.config.append_system_prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            prompts.push(extra.to_owned());
+        }
+        prompts
     }
 
     /// Default budget from config, with per-task overrides applied by the tool.

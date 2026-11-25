@@ -19,7 +19,9 @@ export default function portalTools(pi) {
         signal?.addEventListener('abort', abort, { once: true });
         socket.setTimeout(430000, () => finish(new Error('Portal tool timed out')));
         socket.setEncoding('utf8');
-        socket.on('connect', () => socket.write(JSON.stringify({token:process.env.PORTAL_TOOL_TOKEN, tool:tool.name, arguments:args})+'\n'));
+        const toolArgs = tool.name === 'portal_exec' && args.max_output_bytes === undefined
+          ? { ...args, max_output_bytes: 16000 } : args;
+        socket.on('connect', () => socket.write(JSON.stringify({token:process.env.PORTAL_TOOL_TOKEN, tool:tool.name, arguments:toolArgs})+'\n'));
         socket.on('data', chunk => {
           data += chunk;
           if (data.length > 16000000) { finish(new Error('Portal result too large')); return; }
@@ -28,8 +30,16 @@ export default function portalTools(pi) {
         socket.on('error', error => finish(error));
         socket.on('close', () => { if (!finished) finish(new Error('Portal tool broker closed')); });
       });
-      if (value.isError) throw new Error(value.content?.filter(x => x.type === 'text').map(x => x.text).join('\n') || 'Portal denied the operation');
-      return { content: value.content, details: {} };
+      if (value.isError) {
+        const message = value.content?.filter(x => x.type === 'text').map(x => x.text).join('\n');
+        throw new Error([
+          message || 'Portal denied the operation',
+          value.failure_code,
+          value.next_action,
+        ].filter(Boolean).join('\n'));
+      }
+      const { duration_ms, total_output_bytes, truncated, exit_code } = value;
+      return { content: value.content, details: { duration_ms, total_output_bytes, truncated, exit_code } };
     }
   });
   pi.on('session_start', () => pi.setActiveTools(names));

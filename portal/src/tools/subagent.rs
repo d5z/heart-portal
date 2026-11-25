@@ -61,7 +61,7 @@ pub fn list_tools() -> Vec<ToolInfo> {
                 "properties": {
                     "brief": {
                         "type": "string",
-                        "description": "What to do. Self-contained; the sub-agent cannot ask you questions. Say what 'done' looks like."
+                        "description": "What to do. Self-contained; the sub-agent cannot ask you questions. State the deliverable and the evidence that counts as done. Only name tools known to be available to the child."
                     },
                     "session": {
                         "type": "string",

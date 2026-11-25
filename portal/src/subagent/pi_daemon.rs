@@ -660,6 +660,9 @@ impl PiDaemon {
                 cmd.args(["--api-key", key]);
             }
         }
+        if let Some(prompt) = task.append_system_prompt.as_deref() {
+            cmd.args(["--append-system-prompt", prompt]);
+        }
         cmd.arg(&task.prompt);
 
         cmd.env_clear();
@@ -1189,6 +1192,7 @@ pub struct StdioTask {
     pub count_cache_read: bool,
     /// The full prompt, exactly as a daemon session would have received it.
     pub prompt: String,
+    pub append_system_prompt: Option<String>,
     /// cwd for the process; the sub-agent's working directory.
     pub workdir: PathBuf,
     pub provider: Option<String>,
@@ -1512,7 +1516,7 @@ mod tests {
             let started = time::Instant::now();
             let activity = root.join("activity.jsonl");
             let run = daemon.run_stdio_task(StdioTask {
-                max_turns, max_tokens, count_cache_read, prompt: "test".into(), workdir: root.clone(),
+                max_turns, max_tokens, count_cache_read, prompt: "test".into(), append_system_prompt: None, workdir: root.clone(),
                 provider: None, model: None, thinking: None, api_key: None,
                 timeout: Duration::from_secs(15), transcript: None, activity_file: Some(activity.clone()),
             }).await.unwrap();
@@ -1987,6 +1991,7 @@ JSON
                 max_tokens: 400_000,
                 count_cache_read: true,
                 prompt: "# Task sub_1\nrefactor the thing".to_string(),
+                append_system_prompt: None,
                 workdir: workdir.clone(),
                 provider: Some("openrouter".to_string()),
                 model: Some("deepseek/deepseek-chat-v4-0324".to_string()),
@@ -2052,6 +2057,7 @@ JSON
                 max_tokens: 400_000,
                 count_cache_read: true,
                 prompt: "take too long".to_string(),
+                append_system_prompt: None,
                 workdir: root.clone(),
                 provider: None,
                 model: None,
@@ -2094,6 +2100,7 @@ JSON
                 max_tokens: 400_000,
                 count_cache_read: true,
                 prompt: "anything".to_string(),
+                append_system_prompt: None,
                 workdir: root.clone(),
                 provider: None,
                 model: None,
