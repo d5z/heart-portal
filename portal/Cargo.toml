@@ -9,6 +9,8 @@ name = "heart-portal"
 path = "src/main.rs"
 
 [dependencies]
+# Authenticated loopback Work API, also used by callback test receivers.
+axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,7 +41,3 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization", "Win32_Security", "Win32_Security_Isolation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp"] }
-
-[dev-dependencies]
-# Local HTTP receiver used by background-task callback tests.
-axum = "0.8"

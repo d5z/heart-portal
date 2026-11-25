@@ -134,6 +134,19 @@ impl ToolHost {
         tokio::spawn(async move { subagent.reconcile().await });
     }
 
+    pub(crate) async fn deliver_work_result(&self, id: String, mut result: Value) -> Result<()> {
+        let config = self.callback.config().context("Heart callback is not configured")?;
+        result["portal_name"] = Value::String(config.portal_name.clone());
+        let payload = serde_json::json!({
+            "source": "portal",
+            "task_id": id,
+            "summary": format!("Work {}: {}", result["executor"].as_str().unwrap_or_default(), result["status"].as_str().unwrap_or_default()),
+            "result": result,
+        });
+        anyhow::ensure!(crate::heart_callback::deliver_callback(config, id, payload).await, "Heart did not accept the Work result");
+        Ok(())
+    }
+
     /// Wait until a tool caller has requested a controlled Portal restart.
     pub async fn wait_for_restart(&self) {
         self.restart_notify.notified().await;
@@ -316,7 +329,7 @@ impl ToolHost {
         if self.config.tools.exec {
             tools.push(ToolInfo {
                 name: "portal_exec".to_string(),
-                description: "Execute a shell command. Client releases bundle Python and Node on PATH; sandbox HOME, temp and caches are prepared automatically. Use python3/python or node directly without an environment setup tool. Or execute a client command: @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. Client commands never run in a shell. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
+                description: "Execute a shell command. Client releases bundle Python and Node on PATH; sandbox HOME, temp and caches are prepared automatically. Use python3/python or node directly without an environment setup tool. Or execute a client command: @context [scene_id] reads recent scene conversation history (defaults to the calling scene); @scenes lists available scenes. @work lists Work tasks and local projects; @work projects lists project directories; @work add-project {\"directory\":\"absolute path\"} asks the desktop user to select and register a project folder; @work project <project_id> reads project tasks. Use @work create for a tracked task, @work agents to choose an executor, and @work run to dispatch. Reply when dispatch starts. After a timeout use @work status <work_id> to check the original dispatch. In a later message in the same scene, use @work results <work_id> to collect the result. @work <task_id> reads the linked conversation and follow-ups. Client commands never run in a shell. With background=true it returns a session_id immediately and, when the task finishes, Portal notifies you automatically — you will be woken with the exit code and output, so you can let go of it instead of polling. Prefer background=true for anything slow (builds, tests, long downloads). On Windows, select shell='powershell' and pass the script directly for PowerShell; do not invoke powershell.exe from the default cmd shell.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

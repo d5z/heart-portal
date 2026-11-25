@@ -181,7 +181,7 @@ pub fn redact_url(url: &str) -> String {
 /// POST the payload, retrying per PRD §3.
 /// Never returns an error: a lost callback is a WARN, not a Portal failure
 /// (the being can still poll).
-pub async fn deliver_callback(cfg: CallbackConfig, task_id: String, payload: Value) {
+pub async fn deliver_callback(cfg: CallbackConfig, task_id: String, payload: Value) -> bool {
     let mut last_err = String::from("no attempt made");
     for attempt in 0..CALLBACK_ATTEMPTS {
         if attempt > 0 {
@@ -200,7 +200,7 @@ pub async fn deliver_callback(cfg: CallbackConfig, task_id: String, payload: Val
                 let status = resp.status();
                 if status.is_success() {
                     debug!("callback delivered for task {task_id} ({status})");
-                    return;
+                    return true;
                 }
                 last_err = format!("HTTP {status}");
                 if !should_retry_status(status.as_u16()) {
@@ -222,6 +222,7 @@ pub async fn deliver_callback(cfg: CallbackConfig, task_id: String, payload: Val
         redact_url(&cfg.url),
         last_err
     );
+    false
 }
 
 // ── portal_exec (background) payload ────────────────────────────────

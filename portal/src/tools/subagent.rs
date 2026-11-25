@@ -69,7 +69,7 @@ pub fn list_tools() -> Vec<ToolInfo> {
                     },
                     "workdir": {
                         "type": "string",
-                        "description": "Working directory, inside the workspace root. Default: workspace root (or the session's existing cwd, which is fixed once set)."
+                        "description": "Working directory inside the workspace root or a user-added Work project directory. Use portal_exec @work projects to discover projects, then pass their directory here. Default: workspace root. Session cwd is fixed once set; use a distinct session for independent work."
                     },
                     "budget": {
                         "type": "object",
@@ -136,18 +136,18 @@ pub fn list_tools() -> Vec<ToolInfo> {
         },
         ToolInfo {
             name: "portal_subagent_control".to_string(),
-            description: "Intervene in a running task. 'steer' injects guidance after the current turn; 'follow_up' adds work to run once the task would otherwise finish; 'cancel' ends it deliberately, returns the partial result, and suppresses the completion notification (like portal_process kill).".to_string(),
+            description: "Control a Work task. 'continue' resumes a finished task with its task history and records a linked follow-up, including with a stateless runtime or after restart. 'steer' injects guidance after the current turn; 'follow_up' adds work to run once the task would otherwise finish; 'cancel' ends it deliberately, returns the partial result, and suppresses the completion notification (like portal_process kill).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["steer", "follow_up", "cancel"]
+                        "enum": ["steer", "follow_up", "continue", "retry", "cancel"]
                     },
                     "task_id": {"type": "string"},
                     "message": {
                         "type": "string",
-                        "description": "steer: inject after the current turn; follow_up: run after the task would otherwise finish. Not used by cancel."
+                        "description": "continue: new request for a finished task; steer: inject after the current turn; follow_up: run after the task would otherwise finish. Not used by cancel."
                     }
                 },
                 "required": ["action", "task_id"]
@@ -281,8 +281,14 @@ async fn control(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Val
                 .await?;
             Ok(json!({ "ok": true, "queued": action }))
         }
+        "continue" => {
+            let message = arguments.get("message").and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Missing 'message' for continue"))?;
+            manager.continue_work(task_id, message).await
+        }
+        "retry" => manager.retry_work(task_id).await,
         "cancel" => manager.cancel(task_id).await,
-        other => anyhow::bail!("Unknown action '{other}' (expected steer, follow_up or cancel)"),
+        other => anyhow::bail!("Unknown action '{other}' (expected steer, follow_up, continue, retry or cancel)"),
     }
 }
 
@@ -498,7 +504,7 @@ mod tests {
         let actions = control.input_schema["properties"]["action"]["enum"]
             .as_array()
             .unwrap();
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions, &vec![json!("steer"), json!("follow_up"), json!("continue"), json!("retry"), json!("cancel")]);
         let setup = &tools[4];
         assert_eq!(setup.name, "portal_subagent_setup");
         assert!(setup.input_schema.get("required").is_none(), "bare call shows status");

@@ -7,7 +7,7 @@ use std::{future::Future, path::PathBuf, pin::Pin};
 pub fn parse_command(command: &str) -> Option<(&str, &str)> {
     let command = command.trim_start().strip_prefix('@')?;
     let (verb, args) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
-    matches!(verb, "context" | "scenes" | "plugins" | "security-approve").then_some((verb, args.trim()))
+    matches!(verb, "context" | "scenes" | "work" | "plugins" | "security-approve").then_some((verb, args.trim()))
 }
 
 pub trait ClientHandler: Send + Sync {
@@ -67,7 +67,7 @@ impl ClientHandler for DesktopClientHandler {
                 .context("Missing client token")?;
             let response = reqwest::Client::builder()
                 .no_proxy().redirect(reqwest::redirect::Policy::none())
-                .timeout(if verb == "security-approve" { deadline.saturating_duration_since(tokio::time::Instant::now()) } else { std::time::Duration::from_secs(10) }).build()?
+                .timeout(if verb == "security-approve" || (verb == "work" && args.split_whitespace().next() == Some("add-project")) { deadline.saturating_duration_since(tokio::time::Instant::now()) } else { std::time::Duration::from_secs(10) }).build()?
                 .post(format!("http://127.0.0.1:{port}/command"))
                 .bearer_auth(token)
                 .json(&serde_json::json!({"verb": verb, "args": args, "sceneId": scene_id, "endpoint": self.endpoint}))
@@ -137,6 +137,7 @@ mod tests {
             ("@context <h2>x</h2>", "context|<h2>x</h2>|scene-a"),
             ("  @context\t scene-b  ", "context|scene-b|scene-a"),
             ("@scenes", "scenes||scene-a"),
+            ("@work sub_one", "work|sub_one|scene-a"),
             ("@context", "context||scene-a"),
             (
                 "@plugins ; echo forbidden",

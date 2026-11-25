@@ -590,6 +590,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    let _work_server = subagent::work::start(tool_host.clone()).await?;
+
     if config.kits_enabled {
         tool_host.start_kit_refresh_task();
         info!("Kit manifest and .env hot-reload started (every 5s)");

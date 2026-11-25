@@ -29,6 +29,12 @@ pub fn record(file: &Path, event: &SessionEventBody) {
             "name":event.str_field("toolName").unwrap_or("tool"),
             "failed":event.rest.get("isError").and_then(Value::as_bool).unwrap_or(false) || event.rest.get("error").is_some_and(|v| !v.is_null()),
             "output":event.rest.get("result").or_else(|| event.rest.get("error")).map(text).unwrap_or_default()}),
+        "message_update" => {
+            let Some(update) = event.rest.get("assistantMessageEvent") else { return };
+            if update.get("type").and_then(Value::as_str) != Some("text_delta") { return }
+            let Some(delta) = update.get("delta").and_then(Value::as_str) else { return };
+            json!({"kind":"message-delta", "output":delta})
+        },
         "message_end" => {
             let Some(message) = event.rest.get("message").and_then(assistant_text) else { return };
             let usage = event.rest.get("message").and_then(|message| message.get("usage"))
@@ -58,6 +64,24 @@ pub fn record(file: &Path, event: &SessionEventBody) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn records_visible_text_deltas_without_private_thinking() {
+        let file = std::env::temp_dir().join(format!("subagent-stream-{}.jsonl", uuid::Uuid::new_v4()));
+        for event in [
+            json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"private thought"}}),
+            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hello "}}),
+            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"world"}}),
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello world"}]}}),
+        ] { record(&file, &serde_json::from_value(event).unwrap()); }
+        let output = std::fs::read_to_string(&file).unwrap();
+        let rows: Vec<Value> = output.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["kind"], "message-delta");
+        assert_eq!(rows[1]["output"], "world");
+        assert_eq!(rows[2]["kind"], "message");
+        assert!(!output.contains("private thought"));
+        let _ = std::fs::remove_file(file);
+    }
     #[test]
     fn records_tool_steps_and_results_without_private_thinking() {
         let file = std::env::temp_dir().join(format!("subagent-activity-{}.jsonl", uuid::Uuid::new_v4()));

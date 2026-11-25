@@ -25,6 +25,7 @@ pub mod pi_daemon;
 pub mod protocol;
 pub mod transcript;
 mod tool_bridge;
+pub mod work;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -1074,7 +1075,11 @@ impl SubagentManager {
         Ok(())
     }
 
-    pub async fn spawn(self: &Arc<Self>, mut req: SpawnRequest) -> Result<SpawnReceipt> {
+    pub async fn spawn(self: &Arc<Self>, req: SpawnRequest) -> Result<SpawnReceipt> {
+        self.spawn_work(req, None).await
+    }
+
+    async fn spawn_work(self: &Arc<Self>, mut req: SpawnRequest, continuation: Option<(&TaskRecord, &str)>) -> Result<SpawnReceipt> {
         if let Some(thinking) = req.thinking.as_mut() {
             *thinking = thinking.to_ascii_lowercase();
         }
@@ -1113,7 +1118,7 @@ impl SubagentManager {
                 "unknown thinking level '{thinking}'; one of: {}", SUBAGENT_THINKING_LEVELS.join(", "));
         }
         let key = normalize_session_key(&req.session)?;
-        let workdir = self.resolve_workdir(req.workdir.as_deref())?;
+        let workdir = self.resolve_workdir(req.workdir.as_deref()).await?;
 
         // Serialize spawns per session key for the whole check-and-set window.
         let _spawn_guard = self.begin_spawn(&key)?;
@@ -1171,6 +1176,12 @@ impl SubagentManager {
                 &workdir.display().to_string(),
                 req.scene_id.as_deref(),
             );
+            if let Some((parent, message)) = continuation {
+                let record = ledger.tasks.last_mut().expect("task was just inserted");
+                record.parent_task_id = Some(parent.task_id.clone());
+                record.user_message = Some(message.to_string());
+                record.brief_head = parent.brief_head.clone();
+            }
             ledger.touch_session(&key);
             ledger.save_lossy();
         }
@@ -1588,7 +1599,9 @@ impl SubagentManager {
         };
 
         let daemon = self.daemon();
-        let config = self.portal_config.clone();
+        let mut config = self.portal_config.clone();
+        // Task tools use the selected project as their filesystem and execution root.
+        config.security.workspace_root = task.workdir.clone();
         let handler = self.approval_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let scene = task.scene_id.clone();
         let mut handle = tokio::spawn(async move {
@@ -2659,9 +2672,9 @@ impl SubagentManager {
         &self.workspace_root
     }
 
-    /// Resolve `workdir` and refuse anything outside the workspace root
+    /// Resolve `workdir`; external projects must be registered by the desktop user.
     /// (realpath + prefix, so symlinks cannot escape — PRD §9 risk 11).
-    fn resolve_workdir(&self, raw: Option<&str>) -> Result<PathBuf> {
+    async fn resolve_workdir(&self, raw: Option<&str>) -> Result<PathBuf> {
         let root = self
             .workspace_root
             .canonicalize()
@@ -2682,12 +2695,14 @@ impl SubagentManager {
         let resolved = candidate
             .canonicalize()
             .with_context(|| format!("workdir {} does not exist", candidate.display()))?;
+        anyhow::ensure!(resolved.is_dir(), "workdir {} is not a directory", resolved.display());
         if !resolved.starts_with(&root) {
-            anyhow::bail!(
-                "workdir {} is outside the workspace root {}",
-                resolved.display(),
-                root.display()
-            );
+            let handler = self.approval_handler.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let args = format!("directory {}", serde_json::to_string(&resolved)?);
+            let response = handler.handle_client_command("work", &args, None).await
+                .with_context(|| format!("workdir {} is outside the workspace root; add its project directory in Work first", resolved.display()))?;
+            let decision: serde_json::Value = serde_json::from_str(&response)?;
+            anyhow::ensure!(decision["allowed"] == true, "workdir {} is outside the workspace root and registered Work projects", resolved.display());
         }
         Ok(resolved)
     }
@@ -3235,22 +3250,23 @@ exit /b 0
         assert!(SUB_CONTRACT.contains("## Result"));
     }
 
-    #[test]
-    fn workdir_must_stay_inside_the_workspace() {
+    #[tokio::test]
+    async fn workdir_must_stay_inside_the_workspace() {
         let ws = temp_workspace("workdir");
         let m = manager_for(&ws, |_| {});
 
-        let root = m.resolve_workdir(None).unwrap();
+        let root = m.resolve_workdir(None).await.unwrap();
         assert_eq!(root, ws.canonicalize().unwrap());
-        let proj = m.resolve_workdir(Some("proj")).unwrap();
+        let proj = m.resolve_workdir(Some("proj")).await.unwrap();
         assert_eq!(proj, ws.join("proj").canonicalize().unwrap());
 
         let err = m
             .resolve_workdir(Some(&std::env::temp_dir().display().to_string()))
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("outside the workspace root"), "{err}");
-        assert!(m.resolve_workdir(Some("does/not/exist")).is_err());
+        assert!(m.resolve_workdir(Some("does/not/exist")).await.is_err());
         let _ = std::fs::remove_dir_all(ws);
     }
 
@@ -4766,6 +4782,73 @@ JSON
         fn cleanup(&self) {
             let _ = std::fs::remove_dir_all(&self.workspace);
         }
+    }
+
+    #[tokio::test]
+    async fn work_continues_a_project_task_after_restart_and_notifies_being() {
+        struct ProjectClient(PathBuf);
+        impl crate::tools::client::ClientHandler for ProjectClient {
+            fn handle_client_command<'a>(&'a self, verb: &'a str, args: &'a str, _: Option<&'a str>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+                Box::pin(async move {
+                    assert_eq!(verb, "work");
+                    let directory: PathBuf = serde_json::from_str(args.strip_prefix("directory ").unwrap())?;
+                    Ok(json!({"allowed": directory.starts_with(&self.0)}).to_string())
+                })
+            }
+        }
+        let h = stdio_harness("work-followup", 0).await;
+        let pi = h.workspace.join("fake-pi");
+        let script = std::fs::read_to_string(&pi).unwrap().replace("sleep 0", "sleep 0\npwd >> project-cwd.txt");
+        std::fs::write(&pi, script).unwrap();
+        let project = short_temp_root("work-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let project_path = project.display().to_string();
+        assert!(h.manager.resolve_workdir(Some(&project_path)).await.is_err());
+        let handler = Arc::new(ProjectClient(project.clone()));
+        h.manager.set_approval_handler(handler.clone());
+        assert_eq!(h.manager.resolve_workdir(Some(&project_path)).await.unwrap(), project);
+        assert!(h.manager.resolve_workdir(Some(std::env::temp_dir().to_str().unwrap())).await.is_err());
+        std::os::unix::fs::symlink(std::env::temp_dir(), project.join("outside")).unwrap();
+        assert!(h.manager.resolve_workdir(Some(project.join("outside").to_str().unwrap())).await.is_err());
+        let mut request = h.request("Summarize the original findings");
+        request.workdir = Some(project_path.clone());
+        let first = h.manager.spawn(request).await.unwrap();
+        assert_eq!(first.workdir, project);
+        assert_eq!(h.wait_for_status(&first.task_id, "done", Duration::from_secs(20)).await, "done");
+        assert_eq!(wait_for_hits(&h.sink, 1, Duration::from_secs(20)).await, 1);
+        h.manager.shutdown().await;
+        let callback = HeartCallback::new();
+        callback.set(h.sink.url.clone(), "tok_secret".into(), "alice-laptop".into());
+        let restarted = SubagentManager::new(&h.manager.portal_config, callback);
+        restarted.set_approval_handler(handler);
+        let next = restarted.continue_work(&first.task_id, "Add concrete next steps").await.unwrap();
+        let next_id = next["task_id"].as_str().unwrap();
+        assert_ne!(next_id, first.task_id);
+        assert_eq!(next["session"], "scene-42");
+        assert_eq!(next["workdir"], project_path);
+        {
+            let ledger = restarted.ledger.lock().await;
+            let task = ledger.task(next_id).unwrap();
+            assert_eq!(task.parent_task_id.as_deref(), Some(first.task_id.as_str()));
+            assert_eq!(task.user_message.as_deref(), Some("Add concrete next steps"));
+            assert_eq!(task.scene_id.as_deref(), Some("desktop-1"));
+            assert_eq!(task.workdir, project_path);
+        }
+        let input = std::fs::read_to_string(restarted.config.resolved_state_dir().join(format!("task-{next_id}.jsonl"))).unwrap();
+        assert!(input.contains("Summarize the original findings"));
+        assert!(input.contains("The stdio pi finished the job."));
+        assert!(input.contains("Add concrete next steps"));
+        assert_eq!(wait_for_hits(&h.sink, 2, Duration::from_secs(20)).await, 2);
+        let hit = h.sink.hits.lock().unwrap()[1].clone();
+        assert_eq!(hit["result"]["task_id"], next_id);
+        assert_eq!(hit["result"]["scene_id"], "desktop-1");
+        assert_eq!(hit["result"]["status"], "done");
+        let executed = std::fs::read_to_string(project.join("project-cwd.txt")).unwrap();
+        assert_eq!(executed.lines().collect::<Vec<_>>(), vec![project_path.as_str(), project_path.as_str()]);
+        restarted.shutdown().await;
+        h.cleanup();
+        std::fs::remove_dir_all(project).unwrap();
     }
 
     #[tokio::test]

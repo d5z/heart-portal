@@ -77,6 +77,8 @@ pub struct SessionRecord {
 #[serde(default)]
 pub struct TaskRecord {
     pub task_id: String,
+    pub parent_task_id: Option<String>,
+    pub user_message: Option<String>,
     pub session: String,
     pub brief_head: String,
     pub workdir: String,
