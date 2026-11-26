@@ -629,10 +629,10 @@ impl PiDaemon {
     /// future kills pi. Reported turns and tokens stop the process at the
     /// budget limit; the wall-clock timeout also bounds silent processes.
     pub async fn run_stdio_task(&self, task: StdioTask) -> Result<StdioRun> {
-        self.run_stdio_task_with_bridge(task, None).await
+        self.run_stdio_task_with_bridge(task, None, &[]).await
     }
 
-    pub(super) async fn run_stdio_task_with_bridge(&self, task: StdioTask, bridge: Option<&super::tool_bridge::ToolBridge>) -> Result<StdioRun> {
+    pub(super) async fn run_stdio_task_with_bridge(&self, task: StdioTask, bridge: Option<&super::tool_bridge::ToolBridge>, images: &[PathBuf]) -> Result<StdioRun> {
         let argv = &self.config.command;
         if argv.is_empty() {
             anyhow::bail!("no pi command configured; set [subagent].command in portal.toml");
@@ -662,6 +662,11 @@ impl PiDaemon {
         }
         if let Some(prompt) = task.append_system_prompt.as_deref() {
             cmd.args(["--append-system-prompt", prompt]);
+        }
+        for path in images {
+            let mut argument = std::ffi::OsString::from("@");
+            argument.push(path);
+            cmd.arg(argument);
         }
         cmd.arg(&task.prompt);
 

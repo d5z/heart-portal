@@ -3,10 +3,62 @@ use super::{ledger::{LedgerTaskStatus, TaskRecord}, SubagentManager};
 use crate::tools::ToolHost;
 use anyhow::{Context, Result};
 use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, routing::post, Json, Router};
-use serde::Deserialize;
+use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{fs::{self, OpenOptions}, io::{ErrorKind, Write}, path::{Path as FsPath, PathBuf}, sync::Arc};
 use subtle::ConstantTimeEq;
+
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubmittedImage { name: String, media_type: String, data: String }
+
+pub(crate) struct WorkImage { name: String, extension: String, bytes: Vec<u8> }
+
+#[derive(Deserialize, Serialize)]
+struct StoredImage { name: String, file: String }
+
+fn image_bytes(attachments: Vec<SubmittedImage>) -> Result<Vec<WorkImage>> {
+    let mut total = 0;
+    attachments.into_iter().map(|image| {
+        let bytes = STANDARD.decode(image.data).context("附图编码无效")?;
+        total += bytes.len();
+        anyhow::ensure!(total <= MAX_IMAGE_BYTES, "每条消息的图片合计不能超过 10 MB");
+        let extension = match image.media_type.as_str() {
+            "image/png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => "png",
+            "image/jpeg" if bytes.starts_with(b"\xff\xd8\xff") => "jpg",
+            "image/gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => "gif",
+            "image/webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => "webp",
+            _ => anyhow::bail!("仅支持有效的 PNG、JPEG、WebP 和 GIF 图片"),
+        };
+        Ok(WorkImage { name: image.name, extension: extension.into(), bytes })
+    }).collect()
+}
+
+pub(super) async fn store_images(state: &FsPath, id: &str, images: Vec<WorkImage>) -> Result<(Vec<PathBuf>, Value)> {
+    if images.is_empty() { return Ok((Vec::new(), Value::Null)); }
+    tokio::fs::create_dir_all(state).await?;
+    let directory = tokio::fs::canonicalize(state).await?.join(format!("task-{id}-attachments"));
+    let mut builder = tokio::fs::DirBuilder::new();
+    #[cfg(unix)] { builder.mode(0o700); }
+    builder.create(&directory).await?;
+    let result = async {
+        let mut paths = Vec::with_capacity(images.len());
+        let mut records = Vec::with_capacity(images.len());
+        for (index, image) in images.into_iter().enumerate() {
+            let file = format!("{index}.{}", image.extension);
+            let path = directory.join(&file);
+            tokio::fs::write(&path, image.bytes).await?;
+            records.push(StoredImage { name: image.name, file });
+            paths.push(path);
+        }
+        Ok((paths, json!(records)))
+    }.await;
+    if result.is_err() { let _ = tokio::fs::remove_dir_all(directory).await; }
+    result
+}
 
 impl SubagentManager {
     pub(crate) async fn retry_work(self: &Arc<Self>, id: &str) -> Result<Value> {
@@ -17,15 +69,29 @@ impl SubagentManager {
         let original = text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .find(|row| row["kind"] == "started").context("找不到原始运行指令")?;
         let message = task.user_message.as_deref().or_else(|| original["input"].as_str()).context("找不到原始运行指令")?;
-        self.continue_work(id, message).await
+        let mut images = Vec::new();
+        if let Some(records) = original.get("attachments").filter(|value| !value.is_null()) {
+            let directory = self.config.resolved_state_dir().join(format!("task-{id}-attachments"));
+            for StoredImage { name, file } in serde_json::from_value::<Vec<StoredImage>>(records.clone())? {
+                let (index, extension) = file.split_once('.').context("附件记录无效")?;
+                anyhow::ensure!(!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) &&
+                    matches!(extension, "png" | "jpg" | "gif" | "webp"), "附件记录无效");
+                images.push(WorkImage { name, extension: extension.into(), bytes: tokio::fs::read(directory.join(file)).await.context("原始附图无法读取")? });
+            }
+        }
+        self.continue_work_with_images(id, message, images).await
     }
 
     pub async fn continue_work(self: &Arc<Self>, id: &str, message: &str) -> Result<Value> {
+        self.continue_work_with_images(id, message, Vec::new()).await
+    }
+
+    pub(crate) async fn continue_work_with_images(self: &Arc<Self>, id: &str, message: &str, images: Vec<WorkImage>) -> Result<Value> {
         let (parent, brief) = self.continuation(id, message).await?;
         let receipt = self.spawn_work(super::SpawnRequest {
             brief, session: parent.session.clone(), workdir: Some(parent.workdir.clone()), scene_id: parent.scene_id.clone(),
             budget: self.default_budget(), model: None, thinking: None,
-        }, Some((&parent, message))).await?;
+        }, Some((&parent, message)), images).await?;
         Ok(receipt.to_json())
     }
     async fn continuation(&self, id: &str, message: &str) -> Result<(TaskRecord, String)> {
@@ -62,10 +128,10 @@ impl SubagentManager {
 struct WorkState { host: ToolHost, token: String }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FollowUp { message: String }
+struct FollowUp { message: String, #[serde(default)] attachments: Vec<SubmittedImage> }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NewWork { brief: String, workdir: String, scene_id: String }
+struct NewWork { brief: String, workdir: String, scene_id: String, #[serde(default)] attachments: Vec<SubmittedImage> }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeResult {
@@ -125,6 +191,7 @@ async fn resolve_dispatch(State(state): State<WorkState>, Path(launch): Path<Str
 
 async fn create(State(state): State<WorkState>, headers: HeaderMap, Json(body): Json<NewWork>) -> WorkResult {
     authorize(&state, &headers)?;
+    let images = image_bytes(body.attachments).map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()}))))?;
     let (launch, file) = match headers.get("x-work-launch") {
         Some(value) => {
             let launch = value.to_str().ok().and_then(|value| uuid::Uuid::parse_str(value).ok())
@@ -145,7 +212,7 @@ async fn create(State(state): State<WorkState>, headers: HeaderMap, Json(body): 
         }
         None => (uuid::Uuid::new_v4(), None),
     };
-    let reply = state.host.call_with_scene("portal_subagent_spawn", json!({"brief":body.brief, "workdir":body.workdir, "scene_id":body.scene_id, "session":format!("work-{launch}")}), Some(&body.scene_id)).await;
+    let reply = state.host.call_with_images("portal_subagent_spawn", json!({"brief":body.brief, "workdir":body.workdir, "scene_id":body.scene_id, "session":format!("work-{launch}")}), Some(&body.scene_id), images).await;
     let result = match reply {
         Ok(result) if result["isError"] != true => result,
         error => {
@@ -160,7 +227,8 @@ async fn create(State(state): State<WorkState>, headers: HeaderMap, Json(body): 
 }
 async fn follow_up(State(state): State<WorkState>, Path(id): Path<String>, headers: HeaderMap, Json(body): Json<FollowUp>) -> WorkResult {
     authorize(&state, &headers)?;
-    let result = state.host.call_with_scene("portal_subagent_control", json!({"action":"continue", "task_id":id, "message":body.message}), None).await.map_err(failure)?;
+    let images = image_bytes(body.attachments).map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()}))))?;
+    let result = state.host.call_with_images("portal_subagent_control", json!({"action":"continue", "task_id":id, "message":body.message}), None, images).await.map_err(failure)?;
     if result["isError"] == true { return Err((StatusCode::CONFLICT, Json(result))); }
     let receipt: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap_or("")).map_err(failure)?;
     Ok(Json(receipt))
@@ -173,6 +241,7 @@ async fn cancel(State(state): State<WorkState>, Path(id): Path<String>, headers:
 }
 async fn steer(State(state): State<WorkState>, Path(id): Path<String>, headers: HeaderMap, Json(body): Json<FollowUp>) -> WorkResult {
     authorize(&state, &headers)?;
+    if !body.attachments.is_empty() { return Err(failure("请等待内置任务完成后再发送附图")); }
     let result = state.host.call_with_scene("portal_subagent_control", json!({"action":"steer", "task_id":id, "message":body.message}), None).await.map_err(failure)?;
     if result["isError"] == true { Err((StatusCode::CONFLICT, Json(result))) } else { Ok(Json(result)) }
 }
@@ -220,13 +289,13 @@ pub async fn start(host: ToolHost) -> Result<Option<tokio::task::JoinHandle<()>>
         .route("/api/subagent/tasks/{id}/steer", post(steer))
         .route("/api/subagent/tasks/{id}/retry", post(retry))
         .route("/api/subagent/results", post(publish_result))
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_IMAGE_BYTES.div_ceil(3) * 4 + 64 * 1024))
         .with_state(state);
     let file = PathBuf::from(ready).with_file_name(".portal-work.json");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
-    options.open(&file)?.write_all(serde_json::to_string(&json!({"pid":std::process::id(), "nonce":nonce, "port":port, "token":token, "launchAdmission":admission}))?.as_bytes())?;
+    options.open(&file)?.write_all(serde_json::to_string(&json!({"pid":std::process::id(), "nonce":nonce, "port":port, "token":token, "launchAdmission":admission, "images":true}))?.as_bytes())?;
     Ok(Some(tokio::spawn(async move { let _ = axum::serve(listener, router).await; })))
 }
 
@@ -245,7 +314,9 @@ mod tests {
         config.kits_enabled = false;
         config.security.workspace_root = root.clone();
         config.subagent.state_dir = Some(root.join("state").display().to_string());
-        config.subagent.command = Some(vec!["/usr/bin/true".into()]);
+        config.subagent.command = Some(vec!["/bin/sh".into(), "-c".into(),
+            r#"for arg; do case "$arg" in @*) cp "${arg#@}" received-image.png ;; esac; done"#.into(),
+            "work-test-pi".into()]);
         config.subagent.model.provider = Some("openrouter".into());
         config.subagent.model.model = Some("test-model".into());
         config.subagent.model.api_key = Some("test-key".into());
@@ -254,9 +325,11 @@ mod tests {
         headers.insert("authorization", "Bearer test-capability".parse().unwrap());
         let mut sessions = Vec::new();
         let launch = uuid::Uuid::new_v4();
+        let picture = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6b0sAAAAASUVORK5CYII=";
         for (index, brief) in ["First independent task", "Second independent task"].into_iter().enumerate() {
             if index == 1 { headers.insert("x-work-launch", launch.to_string().parse().unwrap()); }
-            let Json(receipt) = create(State(state.clone()), headers.clone(), Json(NewWork { brief: brief.into(), workdir: root.display().to_string(), scene_id: "desktop-main".into() })).await.unwrap();
+            let attachments = if index == 0 { vec![SubmittedImage { name: "shot.png".into(), media_type: "image/png".into(), data: picture.into() }] } else { Vec::new() };
+            let Json(receipt) = create(State(state.clone()), headers.clone(), Json(NewWork { brief: brief.into(), workdir: root.display().to_string(), scene_id: "desktop-main".into(), attachments })).await.unwrap();
             let ledger = state.host.subagent.ledger.lock().await;
             let task = ledger.task(receipt["task_id"].as_str().unwrap()).unwrap();
             assert_eq!(task.scene_id.as_deref(), Some("desktop-main"));
@@ -278,7 +351,7 @@ mod tests {
         let repeat = |key: uuid::Uuid| {
             let mut headers = headers.clone();
             headers.insert("x-work-launch", key.to_string().parse().unwrap());
-            create(State(state.clone()), headers, Json(NewWork { brief: "Repeated dispatch".into(), workdir: root.display().to_string(), scene_id: "desktop-main".into() }))
+            create(State(state.clone()), headers, Json(NewWork { brief: "Repeated dispatch".into(), workdir: root.display().to_string(), scene_id: "desktop-main".into(), attachments: Vec::new() }))
         };
         let Json(replayed) = repeat(launch).await.unwrap();
         assert_eq!(replayed["task_id"], accepted["task_id"]);
@@ -287,6 +360,11 @@ mod tests {
         assert!(claim_dispatch(&dispatch_dir(&state).join(admitting.to_string()), "admitted").unwrap());
         assert_eq!(repeat(admitting).await.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.host.subagent.ledger.lock().await.tasks.len(), 2);
+        let image_received = root.join("received-image.png");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !image_received.exists() { tokio::time::sleep(std::time::Duration::from_millis(20)).await; }
+        }).await.unwrap();
+        assert_eq!(std::fs::read(image_received).unwrap(), STANDARD.decode(picture).unwrap());
         state.host.subagent.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
     }

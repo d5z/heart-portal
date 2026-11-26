@@ -672,6 +672,16 @@ impl ToolHost {
         arguments: Value,
         scene_id: Option<&str>,
     ) -> Result<Value> {
+        self.call_with_images(tool_name, arguments, scene_id, Vec::new()).await
+    }
+
+    pub(crate) async fn call_with_images(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        scene_id: Option<&str>,
+        images: Vec<crate::subagent::work::WorkImage>,
+    ) -> Result<Value> {
         match tool_name {
             "portal_exec" | "portal_process" => anyhow::ensure!(self.config.tools.exec, "Execution tools are disabled"),
             "portal_file_read" | "portal_file_write" | "portal_file_edit" | "portal_file_list" | "portal_file_copy" => anyhow::ensure!(self.config.tools.file, "File tools are disabled"),
@@ -781,7 +791,7 @@ impl ToolHost {
             "portal_web_fetch" => web::fetch(arguments).await,
             "portal_oauth_authorize" => oauth::authorize(arguments).await,
             name if subagent::is_subagent_tool(name) => {
-                subagent::handle(&self.subagent, name, arguments).await
+                subagent::handle_with_images(&self.subagent, name, arguments, images).await
             }
             "portal_tools_reload" => self.handle_tools_reload().await,
             "portal_kits_setup" => {

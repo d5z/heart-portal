@@ -859,7 +859,7 @@ impl SubagentManager {
         providers.insert("portal-custom".into(), serde_json::json!({
             "baseUrl": model.base_url, "api": model.api,
             "apiKey": "PORTAL_SUBAGENT_API_KEY",
-            "models": [{"id": model.model, "name": model.model, "reasoning": model.thinking.as_deref() != Some("off")}]
+            "models": [{"id": model.model, "name": model.model, "reasoning": model.thinking.as_deref() != Some("off"), "input": ["text", "image"]}]
         }));
         let temporary = dir.join(format!("models-{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&temporary, serde_json::to_vec_pretty(&document)?)?;
@@ -1078,10 +1078,14 @@ impl SubagentManager {
     }
 
     pub async fn spawn(self: &Arc<Self>, req: SpawnRequest) -> Result<SpawnReceipt> {
-        self.spawn_work(req, None).await
+        self.spawn_work(req, None, Vec::new()).await
     }
 
-    async fn spawn_work(self: &Arc<Self>, mut req: SpawnRequest, continuation: Option<(&TaskRecord, &str)>) -> Result<SpawnReceipt> {
+    pub(crate) async fn spawn_with_images(self: &Arc<Self>, req: SpawnRequest, images: Vec<work::WorkImage>) -> Result<SpawnReceipt> {
+        self.spawn_work(req, None, images).await
+    }
+
+    async fn spawn_work(self: &Arc<Self>, mut req: SpawnRequest, continuation: Option<(&TaskRecord, &str)>, images: Vec<work::WorkImage>) -> Result<SpawnReceipt> {
         if let Some(thinking) = req.thinking.as_mut() {
             *thinking = thinking.to_ascii_lowercase();
         }
@@ -1137,6 +1141,7 @@ impl SubagentManager {
             })?;
 
         let transport = self.transport().await?;
+        anyhow::ensure!(images.is_empty() || matches!(&transport, Transport::Stdio), "当前内置运行方式不支持附图");
         anyhow::ensure!(req.budget.max_tokens == 0 || req.budget.count_cache_read || matches!(&transport, Transport::Stdio),
             "budget.count_cache_read=false requires the stdio subagent transport");
         let (session, resumed) = self
@@ -1146,7 +1151,7 @@ impl SubagentManager {
         // Claim the session under one lock hold: checking `busy_task` and then
         // setting it in two steps would let two parallel spawns both pass.
         let task_id = format!("sub_{}", uuid::Uuid::new_v4());
-        let (active_session_id, session_file) = {
+        let (active_session_id, session_file, image_paths, attachments) = {
             let mut inner = session.inner.lock().await;
             if let Some(running) = inner.busy_task.as_deref() {
                 anyhow::bail!(
@@ -1158,17 +1163,19 @@ impl SubagentManager {
                 .active_session_id
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("session '{key}' has no live pi session"))?;
+            let (image_paths, attachments) = work::store_images(&self.config.resolved_state_dir(), &task_id, images).await?;
             inner.busy_task = Some(task_id.clone());
             inner.tasks_total += 1;
             inner.last_used = time::Instant::now();
-            (active_session_id, inner.session_file.clone())
+            (active_session_id, inner.session_file.clone(), image_paths, attachments)
         };
 
         let task = self
             .register_task(task_id, &key, &brief, &workdir, &req)
             .await;
-        activity::append(&self.config.resolved_state_dir().join(format!("task-{}.jsonl", task.task_id)),
-            json!({"kind":"started", "input":brief}));
+        let mut started = json!({"kind":"started", "input":brief});
+        if !attachments.is_null() { started["attachments"] = attachments; }
+        activity::append(&self.config.resolved_state_dir().join(format!("task-{}.jsonl", task.task_id)), started);
         {
             let mut ledger = self.ledger.lock().await;
             ledger.start_task(
@@ -1207,6 +1214,7 @@ impl SubagentManager {
                     active_session_id,
                     message,
                     choice,
+                    image_paths,
                 )
                 .await;
             drop(permit);
@@ -1543,13 +1551,14 @@ impl SubagentManager {
         active_session_id: String,
         message: String,
         choice: ModelChoice,
+        image_paths: Vec<PathBuf>,
     ) {
         match transport {
             Transport::Daemon(client) => {
                 self.run_task_daemon(client, session, task, active_session_id, message)
                     .await
             }
-            Transport::Stdio => self.run_task_stdio(session, task, message, choice).await,
+            Transport::Stdio => self.run_task_stdio(session, task, message, choice, image_paths).await,
         }
     }
 
@@ -1563,6 +1572,7 @@ impl SubagentManager {
         task: Arc<TaskState>,
         message: String,
         choice: ModelChoice,
+        image_paths: Vec<PathBuf>,
     ) {
         // Rendered progress lines, drained into the session transcript so
         // `portal_subagent_log` keeps working without an event pump.
@@ -1598,10 +1608,10 @@ impl SubagentManager {
         let scene = task.scene_id.clone();
         let mut handle = tokio::spawn(async move {
             if !config.subagent.inherit_model && config.security.permission_mode == crate::config::PermissionMode::FullAccess {
-                return daemon.run_stdio_task(spec).await;
+                return daemon.run_stdio_task_with_bridge(spec, None, &image_paths).await;
             }
             let bridge = tool_bridge::ToolBridge::start(config, handler, scene, daemon.agent_dir().join("portal-tools")).await?;
-            daemon.run_stdio_task_with_bridge(spec, Some(&bridge)).await
+            daemon.run_stdio_task_with_bridge(spec, Some(&bridge), &image_paths).await
         });
 
         // There is no socket to abort over: cancelling a stdio task means

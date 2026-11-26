@@ -189,14 +189,23 @@ pub async fn handle(
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value> {
+    handle_with_images(manager, tool_name, arguments, Vec::new()).await
+}
+
+pub(crate) async fn handle_with_images(
+    manager: &Arc<SubagentManager>,
+    tool_name: &str,
+    arguments: Value,
+    images: Vec<crate::subagent::work::WorkImage>,
+) -> Result<Value> {
     if tool_name == "portal_subagent_setup" && manager.inherits_model() && arguments.as_object().is_some_and(|a| !a.is_empty()) {
         return Ok(err("Subagent automatically inherits the Being model. Change the existing client model settings instead."));
     }
     let result = match tool_name {
-        "portal_subagent_spawn" => spawn(manager, arguments).await,
+        "portal_subagent_spawn" => spawn(manager, arguments, images).await,
         "portal_subagent_status" => status(manager, arguments).await,
         "portal_subagent_log" => log(manager, arguments).await,
-        "portal_subagent_control" => control(manager, arguments).await,
+        "portal_subagent_control" => control(manager, arguments, images).await,
         "portal_subagent_setup" => setup(manager, arguments).await,
         other => anyhow::bail!("Unknown tool: {other}"),
     };
@@ -209,7 +218,7 @@ pub async fn handle(
     })
 }
 
-async fn spawn(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value> {
+async fn spawn(manager: &Arc<SubagentManager>, arguments: Value, images: Vec<crate::subagent::work::WorkImage>) -> Result<Value> {
     let brief = match arguments.get("brief") {
         Some(Value::String(value)) => value.clone(),
         Some(value) => anyhow::bail!("'brief' must be a string, got {value}"),
@@ -231,7 +240,7 @@ async fn spawn(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value
         scene_id: optional_string(&arguments, "scene_id")?,
     };
 
-    Ok(manager.spawn(req).await?.to_json())
+    Ok(manager.spawn_with_images(req, images).await?.to_json())
 }
 
 async fn status(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value> {
@@ -260,7 +269,7 @@ async fn log(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value> 
     manager.log(task_id, offset, limit, timeout_ms).await
 }
 
-async fn control(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Value> {
+async fn control(manager: &Arc<SubagentManager>, arguments: Value, images: Vec<crate::subagent::work::WorkImage>) -> Result<Value> {
     let action = arguments
         .get("action")
         .and_then(|v| v.as_str())
@@ -284,7 +293,7 @@ async fn control(manager: &Arc<SubagentManager>, arguments: Value) -> Result<Val
         "continue" => {
             let message = arguments.get("message").and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("Missing 'message' for continue"))?;
-            manager.continue_work(task_id, message).await
+            manager.continue_work_with_images(task_id, message, images).await
         }
         "retry" => manager.retry_work(task_id).await,
         "cancel" => manager.cancel(task_id).await,
